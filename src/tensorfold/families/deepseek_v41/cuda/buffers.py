@@ -137,6 +137,7 @@ class Buffers:
         sources = [cfg.roles[layer].ratio for layer in cfg.kv_source_layer_ids]
         self.cmp = t((sources.count(2), rows, 2, hd), f32)
         self.lat = t((rows, hd), bf)
+        self.kI, self.epos = t((rows, cfg.index_head_dim), bf), t((rows,), i32)   # index keys, entry positions
         self.qI = t((rows, cfg.index_n_heads, cfg.index_head_dim), bf)
         self.wI = t((rows, cfg.index_n_heads), f32)
         visible = max((entries(r, capacity) for r in sources), default=0)
