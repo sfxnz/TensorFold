@@ -181,34 +181,39 @@ def policy(confidence: Sequence[float], d_fixed: int, conf_threshold: float | No
 
 
 @torch.no_grad()
-def propose(e, y: int, p: int, sampling: Sampling | None, d: int,
-            conf_threshold: float | None = None) -> tuple[list[int], list[float]]:
+def propose(e, y: int, p: int, sampling: Sampling | None, d: int, conf_threshold: float | None = None, *,
+            steps=None, landed=None) -> tuple[list[int], list[float]]:
     """The block for pending token ``y`` after the last committed position ``p``, then Markov steps i < d (with a
     threshold: while ``policy`` keeps row i) -> (drafts for positions p+2.., their confidence logits).
 
     Each draft is ``sample.draft_rows`` of its row at its own absolute position, the same on every rank.
+    ``steps`` stands in for (``block``, ``markov_input``, ``markov_step``), e.g. graph replays; ``landed(i, token)``
+    runs as each draft is drawn.
     """
 
     w, st, b, k = e.w, e.st, e.dbuf, e.dwork
     B = w.cfg.dspark_block_size
     if p != st.pos - 1 or p < 0 or not 1 <= d <= B:
         raise ValueError(f"propose: p {p} with {st.pos} committed positions, {d} drafts of a {B}-row block")
+    run_block, run_input, run_step = steps or (block, markov_input, markov_step)
     k.bids[:1].fill_(y)
     k.mids[:1].fill_(y)
-    block(e)
+    run_block(e)
     drafts: list[int] = []
     conf: list[float] = []
     k.sampling = 0.0
     for i in range(d):
-        markov_input(e, i)
+        run_input(e, i)
         if conf_threshold is not None:
             conf.append(float(b.conf[i]))
             if policy(conf, d, conf_threshold) <= i:
                 break
-        markov_step(e, i)
+        run_step(e, i)
         (tok,), seconds = sample.draft_rows(w, b.dlog[i:i + 1], [p + 2 + i], sampling)
         k.sampling += seconds
         drafts.append(tok)
+        if landed is not None:
+            landed(i, tok)
         if i + 1 < B:
             k.mids[i + 1:i + 2].fill_(tok)
     return drafts, (conf if conf_threshold is not None else b.conf[:d].tolist())[:len(drafts)]
