@@ -90,6 +90,8 @@ The MTP layer TensorFold drafts with comes from that checkpoint's last shard (MI
 `src/tensorfold/families/deepseek_v41/vendor/encoding_dsv41.py` is the unmodified `encoding/encoding.py` of
 [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (revision dba1be0), and
 `tests/fixtures/deepseek_v41/` holds its test cases, MIT License, Copyright (c) 2023 DeepSeek.
+`tests/dsv41_reference.py` ports the forward pass of that checkpoint's `inference/model.py` and the arithmetic of
+its `inference/kernel.py` to plain PyTorch as a test comparator, MIT License, Copyright (c) 2023 DeepSeek.
 
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
 The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
