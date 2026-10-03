@@ -35,6 +35,7 @@ MIRROR = Mode("mirror", world=1)
 TOP1 = 0.99                             # T2, reduced model: top-1 agreement
 KL = 1e-3                               # T2: mean KL(reference || TF)
 REL_L2 = 0.05                           # T2: logits rel-L2
+DECIDED = 0.25                          # least share of rows whose top-1 the tiny reference decides
 BLOCK_L2 = 4 * 2**-8                    # T2, one block: residual stream rel-L2 and cosine
 COS = 0.9999
 # (rows, keep, prompt): chunks of every size class, then windows of every R with kept prefixes and rejected drafts
@@ -116,18 +117,23 @@ def _kl(p: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> float:
 
 def _follows(got: torch.Tensor, mirror: torch.Tensor, fp32: torch.Tensor, what: str) -> None:
     """Whole-model logits against the reference in mirror mode: top-1 agreement where the reference's margin
-    exceeds twice its own fp32-vs-mirror spread on the row, KL and rel-L2 no larger than fp32 mode's."""
+    exceeds twice its own fp32-vs-mirror spread on the row (at least DECIDED of rows), KL and rel-L2 no larger
+    than fp32 mode's."""
 
     g, x, f = got.double().cpu(), mirror.double().cpu(), fp32.double().cpu()
     pick, want = g.argmax(-1), x.argmax(-1)
     margin = (x.gather(-1, want[:, None]) - x.gather(-1, pick[:, None]))[:, 0]
-    top1 = float(((pick == want) | (margin <= 2 * (x - f).abs().amax(-1))).double().mean())
+    spread = 2 * (x - f).abs().amax(-1)
+    top1 = float(((pick == want) | (margin <= spread)).double().mean())
+    gap = x.topk(2, -1).values
+    decided = float((gap[:, 0] - gap[:, 1] > spread).double().mean())
     p = torch.softmax(x, -1)
     kl, kl_ref = _kl(p, x, g), _kl(p, x, f)
     rel, rel_ref = float((g - x).norm() / x.norm()), float((f - x).norm() / x.norm())
-    print(f"{what}: top-1 {float((pick == want).double().mean()):.4f} ({top1:.4f} decided), KL {kl:.3g}, rel-L2 "
-          f"{rel:.3g}; the reference's fp32 mode: top-1 {float((f.argmax(-1) == want).double().mean()):.4f}, KL "
-          f"{kl_ref:.3g}, rel-L2 {rel_ref:.3g}")
+    print(f"{what}: top-1 {float((pick == want).double().mean()):.4f} ({top1:.4f} where {decided:.2f} decided), "
+          f"KL {kl:.3g}, rel-L2 {rel:.3g}; the reference's fp32 mode: top-1 "
+          f"{float((f.argmax(-1) == want).double().mean()):.4f}, KL {kl_ref:.3g}, rel-L2 {rel_ref:.3g}")
+    assert decided >= DECIDED, f"{what}: only {decided} of rows decided"
     assert top1 >= TOP1 and kl <= kl_ref and rel <= rel_ref, f"{what}: top-1 {top1}, KL {kl}, rel-L2 {rel}"
 
 
@@ -317,6 +323,9 @@ def test_graph_replays_equal_eager(tiny, ref, R):
         F.stage(w, st, b, ids, e.hasher, e.reader)
         eager = F.compute(w, st, b, R, prompt=False, head_rows=R).clone()
         state = [b.kvw[:layers, :R].clone(), b.taps[:R].clone(), *(x.clone() for x in st.row_views(st.pos + R))]
+        wrote = [c[layer][st.pos // r:(st.pos + R) // r] for layer, r in st.ratio.items() for c in (st.comp, st.index_k)]
+        for x in [out, b.kvw[:layers, :R], b.taps[:R], *wrote]:
+            x.fill_(float("nan"))           # the replay must rewrite everything the eager forward did
         graph.replay()
         assert torch.equal(out, eager), f"logits: {R} rows at {st.pos}"
         again = [b.kvw[:layers, :R], b.taps[:R], *st.row_views(st.pos + R)]
