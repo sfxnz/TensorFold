@@ -3,8 +3,8 @@ stream, the whole model's logits as close to the reference's as its own fp32 mod
 and in agreement, a prompt row's head independent of its chunk, rings rebuilt from committed rows, graph replays
 equal to eager runs.
 
-The tiny's random weights amplify roundings from block to block: the reference's own fp32 and mirror modes pick
-different top-1 tokens at about 7% of positions, so end-to-end top-1 counts only rows whose top-1 is decided.
+The tiny's random weights amplify roundings from block to block: the reference's own fp32 and mirror modes disagree
+on top-1 where margins are small, so end-to-end top-1 counts only rows whose top-1 is decided.
 """
 
 from __future__ import annotations
