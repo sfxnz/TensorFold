@@ -28,7 +28,16 @@ from dsv41_ref_weights import RefWeights
 
 from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import BLOCK, MAX_ROWS, PREFILL_ROWS, buffers, dspark, loader, snapshot
+from tensorfold.families.deepseek_v41.cuda import (
+    BLOCK,
+    MAX_ROWS,
+    PREFILL_ROWS,
+    buffers,
+    dspark,
+    loader,
+    sample,
+    snapshot,
+)
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import prefill as P
 
@@ -160,6 +169,9 @@ def test_one_token_prompt(eng):
     F.stage(w, st, b, prompt, eng.hasher, eng.reader)
     logits = F.compute(w, st, b, 1, prompt=True, head_rows=1)
     assert torch.equal(_bits(logits[0]), got["logits"])
+    (first,), _ = sample.target_rows(w, logits, [1], SAMPLING)
+    (other,), _ = sample.target_rows(w, logits, [0], SAMPLING)
+    assert got["first"].item() == first != other, "the first token is drawn with position 1's key"
     F.commit(w, st, b, 1, 1)
     dspark.absorb(eng, b, 1, prompt=True)
     by_hand = _state(eng)
@@ -248,6 +260,17 @@ def test_three_resends_keep_every_state(eng):
         P.prefill(eng, prompt[:400], None, resume=snap)
 
 
+def test_kept_snapshot_lands_in_the_given_space(eng):
+    prompt = _ids(6, 300, eng.w.cfg.vocab_size)
+    space = torch.empty((snapshot.state_bytes(eng),), dtype=torch.uint8, device="cuda")
+    kept: list[snapshot.Snapshot] = []
+    P.prefill(eng, prompt, None, keep_at=200, keep=kept.append, space=space)
+    for x in (kept[0].rings, kept[0].tail, kept[0].tail_valid):
+        assert x.untyped_storage().data_ptr() == space.untyped_storage().data_ptr(), "a copy outside the space"
+    P.prefill(eng, prompt[:200], None)
+    _equal(_snap(kept[0]), _snap(snapshot.take(eng, prompt[:200])), "a snapshot kept into the space")
+
+
 class _Slow:
     """The Engram reader with every chunk's read held back ``delay`` seconds on its own thread."""
 
@@ -305,6 +328,7 @@ def test_pack_reduced_model_chunked_and_resumed_equal_whole():
     assert len(prompt) == REDUCED_TOKENS
     cap = REDUCED_TOKENS + MAX_ROWS
     w = loader.load(MODEL, cfg, 0, 1, None, capacity=cap)
+    assert w.dspark is not None and w.engram, "the pack check covers the DSpark rings and Engram reads"
     e = Eng(w, rw.hasher, rw.reader, rows=REDUCED_TOKENS, capacity=cap)
     want = _run(e, prompt)
     del e

@@ -93,9 +93,11 @@ class _Rows:
 
 @torch.no_grad()
 def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapshot | None = None,
-            keep_at: int | None = None, keep: Callable[[Snapshot], object] | None = None) -> int:
+            keep_at: int | None = None, keep: Callable[[Snapshot], object] | None = None,
+            space: torch.Tensor | None = None) -> int:
     """Commit ``prompt`` from position 0 (or from ``resume``, a snapshot of a strict prefix) and sample its first
-    token at position ``len(prompt)``; with ``keep_at``, ``keep`` receives the snapshot at that point."""
+    token at position ``len(prompt)``; with ``keep_at``, ``keep`` receives the snapshot at that point, copied into
+    ``space`` when given (see ``snapshot.take``)."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
@@ -133,7 +135,7 @@ def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapsho
             if w.dspark is not None:
                 dspark.absorb(e, b, min(R, b.taps.shape[0]), prompt=True)
             if z == keep_at:
-                kept = snapshot.take(e, prompt[:keep_at])
+                kept = snapshot.take(e, prompt[:keep_at], space)
     finally:
         if rows is not None:
             rows.drain()
