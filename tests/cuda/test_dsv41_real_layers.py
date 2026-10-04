@@ -1,4 +1,4 @@
-"""Real weights against the fp32 reference port (memory class M, ``TF_DSV41_MODEL``): blocks and DSpark stages fed
+"""Real weights against the fp32 reference port (``TF_DSV41_MODEL``): blocks and DSpark stages fed
 TF's own stream, and a reduced model through TF's prompt path.
 
 Blocks 0, 1, 2, 3, 8, 14, 20, 21, 24, 25, 37 and 39 each take the bf16 stream and FFN pre that TF's forward gives
@@ -9,7 +9,7 @@ differ most on high-norm rows, so TF's fp32 distance is gated at max(3%, the mir
 over the same rows: all but those the fp32 reference routes to other experts than TF at a near-tie (reported).
 TF's next pre-mix (the FFN mix's pre, which collapses the next block's stream) takes the mirror gate on those rows.
 TF's routed sets, index lists and candidate blocks must equal an fp64 selection on TF's own inputs except at
-near-ties (§7.7).
+near-ties.
 TF runs one layer at a time with only that layer's weights on the device, so the 40 blocks fit one GPU.
 
 Each DSpark stage runs TF's block [y, noise...] after each context's prompt and first window, its rings absorbed from
@@ -73,7 +73,7 @@ TAIL = 256                              # compared prompt rows that end each con
 BLOCK = PREFILL_ROWS                    # rows the reference writes caches for at once
 MIRROR, FP32 = Mode("mirror", world=1), Mode("fp32", world=1)     # one rank: row sums over the whole input dim
 MODES = {"mirror": MIRROR, "fp32": FP32, "fp32_qdq": FP32}
-REL_MIRROR, COS, REL_FP32, MARGIN = 0.02, 0.9999, 0.03, 4 * 2**-8     # T2, one block
+REL_MIRROR, COS, REL_FP32, MARGIN = 0.02, 0.9999, 0.03, 4 * 2**-8     # the model-level gate, one block
 TIE = 4                                 # a near-tie: the fp64 margin below TIE x the fp32 bound
 DSPARK_AT = (99, 104, 1_099, 1_104, 16_999, 17_004)       # p after each context's prompt and its first window
 REDUCED, REDUCED_ROWS = 8, 256          # reduced model: layers 0-7, norm, head over 256 positions
@@ -179,7 +179,7 @@ def _close(got: torch.Tensor, want: torch.Tensor) -> dict:
 
 def _route(cfg: Config, xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, k: int
            ) -> dict:
-    """Per row of FFN input ``xf``: fp64 router scores (N3, M:809-827), the sorted top-``k`` set ``pick`` made, its
+    """Per row of FFN input ``xf``: fp64 router scores (M:809-827), the sorted top-``k`` set ``pick`` made, its
     k-th to (k+1)-th margin, whether ``pick`` differs from the fp64 top-k, and whether that margin is below TIE x
     the fp32 error bound."""
 
@@ -227,7 +227,8 @@ def _versus(got: torch.Tensor, tf: dict, want: dict) -> dict:
 
 
 def _gated(name: str, d: dict) -> bool:
-    """The T2 gate of one comparison: mirror over all rows, fp32 over the kept rows; ``fp32_qdq`` is reported only."""
+    """The model-level gate of one comparison: mirror over all rows, fp32 over the kept rows; ``fp32_qdq`` is reported
+    only."""
 
     if name == "mirror":
         return d["rel"] <= REL_MIRROR and d["cos"] >= COS
@@ -339,10 +340,10 @@ def _ties(out: dict, s: torch.Tensor, tol: torch.Tensor, k: torch.Tensor, given:
 
 def _index(cfg: Config, role, b, keys: torch.Tensor, i: int, j: int, first: int, out: dict) -> None:
     """TF's lists of forward rows i..j (at ``first`` on), and the candidate source's blocks, against an fp64
-    selection on TF's own index Q, weights and keys (M:556-610): every difference must be a near-tie (§7.7)."""
+    selection on TF's own index Q, weights and keys (M:556-610): every difference must be a near-tie."""
 
     H, D, G = cfg.index_n_heads, cfg.index_head_dim, cfg.candidate_block_size
-    bound = TIE * 8 * math.sqrt(H * D) * 2.0**-24          # T1 fp32 bound, the scale summed below
+    bound = TIE * 8 * math.sqrt(H * D) * 2.0**-24          # the op-level fp32 bound, the scale summed below
     visible = (torch.arange(first, first + j - i, device=keys.device) + 1) // role.ratio
     K = keys[:int(visible.max())].double()
     t = torch.arange(len(K), device=K.device)

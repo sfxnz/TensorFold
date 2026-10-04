@@ -1,6 +1,6 @@
 """Engram on the device: file rows dequantize bit-exactly, two ranks' exchange and ``wkv`` gather equal one rank's
-concatenation, the gate tracks the fp32 reference port in mirror mode (T1), staging never races its copy, rows do
-not depend on the window and graph replays equal eager runs."""
+concatenation, the gate tracks the fp32 reference port in mirror mode (the op-level bound), staging never races its
+copy, rows do not depend on the window and graph replays equal eager runs."""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def _t1(out: torch.Tensor, want: torch.Tensor, what: str) -> None:
 
 
 def _t1_sum(got: torch.Tensor, x: torch.Tensor, w: torch.Tensor, what: str) -> None:
-    """Section 7.7's T1 for a bf16 projection against the fp64 product: within 1 ulp with <= 0.5% off, except a sum
+    """The op-level bound for a bf16 projection against the fp64 product: within 1 ulp with <= 0.5% off, except a sum
     that cancels to far below its terms, which stays within the fp32 sum bound plus the half ulp of its rounding."""
 
     want = x.double() @ w.double().T
@@ -346,7 +346,8 @@ def test_real_rows_dequantize_bit_exactly_from_the_file_bytes():
 @needs_model
 @pytest.mark.parametrize("world", [1, 2])
 def test_real_layers_track_the_reference_in_mirror_mode(world, monkeypatch):
-    """kv against the fp64 product (T1); the gate against B8's Engram fed this kv, so its inputs are identical."""
+    """kv against the fp64 product (the op-level bound); the gate against the reference port's Engram fed this kv, so
+    its inputs are identical."""
 
     pytest.importorskip("safetensors")
     from dsv41_layouts import mx8_from_block

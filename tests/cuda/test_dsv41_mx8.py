@@ -1,5 +1,5 @@
 """DeepSeek's FP8 projections: bf16 is ``Mx8Linear``'s bits, fp32 rounds to them, rows never follow the row count,
-and real rank shapes track an fp64 product of the dequantized weights (T1)."""
+and real rank shapes track an fp64 product of the dequantized weights."""
 
 from __future__ import annotations
 
@@ -188,7 +188,7 @@ def _mx8(w: torch.Tensor, s: torch.Tensor) -> Mx8Linear:
 
 
 def _t1(got: torch.Tensor, x: torch.Tensor, w: torch.Tensor, k: int, f32: bool) -> dict:
-    """Section 7.7's T1 against the fp64 product: the fp32 sum bound over K; bf16 within 1 ulp with <= 0.5% off, or
+    """The op-level bound against the fp64 product: the fp32 sum bound over K; bf16 within 1 ulp with <= 0.5% off, or
     (a sum that cancels to far below its terms) within that bound plus the half ulp of the bf16 rounding."""
 
     ref = x.double() @ w.t()

@@ -1,5 +1,5 @@
-"""DeepSeek-V4.1's MoE on one rank: N3 routing, EXL3 routed experts split by intermediate dim, the shared expert's
-single fp32 add, DSpark's NVFP4 experts; real layers against the fp32 reference (memory class M).
+"""DeepSeek-V4.1's MoE on one rank: routing, EXL3 routed experts split by intermediate dim, the shared expert's
+single fp32 add, DSpark's NVFP4 experts; real layers against the fp32 reference (with the checkpoint).
 
 Random layers keep the real rank shapes (D 5120, I 1152 a rank, 384 experts, 2-bit mcg trellises); a few trellis
 sets are shared between experts, each expert with its own suh/svh.
@@ -131,7 +131,7 @@ def _abs_had(v: torch.Tensor) -> torch.Tensor:
 # -- routing ------------------------------------------------------------------------------------------------------
 
 def _torch_route(mlog: torch.Tensor, bias: torch.Tensor, k: int, scale: float):
-    """N3 in torch fp32 on the device from the same logits: same scores, stable sort for lower-id ties."""
+    """Routing in torch fp32 on the device from the same logits: same scores, stable sort for lower-id ties."""
 
     s = torch.nn.functional.softplus(mlog).sqrt()
     idx = torch.sort(s + bias, dim=-1, descending=True, stable=True).indices[:, :k]
@@ -266,7 +266,7 @@ def test_rank_halves_add_in_rank_order_to_the_fp64_reference_within_t1():
         b = _buffers()
         parts.append(moe.backbone(CFG, m, x, b).clone())
         share, a, xd64, budget = _rank_ref(m, keep, b, R)
-        xd = b.exl3.xd[:R * K]                                # the fp16 down inputs: T1 on the gate/up stage
+        xd = b.exl3.xd[:R * K]                                # the fp16 down inputs: the op-level bound on gate/up
         used = float(((xd.to(F64) - xd64).abs() / (budget + _half_ulp16(xd))).max())
         off = float((xd != xd64.half()).double().mean())
         print(f"rank {rank}: xd {used:.3f} of the rounding budget, {off:.2e} off the rounded fp64 value")
@@ -275,7 +275,7 @@ def test_rank_halves_add_in_rank_order_to_the_fp64_reference_within_t1():
     total = parts[0] + parts[1]
     bound = 8 * math.sqrt(I + HAD + 2 * K) * 2.0**-24 * absum
     ratio = float(((total.to(F64) - ref).abs() / bound.clamp_min(1e-300)).max())
-    print(f"rank-order sum: {ratio:.3f} of the T1 bound")
+    print(f"rank-order sum: {ratio:.3f} of the op-level bound")
     assert ratio <= 1
 
 

@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1 RoPE (N4) and QDQ (N5, N7, N6q) kernels against the fp32 reference port, row by row and in graphs."""
+"""DeepSeek-V4.1 RoPE and quantize-dequantize kernels against the fp32 reference port, row by row and in graphs."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _positions(n: int = 64, seed: int = 0) -> torch.Tensor:
 
 
 def _reference_table(kind: str, device: str) -> torch.Tensor:
-    """B8's ``freqs_cis`` for the kind, built with torch on ``device``, as (cos, sin) pairs."""
+    """The reference port's ``freqs_cis`` for the kind, built with torch on ``device``, as (cos, sin) pairs."""
 
     c = CFG
     original, base = (c.original_max_position_embeddings, c.compress_rope_theta) if kind == "yarn" else \
@@ -70,7 +70,7 @@ def _grouped(values: torch.Tensor, head: float, group: int) -> torch.Tensor:
     return torch.cat([torch.full((body.shape[0], 1), head, dtype=values.dtype), body], 1)
 
 
-# -- N4 ------------------------------------------------------------------------------------------------------
+# -- RoPE ---------------------------------------------------------------------------------------------------
 
 def test_tables_bit_equal_the_reference_built_on_the_device(table):
     kind, t = table
@@ -150,7 +150,7 @@ def test_apply_refuses_bad_arguments(table):
         rope.tables(CFG, "ntk", 8, DEV)
 
 
-# -- N5, N7, N6q ---------------------------------------------------------------------------------------------
+# -- QDQ ------------------------------------------------------------------------------------------------
 
 def _check(name: str, x: torch.Tensor) -> None:
     """The kernel, in place and into another buffer, bit-equals the reference port run on the CPU."""
@@ -224,7 +224,7 @@ def test_fp4_e4m3_exact_ties_of_both_divides():
 
 
 def test_e2m1_rounds_to_nearest_even():
-    """N7 at scale 1 against the nearest e2m1 point, ties to the even code, computed in fp64 here."""
+    """FP4 QDQ at scale 1 against the nearest e2m1 point, ties to the even code, computed in fp64 here."""
 
     v = _bf16_values(6.0)
     got = quant.fp4_qdq_1x32_e8m0(_grouped(v, 6.0, 32).to(DEV))[:, 1:].reshape(-1)[:len(v)].cpu()

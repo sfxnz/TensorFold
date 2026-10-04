@@ -1,10 +1,11 @@
-"""DSpark drafting: block logits within T2 of the reference's DSpark driver fed the same taps (tiny checkpoint and the
-pack's mtp stages), greedy drafts agreeing with the reference's on real weights, two thread ranks drafting alike,
-absorb writing committed positions only, the Markov chain stopping at d, and graph replays equal to eager runs.
+"""DSpark drafting: block logits within the model-level gate of the reference's DSpark driver fed the same taps (tiny
+checkpoint and the pack's mtp stages), greedy drafts agreeing with the reference's on real weights, two thread ranks
+drafting alike, absorb writing committed positions only, the Markov chain stopping at d, and graph replays equal to
+eager runs.
 
-Top-1 counts only rows the reference decides between its fp32 and mirror modes (as the forward's test does), and a
-row those modes route apart is held to the nearer. The pack's check needs ``TF_DSV41_MODEL``; its taps come from the
-whole backbone, loaded a few layers at a time.
+Top-1 counts only rows the reference decides between its fp32 and mirror modes (as the forward's test does), and a row
+those modes route apart is held to the nearer. The pack's check needs ``TF_DSV41_MODEL``; its taps come from the whole
+backbone, loaded a few layers at a time.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ MODEL = os.environ.get("TF_DSV41_MODEL", "")
 needs_model = pytest.mark.skipif(not MODEL or not Path(MODEL).is_dir(), reason="set TF_DSV41_MODEL to the checkpoint")
 CAP = 1024
 PROMPT_ROWS = 256
-TOP1, KL, REL_L2 = 0.99, 1e-3, 0.05     # T2, reduced model
+TOP1, KL, REL_L2 = 0.99, 1e-3, 0.05     # the model-level gate, reduced model
 DECIDED = 0.25                          # least share of rows whose top-1 the reference decides
 AGREE = 0.95                            # greedy drafts equal to the reference's on real weights
 # prompt chunks (ints) then decode rounds (rows, keep); every commit is absorbed and followed by a block
@@ -126,9 +127,9 @@ def _kl(p: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def _t2(got: torch.Tensor, mirror: torch.Tensor, fp32: torch.Tensor, what: str) -> torch.Tensor:
-    """T2 against the reference in mirror mode, its fp32 mode giving its own spread: top-1 counts only rows it
-    decides (margin above twice that spread), and a row whose two modes are farther apart than T2 (a routing flip)
-    is held to the nearer one -> the rows held to fp32."""
+    """The model-level gate against the reference in mirror mode, its fp32 mode giving its own spread: top-1 counts only
+    rows it decides (margin above twice that spread), and a row whose two modes are farther apart than the gate (a
+    routing flip) is held to the nearer one -> the rows held to fp32."""
 
     g, x, f = got.double(), mirror.double(), fp32.double()
     flip = (f - x).norm(dim=-1) > REL_L2 * x.norm(dim=-1)

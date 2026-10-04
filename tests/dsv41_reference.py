@@ -241,7 +241,7 @@ class Reference:
         self.cfg, self.weight, self.mode = cfg, weight, mode
         self.expert = expert or (lambda prefix, e: tuple(weight(f"{prefix}.ffn.experts.{e}.{n}.weight")
                                                         for n in ("w1", "w2", "w3")))
-        self.engram_rows, self.hasher = engram_rows, hasher   # (layer, ids) -> rows; B4's Hasher
+        self.engram_rows, self.hasher = engram_rows, hasher   # (layer, ids) -> rows; engram_hash's Hasher
         self.state = State()
         self._tables: dict[str, torch.Tensor] = {}
 

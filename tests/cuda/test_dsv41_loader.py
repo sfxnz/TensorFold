@@ -1,5 +1,5 @@
 """The per-rank loader: every object of the tiny checkpoint holds its source tensor's rank slice exactly (world 1 and
-both ranks of world 2), Engram tables are never read; real layers stay within B6's estimate and staging (class M)."""
+both ranks of world 2), Engram tables are never read; real layers stay within split's estimate and staging."""
 
 from __future__ import annotations
 
@@ -235,7 +235,8 @@ def test_a_layer_subset_without_dspark(linked, tiny_dir):
 
 
 def _estimate(model_dir: str, layers, world: int = 2) -> tuple[int, int]:
-    """B6's resident bytes of the loaded groups and capacity's staging over them (3x the largest tensor or layer)."""
+    """split.weights_estimate's resident bytes of the loaded groups and capacity's staging over them (3x the largest
+    tensor or layer)."""
 
     total, groups, largest = 0, {}, 0
     for name, info in capacity.headers(model_dir).items():

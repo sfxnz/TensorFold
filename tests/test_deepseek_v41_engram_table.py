@@ -100,7 +100,7 @@ def _reader(model: Path) -> Reader:
 
 
 def test_rank_ranges_equal_the_pack_tables_byte_offsets():
-    """pack-format §7: each rank's 12 hash columns are one weight range and one scale range in the file."""
+    """The pack format: each rank's 12 hash columns are one weight range and one scale range in the file."""
 
     want = {(1, 0): ((664, 49_152_446_104), (98_305_579_672, 99_841_593_592)),
             (1, 1): ((49_152_446_104, 98_305_579_672), (99_841_593_592, 101_377_629_016)),

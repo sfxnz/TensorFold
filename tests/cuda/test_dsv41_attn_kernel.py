@@ -1,4 +1,4 @@
-"""N8 sparse attention: T1 against the reference port's sparse_attn in mirror mode, bit-equal rows, graphs.
+"""Sparse attention: the op-level bound against the reference port's sparse_attn in mirror mode, bit-equal rows, graphs.
 
 Ring slots, ``kvw`` rows and cache entries a row must not read hold NaN, so a wrong read cannot pass.
 """
@@ -24,7 +24,8 @@ NAN = float("nan")
 
 
 def _t1(out: torch.Tensor, rows: list[tuple[torch.Tensor, torch.Tensor]], sink: torch.Tensor, what: str) -> None:
-    """T1 for attention against B8's mirror-mode sparse_attn over each row's (q [H, D], entries [n, D]).
+    """The op-level bound for attention against the reference port's mirror-mode sparse_attn over each row's (q [H, D],
+    entries [n, D]).
 
     Both round every P to bf16 (2^-9 relative), the kernel against a running max and the reference against the row's
     max, and both round the output once: |out - ref| <= 2^-8 (sum P |v| / den + |ref|) per element. Neither may sit
@@ -84,7 +85,8 @@ class Seq:
 
     def run(self, pos: int, rows: int, prompt: bool, start: int | None = None, kvw_rows: int | None = None
             ) -> torch.Tensor:
-        """N8 for query rows ``start..start+rows-1`` of a forward beginning at ``pos`` (kvw: pos.. committed after)."""
+        """Attention for query rows ``start..start+rows-1`` of a forward beginning at ``pos`` (kvw: pos.. committed
+        after)."""
 
         start = pos if start is None else start
         kvw_rows = start + rows - pos if kvw_rows is None else kvw_rows
@@ -101,7 +103,8 @@ class Seq:
         return out.cpu()
 
     def reference(self, pos: int, rows: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """(q, entries) per row as B8 assembles them: Reference._window over the committed ring, then the list."""
+        """(q, entries) per row as the reference port assembles them: Reference._window over the committed ring, then
+        the list."""
 
         st = SimpleNamespace(ring={0: self.ring(pos).float()})
         ns = SimpleNamespace(cfg=SimpleNamespace(sliding_window=WIN, head_dim=D), state=st)
@@ -154,7 +157,8 @@ def test_prompt_rows_equal_across_chunk_sizes():
 
 @pytest.mark.parametrize("p", [0, 5, 126, 127, 128, 500])
 def test_dspark_block_attends_window_at_p_and_block_rows(p):
-    """Five rows anchored at p (pos = p + 1, no kvw) plus the block: min(p+1, 128) + 5 entries, as B8 assembles."""
+    """Five rows anchored at p (pos = p + 1, no kvw) plus the block: min(p+1, 128) + 5 entries, as the reference
+    assembles."""
 
     seq = Seq(p + 1, 1, 32, seed=p)
     g = torch.Generator().manual_seed(p)

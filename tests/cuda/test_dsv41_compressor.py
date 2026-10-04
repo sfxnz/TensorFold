@@ -1,4 +1,5 @@
-"""Compressor, index-K and compressed entries: T1 against the reference port, bit-equal however rows are split.
+"""Compressor, index-K and compressed entries: the op-level bound against the reference port, bit-equal however rows are
+split.
 
 The reference runs on the CPU with the device's RoPE table, so the tables add no difference of their own.
 """
@@ -224,7 +225,7 @@ def test_rejected_rows_are_rewritten(tiny):
 
 
 def test_a_ratio_2_source_keeps_its_own_index_k_at_even_positions(tiny):
-    """D8: at an even position layer 2 writes nothing; its keys never take the ratio-1 source's."""
+    """At an even position layer 2 writes nothing; its keys never take the ratio-1 source's."""
 
     w, xa = tiny
     (r2, r1) = sorted(TINY.kv_source_layer_ids, key=lambda i: -TINY.roles[i].ratio)

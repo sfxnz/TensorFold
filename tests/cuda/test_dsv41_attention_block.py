@@ -1,6 +1,6 @@
-"""The attention sublayer: T2 against the reference port in mirror mode (tiny checkpoint; real layers with
-``TF_DSV41_MODEL``, memory class M), decode rows bit-equal alone and in windows, prompt rows bit-equal however the
-prompt is chunked, graph replays equal to eager.
+"""The attention sublayer: the model-level gate against the reference port in mirror mode (tiny checkpoint; real layers
+with ``TF_DSV41_MODEL``), decode rows bit-equal alone and in windows, prompt rows bit-equal however the prompt is
+chunked, graph replays equal to eager.
 
 Each test feeds every layer the same streams and runs the layers in order, so reuse layers read their index layer's
 lists of the same forward. The commit here (ring rows, compressor tails, position) is the forward's, written out.
@@ -33,7 +33,7 @@ tiny_dir = dsv41_tiny.tiny_dir          # the session fixture
 MODEL = os.environ.get("TF_DSV41_MODEL", "")
 needs_model = pytest.mark.skipif(not MODEL or not Path(MODEL).is_dir(), reason="set TF_DSV41_MODEL to the checkpoint")
 MIRROR = Mode("mirror", world=1)        # one rank: wo_b sums its whole input dim
-REL_L2 = 4 * 2**-8                      # T2: four bf16 half-ulps
+REL_L2 = 4 * 2**-8                      # four bf16 half-ulps
 COS = 0.9999
 TINY_CAP = 1024
 TINY_PROMPT = 320                       # prompt-chunk rows of the tiny runs

@@ -1,5 +1,6 @@
-"""DeepSeek-V4.1's indexer: N8a scores (T1 against fp64), N9/N9b selections equal to a reference selection on the
-kernel's own scores (zero tolerance), rows that never follow the window or row block, graphs, real layers (T1)."""
+"""DeepSeek-V4.1's indexer: scores (the op-level bound against fp64), block and entry selections equal to a reference
+selection on the kernel's own scores (zero tolerance), rows that never follow the window or row block, graphs, real
+layers."""
 
 from __future__ import annotations
 
@@ -93,7 +94,7 @@ def _ref_topk(s: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _ref_blocks(s: torch.Tensor, vis: int) -> torch.Tensor:
-    """B8's ``select_candidate_blocks`` on a row's visible scores, as ascending block ids."""
+    """The reference port's ``select_candidate_blocks`` on a row's visible scores, as ascending block ids."""
 
     if vis == 0:
         return torch.zeros(0, dtype=torch.int32)
@@ -126,7 +127,8 @@ def _check_selection(o: Out, ratio: int, pos: int, within=None, source: bool = F
 
 
 def _fp64(q, w, k, ratio: int, pos: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact scores and the T1 bound 8 sqrt(H D) 2^-24 sum_h |w_h| sum_d |q_hd k_td| per (row, entry), invisible -inf."""
+    """Exact scores and the op-level bound 8 sqrt(H D) 2^-24 sum_h |w_h| sum_d |q_hd k_td| per (row, entry), invisible
+    -inf."""
 
     dots = torch.einsum("rhd,td->rht", q.double(), k.double())
     s = (dots.relu() * w.double()[..., None]).sum(1)
@@ -137,7 +139,7 @@ def _fp64(q, w, k, ratio: int, pos: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _near_ties(got: torch.Tensor, want: torch.Tensor, s64: torch.Tensor, bound: torch.Tensor) -> float:
-    """Section 7.7's discrete rule: entries in one list only score within 4x the bounds of the k-th fp64 score.
+    """The selection rule: entries in one list only score within 4x the bounds of the k-th fp64 score.
     Returns the smallest k-th/(k+1)-th fp64 margin over the bound (inf when every entry is taken)."""
 
     k = len(want)
@@ -165,7 +167,7 @@ def test_scores_track_fp64_and_selections_differ_only_at_near_ties(ratio, pos):
         assert torch.isneginf(o.s[r, vis:(pos + MAX_ROWS) // ratio]).all(), r
         margins.append(_near_ties(o.list(r), _ref_topk(s64[r, :vis], min(K, vis)), s64[r, :vis].cpu(),
                                   bound[r, :vis].cpu()))
-    print(f"N8a ratio {ratio} pos {pos}: k-th margin / fp32 bound per row {[f'{m:.3g}' for m in margins]}")
+    print(f"scores ratio {ratio} pos {pos}: k-th margin / fp32 bound per row {[f'{m:.3g}' for m in margins]}")
 
 
 @pytest.mark.parametrize("ties", [False, True])
@@ -348,8 +350,8 @@ def test_graph_replays_equal_eager(table):
 
 
 def _swaps_within(mine: set, theirs: set, score: torch.Tensor, delta: float) -> None:
-    """Two top sets of one row: an item only B8 took outscores (B8's fp64) one only TF took by at most twice the
-    largest change between the two score sets, so the difference is the scores', never the selection's."""
+    """Two top sets of one row: an item only the reference took outscores (its fp64) one only TF took by at most twice
+    the largest change between the two score sets, so the difference is the scores', never the selection's."""
 
     if theirs - mine:
         gap = max(float(score[t]) for t in theirs - mine) - min(float(score[t]) for t in mine - theirs)
@@ -358,8 +360,9 @@ def _swaps_within(mine: set, theirs: set, score: torch.Tensor, delta: float) -> 
 
 @pytest.mark.skipif(not MODEL, reason="set TF_DSV41_MODEL to the checkpoint")
 def test_real_layers_track_the_reference_indexer():
-    """Layers 2, 20 and 24 on the checkpoint's weights: T1 scores on TF's own index Q, exact selection on them, and
-    B8's mirror-mode Indexer (its own Q, bf16 weights) differing only within the measured score change."""
+    """Layers 2, 20 and 24 on the checkpoint's weights: scores within the op-level bound on TF's own index Q, exact
+    selection on them, and the reference port's mirror-mode Indexer (its own Q, bf16 weights) differing only within the
+    measured score change."""
 
     pytest.importorskip("safetensors")
     from dsv41_layouts import mx8_from_block
@@ -393,7 +396,7 @@ def test_real_layers_track_the_reference_indexer():
         o = _run(qI, wI, keys, ratio, pos, source=role.candidate_source, within=within)
         _check_selection(o, ratio, pos, within=within, source=role.candidate_source)
         s64, bound = _fp64(qI, wI, keys, ratio, pos)
-        # B8's scores from its own index Q and bf16 weights (Reference.indexer's formulas, in fp64)
+        # the reference's scores from its own index Q and bf16 weights (Reference.indexer's formulas, in fp64)
         qb = ref.MIRROR.bf16(ref.linear(qr, model.W(f"{p}.attn.indexer.wq_b.weight"), ref.MIRROR))
         qref = ref.fp4_act_quant(ref.rope(qb.unflatten(-1, (H, D)), model.cis(role.rope, torch.arange(pos, S)),
                                           ref.MIRROR), 32)
@@ -418,5 +421,6 @@ def test_real_layers_track_the_reference_indexer():
         assert t1 <= 1, (layer, t1)
         if role.candidate_source:
             tf_cand = (o.cand, o.cand_n)
-        print(f"layer {layer}: index Q off B8 {float((qI.cpu().float() != qref).double().mean()):.2e}, T1 {t1:.3f}, "
-              f"top-k overlap {min(overlap):.4f}..{max(overlap):.4f}, candidate rows equal B8 {sum(equal_cand)}/{len(equal_cand)}")
+        print(f"layer {layer}: index Q off the reference {float((qI.cpu().float() != qref).double().mean()):.2e}, "
+              f"bound {t1:.3f}, top-k overlap {min(overlap):.4f}..{max(overlap):.4f}, "
+              f"candidate rows equal the reference {sum(equal_cand)}/{len(equal_cand)}")

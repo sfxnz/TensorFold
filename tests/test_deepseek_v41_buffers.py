@@ -82,7 +82,7 @@ def test_row_views_stop_at_the_cache():
 
 
 def _expected(rows: int, capacity: int, prefill: bool) -> dict:
-    """§2.3's shapes for the pack's config on two ranks."""
+    """The buffer shapes for the pack's config on two ranks."""
 
     taps = min(rows, 128)
     scored = min(rows, buffers.score_rows(capacity)) if prefill else rows

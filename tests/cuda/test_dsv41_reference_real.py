@@ -1,7 +1,7 @@
 """The fp32 reference's weights and drivers: EXL3 experts decoded on the GPU against the numpy format decoder, Engram
 rows and ids, chained layers against the model, and DSpark resumed against fresh.
 
-The tiny synthetic checkpoint runs wherever a GPU does; the pack's checks need ``TF_DSV41_MODEL`` (memory class M).
+The tiny synthetic checkpoint runs wherever a GPU does; the pack's checks need ``TF_DSV41_MODEL``.
 """
 
 from __future__ import annotations

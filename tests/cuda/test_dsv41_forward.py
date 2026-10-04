@@ -1,10 +1,10 @@
-"""The target forward on the tiny checkpoint: every block and the head within T2 of the reference port fed the same
-stream, the whole model's logits as close to the reference's as its own fp32 mode is, two thread ranks deterministic
-and in agreement, a prompt row's head independent of its chunk, rings rebuilt from committed rows, graph replays
-equal to eager runs.
+"""The target forward on the tiny checkpoint: every block and the head within the model-level gate of the reference port
+fed the same stream, the whole model's logits as close to the reference's as its own fp32 mode is, two thread ranks
+deterministic and in agreement, a prompt row's head independent of its chunk, rings rebuilt from committed rows, graph
+replays equal to eager runs.
 
-The tiny's random weights amplify roundings from block to block: the reference's own fp32 and mirror modes disagree
-on top-1 where margins are small, so end-to-end top-1 counts only rows whose top-1 is decided.
+The tiny's random weights amplify roundings from block to block: the reference's own fp32 and mirror modes disagree on
+top-1 where margins are small, so end-to-end top-1 counts only rows whose top-1 is decided.
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ from tensorfold.families.deepseek_v41.engram_table import Reader
 tiny_dir = dsv41_tiny.tiny_dir          # the session fixture
 CAP = 2560
 MIRROR = Mode("mirror", world=1)
-TOP1 = 0.99                             # T2, reduced model: top-1 agreement
-KL = 1e-3                               # T2: mean KL(reference || TF)
+TOP1 = 0.99                             # reduced model: top-1 agreement
+KL = 1e-3                               # mean KL(reference || TF)
 REL_L2 = 0.05                           # T2: logits rel-L2
 DECIDED = 0.25                          # least share of rows whose top-1 the tiny reference decides
 BLOCK_L2 = 4 * 2**-8                    # T2, one block: residual stream rel-L2 and cosine

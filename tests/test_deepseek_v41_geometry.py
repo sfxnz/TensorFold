@@ -101,7 +101,7 @@ def test_minimum_slots_and_reserve():
 
 @pytest.fixture
 def weights(monkeypatch) -> capacity.Weights:
-    """B6's estimate over every header the pack holds, read from a synthetic header dict."""
+    """split.weights_estimate over every header the pack holds, read from a synthetic header dict."""
 
     names = inventory(json.loads(FIXTURE.read_text()))
     monkeypatch.setattr(capacity, "headers", lambda model_dir, **kw: names)

@@ -1,4 +1,5 @@
-"""DeepSeek RMSNorm and mHC kernels: T1 against the fp32 reference port in mirror mode, bit-equal rows, graphs.
+"""DeepSeek RMSNorm and mHC kernels: the op-level bound against the fp32 reference port in mirror mode, bit-equal rows,
+graphs.
 
 The reference runs on the CPU: NVIDIA's container runs fp32 CUDA matmuls in TF32, too coarse for the mixes.
 """
@@ -138,7 +139,7 @@ def test_hc_mix_and_collapse_match_the_reference():
 
 
 def test_one_hot_collapse_is_the_plain_norm_of_copy_zero():
-    """Layer 0 collapses with pre = [1, 0, 0, 0]: exactly the first copy, normed by N1's own code."""
+    """Layer 0 collapses with pre = [1, 0, 0, 0]: exactly the first copy, normed by the RMSNorm kernel's own code."""
 
     gen = torch.Generator().manual_seed(3)
     x = _streams(7, gen).cuda()
