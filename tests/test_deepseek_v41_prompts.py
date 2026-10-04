@@ -127,6 +127,20 @@ def test_unknown_roles_are_template_errors(message):
         Template().render([message], tools=None, enable_thinking=False)
 
 
+IMAGE = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+
+
+@pytest.mark.parametrize("message", [
+    {"role": "user", "content": [{"type": "text", "text": "describe"}, IMAGE]},
+    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}]},
+    {"role": "user", "content_blocks": [IMAGE]},
+    {"role": "tool", "content": [{"type": "tool_result", "content": [IMAGE]}]},
+])
+def test_image_blocks_are_template_errors_not_placeholders(message):
+    with pytest.raises(TemplateError, match="vision"):
+        Template().render([message], tools=None, enable_thinking=False)
+
+
 def test_numeric_effort():
     """An integer effort becomes chat_template_kwargs.reasoning_budget and turns thinking on unless switched off."""
 

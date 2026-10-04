@@ -15,6 +15,15 @@ OPEN = enc.ASSISTANT_SP_TOKEN + enc.thinking_start_token
 CLOSE = enc.ASSISTANT_SP_TOKEN + enc.thinking_end_token
 
 
+def _has_image(blocks: Any) -> bool:
+    """Whether content blocks (a tool result's included) hold an image the encoder would render as a placeholder."""
+
+    return isinstance(blocks, list) and any(
+        isinstance(b, dict) and (b.get("type") in ("image", "image_url")
+                                 or (b.get("type") == "tool_result" and _has_image(b.get("content"))))
+        for b in blocks)
+
+
 def render(messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None, thinking: bool = False,
            reasoning_effort: str | int | None = None, add_generation_prompt: bool = True,
            drop_thinking: bool = True) -> str:
@@ -25,6 +34,8 @@ def render(messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None
         role = m.get("role") if isinstance(m, dict) else None
         if role not in ROLES:
             raise ValueError(f"message role must be one of {', '.join(ROLES)}")
+        if _has_image(m.get("content")) or _has_image(m.get("content_blocks")):
+            raise ValueError("image input requires a supported vision checkpoint")
         m = {**m, "role": "system" if role == "developer" else role}
         if "reasoning_content" not in m and "reasoning" in m:
             m["reasoning_content"] = m.pop("reasoning")

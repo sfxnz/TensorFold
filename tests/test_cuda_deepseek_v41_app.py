@@ -173,6 +173,15 @@ def test_a_thinking_budget_is_refused_before_decoding(server_budget, request_bud
     assert len(engine.calls) == 1
 
 
+def test_an_anthropic_image_block_is_refused_not_dropped():
+    engine = Engine()
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+    body = {"messages": [{"role": "user", "content": [{"type": "text", "text": "describe"}, image]}]}
+    with http_server(app_for(engine)) as port:
+        status, reply = post(port, body, True)
+    assert status == 400 and "vision" in reply and engine.calls == []
+
+
 def test_default_sampling_has_no_top_k(tmp_path):
     tok = Tokenizer(models.WordLevel({"[UNK]": 0, "w": 1}, unk_token="[UNK]"))
     tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
