@@ -5,8 +5,9 @@ Blocks 0, 1, 2, 3, 8, 14, 20, 21, 24, 25, 37 and 39 each take the bf16 stream an
 them, on one rank, at contexts 100, 1,100 and 17,000 (the prompt rows that end each context, then decode windows
 at even and odd positions). The reference builds its caches from every row and runs the whole block on those rows,
 in mirror mode (rel-L2 2%, cosine 0.9999) and fp32 mode. Both attend TF's index lists. The fp32 and mirror references
-differ by up to 10% on high-norm rows, so TF's fp32 distance is gated at max(3%, the mirror reference's own + 4 x 2^-8)
+differ most on high-norm rows, so TF's fp32 distance is gated at max(3%, the mirror reference's own + 4 x 2^-8)
 over the same rows: all but those the fp32 reference routes to other experts than TF at a near-tie (reported).
+TF's next pre-mix (the FFN mix's pre, which collapses the next block's stream) takes the mirror gate on those rows.
 TF's routed sets, index lists and candidate blocks must equal an fp64 selection on TF's own inputs except at
 near-ties (§7.7).
 TF runs one layer at a time with only that layer's weights on the device, so the 40 blocks fit one GPU.
@@ -380,7 +381,7 @@ def _quantize_as_mirror(rw: Ref, ref, held: dict):
 def ref_block(rw: Ref, L: int, name: str, state: State, stream: Stream, eng_ids) -> tuple[torch.Tensor, ...]:
     """Block L of the reference (M:968-994) in ``MODES[name]`` on TF's input stream: caches from every row, the whole
     block on the compared rows, their MoE in one call -> (their output stream fp32 [rows, hc, D], their routed experts,
-    their FFN input).
+    their FFN input, their next pre-mix [rows, hc]).
 
     ``fp32_qdq`` computes the window KV and compressed entries in mirror mode from mirror's attention input."""
 
@@ -408,12 +409,12 @@ def ref_block(rw: Ref, L: int, name: str, state: State, stream: Stream, eng_ids)
         at += b - a
         a_pre, a_post, a_comb = ref._mix(f"{p}.hc_attn", X)
         X = hc_post(ref.attention(L, xa, a), X, a_post, a_comb, mode)
-        _, f_post, f_comb = ref._mix(f"{p}.hc_ffn", X)
+        f_pre, f_post, f_comb = ref._mix(f"{p}.hc_ffn", X)
         xf = rms_norm(hc_pre(X, a_pre, mode), ref.W(f"{p}.ffn_norm.weight"), eps, mode)
-        mids.append((X, xf, f_post, f_comb))
-    X, xf, post, comb = (torch.cat(t) for t in zip(*mids))
+        mids.append((X, xf, f_pre, f_post, f_comb))
+    X, xf, pre, post, comb = (torch.cat(t) for t in zip(*mids))
     _, picked = gate(xf, ref.W(f"{p}.ffn.gate.weight"), ref.W(f"{p}.ffn.gate.bias"), c.num_experts_per_tok, c)
-    return hc_post(ref.moe(L, xf), X, post, comb, mode), picked, xf
+    return hc_post(ref.moe(L, xf), X, post, comb, mode), picked, xf, pre
 
 
 def _keep_ffn_input(ref, into: dict, name: str) -> None:
@@ -483,17 +484,18 @@ def _line(g: dict) -> str:
 
 
 def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict) -> dict:
-    """Block L's figures per compared group, ``_versus`` each mode."""
+    """Block L's figures per compared group, ``_versus`` each mode, and TF's next pre-mix against each mode's."""
 
     groups, at, k = [], 0, cfg.num_experts_per_tok
-    routes = {name: (y, _route(cfg, xf, *seen["gate"], picked, k)) for name, (y, picked, xf) in want.items()}
+    routes = {name: (y, _route(cfg, xf, *seen["gate"], picked, k)) for name, (y, picked, xf, _) in want.items()}
     for lo, hi, kind in _groups():
         n = hi - lo
         mine = {name: (y[at:at + n], _rows(r, at, at + n)) for name, (y, r) in routes.items()}
-        g = {"rows": [lo, hi], "kind": kind, **_versus(stream.Y[lo:hi].cpu(), _rows(seen["route"], at, at + n), mine)}
+        g = {"rows": [lo, hi], "kind": kind, **_versus(stream.Y[lo:hi].cpu(), _rows(seen["route"], at, at + n), mine),
+             "pre_mix": {name: _close(stream.pre_out[lo:hi].cpu(), w[3][at:at + n]) for name, w in want.items()}}
         groups.append(g)
         at += n
-        print(f"layer {L} ({cfg.roles[L].mode}) {kind} rows {lo}-{hi - 1}: " + _line(g))
+        print(f"layer {L} ({cfg.roles[L].mode}) {kind} rows {lo}-{hi - 1}: " + _line(g) + f"; pre-mix {g['pre_mix']}")
     print(f"layer {L}: TF routing against fp64 {seen['routing']}; TF index selection against fp64 {seen['index']}")
     return {"role": cfg.roles[L].mode, "groups": groups, "routing": seen["routing"], "index": seen["index"]}
 
@@ -543,6 +545,7 @@ def test_block_follows_the_reference(layers, L):
     for g in out["groups"]:
         for name in MODES:
             assert _gated(name, g[name]), f"layer {L} rows {g['rows']}: {name} {g[name]}"
+        assert _gated("mirror", g["pre_mix"]["mirror"]), f"layer {L} rows {g['rows']}: pre-mix {g['pre_mix']}"
     assert out["routing"]["not_ties"] == 0, f"layer {L}: routed sets differ away from near-ties {out['routing']}"
     for kind, d in out["index"].items():
         assert d["not_ties"] == 0, f"layer {L}: index {kind} differ away from near-ties {d}"
