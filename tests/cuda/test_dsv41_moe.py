@@ -1,5 +1,5 @@
 """DeepSeek-V4.1's MoE on one rank: N3 routing, EXL3 routed experts split by intermediate dim, the shared expert's
-single fp32 add, DSpark's NVFP4 experts; real layers against the fp32 reference (memory class M); receipts.
+single fp32 add, DSpark's NVFP4 experts; real layers against the fp32 reference (memory class M).
 
 Random layers keep the real rank shapes (D 5120, I 1152 a rank, 384 experts, 2-bit mcg trellises); a few trellis
 sets are shared between experts, each expert with its own suh/svh.
@@ -7,10 +7,8 @@ sets are shared between experts, each expert with its own suh/svh.
 
 from __future__ import annotations
 
-import json
 import math
 import os
-import statistics
 from pathlib import Path
 
 import pytest
@@ -34,7 +32,7 @@ MODEL = os.environ.get("TF_DSV41_MODEL", "")
 needs_model = pytest.mark.skipif(not MODEL or not Path(MODEL).is_dir(), reason="set TF_DSV41_MODEL to the checkpoint")
 D, I, E, K = CFG.hidden_size, CFG.moe_intermediate_size, CFG.n_routed_experts, CFG.num_experts_per_tok
 LIMIT, CAP, SETS, HAD = CFG.swiglu_limit, 512, 8, 128
-T2_REL, T2_COS, SLOW_GBPS = 4 * 2.0**-8, 0.9999, 200.0
+T2_REL, T2_COS = 4 * 2.0**-8, 0.9999
 F64 = torch.float64
 _CACHE: dict = {}
 
@@ -534,66 +532,3 @@ def test_dspark_experts4_track_the_real_mxfp4_experts_within_t1():
         real = MoEW(gate, bias, None, make_experts4(mats["w1"], mats["w3"], mats["w2"], limit=LIMIT), m.shared_gu,
                     m.shared_d)
         _check_dspark(real, x, b, lambda e, w, dense=dense: dense[e, w])
-
-
-# -- receipts ------------------------------------------------------------------------------------------------------
-
-def _distinct_layer() -> MoEW:
-    """Rank 0's TP-I shapes with every expert's trellises its own (so GB/s counts DRAM reads)."""
-
-    m, _ = _random_layer()
-    size = D // 16 * (I // 32) * 32
-    t = torch.randint(0, 256, (E, 3, 2 * size), device="cuda", dtype=torch.uint8).view(torch.int16)
-    gu_shape, d_shape = (D // 16, I // 32, 32), (I // 32, D // 16, 32)
-    ex = exl3.prepare([(t[e, 0].view(gu_shape), m.experts.suh_g[e], m.experts.svh_g[e]) for e in range(E)],
-                      [(t[e, 1].view(gu_shape), m.experts.suh_u[e], m.experts.svh_u[e]) for e in range(E)],
-                      [(t[e, 2].view(d_shape), m.experts.suh_d[e], m.experts.svh_d[e]) for e in range(E)], "mcg")
-    return MoEW(m.gate, m.bias, m.bias, ex, m.shared_gu, m.shared_d)
-
-
-def test_receipt_routed_prefill_tok_s_and_exl3_gbps():
-    """Receipt only (never gated): one layer's prompt MoE tok/s at 1024/2048 rows, DRAM-cold EXL3 GB/s at M = 1/4/6;
-    under 200 GB/s is flagged."""
-
-    m = _distinct_layer()
-    report = {"prefill": [], "exl3_gbps": []}
-    bp = _buffers(rows=2048, prefill=True)
-    for rows in (1024, 2048):
-        x = _x(rows, 130)
-        moe.backbone(CFG, m, x, bp, prompt=True)
-        times = []
-        for _ in range(3):
-            a, z = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            a.record()
-            moe.backbone(CFG, m, x, bp, prompt=True)
-            z.record()
-            z.synchronize()
-            times.append(a.elapsed_time(z) * 1e-3)
-        tok_s = rows / statistics.median(times)
-        report["prefill"].append({"rows": rows, "layers": 1, "tok_s": round(tok_s, 1)})
-        print(f"routed prefill {rows} rows (one layer's routed + shared experts, one rank): {tok_s:9.1f} tok/s")
-    flush = torch.empty(max(4 * torch.cuda.get_device_properties(0).L2_cache_size, 1 << 27), dtype=torch.uint8,
-                        device="cuda")
-    b = _buffers()
-    for M in (1, 4, 6):
-        x = _x(M, 140 + M)
-        moe.route(x, m.gate, m.bias, b.mlog[:M], b.pick[:M], b.wts[:M], K, CFG.routed_scaling_factor)
-        nbytes = m.experts.nbytes_read(sorted(set(b.pick[:M].reshape(-1).tolist())))
-        graph = _capture(lambda x=x, M=M: exl3.routed(x, b.pick[:M], b.wts[:M], m.experts, b.exl3, b.part[:M], M,
-                                                      LIMIT, exl3.ACT_F32))
-        times = []
-        for _ in range(30):
-            flush.zero_()
-            a, z = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            a.record()
-            graph.replay()
-            z.record()
-            z.synchronize()
-            times.append(a.elapsed_time(z) * 1e-3)
-        gbps = nbytes / statistics.median(times) / 1e9
-        report["exl3_gbps"].append({"m": M, "bytes": nbytes, "gbps": round(gbps, 1), "slow": gbps < SLOW_GBPS})
-        print(f"exl3 routed TP-I M={M}: {gbps:7.1f} GB/s{' SLOW' if gbps < SLOW_GBPS else ''}")
-    path = os.environ.get("TF_DSV41_REPORT")
-    if path:
-        old = json.loads(Path(path).read_text()) if Path(path).is_file() else {}
-        Path(path).write_text(json.dumps({**old, "moe": report}, indent=1))

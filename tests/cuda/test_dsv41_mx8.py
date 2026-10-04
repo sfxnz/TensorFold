@@ -1,12 +1,10 @@
 """DeepSeek's FP8 projections: bf16 is ``Mx8Linear``'s bits, fp32 rounds to them, rows never follow the row count,
-real rank shapes track an fp64 product of the dequantized weights (T1), and graph replays report DRAM-cold GB/s."""
+and real rank shapes track an fp64 product of the dequantized weights (T1)."""
 
 from __future__ import annotations
 
-import json
 import math
 import os
-import statistics
 
 import pytest
 
@@ -25,7 +23,6 @@ needs_model = pytest.mark.skipif(not MODEL, reason="set TF_DSV41_MODEL to the ch
 ROWS = range(1, 7)
 PROMPTS = (1, 7, 256, 2048)
 GROUPS = 4                          # wo_a groups a rank holds
-SLOW_GBPS = 200.0
 # one rank's projections at world 2: (n, K, fp32 output)
 SHAPES = {
     "wqa_kv": (1792, 5120, False), "wq_b": (16384, 1280, False), "wo_a": (1024, 4096, False),
@@ -235,47 +232,3 @@ def test_real_rank_parts_track_the_fp64_product(module, f32):
             print(module, "rank", rank, "prompt" if prompt else "decode", _t1(got, x, w, lins[0].k, f32))
         del w8, s, dense, w, lins
         torch.cuda.empty_cache()
-
-
-def _gbps(step, nbytes: int, flush: torch.Tensor, reps: int = 30) -> float:
-    """Bytes over the median time of graph replays, L2 flushed before each (weights read from DRAM)."""
-
-    graph = _capture(step)
-    times = []
-    for _ in range(reps):
-        flush.zero_()
-        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        a.record()
-        graph.replay()
-        b.record()
-        b.synchronize()
-        times.append(a.elapsed_time(b) * 1e-3)
-    return nbytes / statistics.median(times) / 1e9
-
-
-def _projection(lins: list[Mx8Linear], x: torch.Tensor, out: torch.Tensor, f32: bool):
-    if len(lins) > 1:
-        return lambda: mx8.grouped(lins, x, out)
-    return lambda: mx8.mm(lins[0], x, out, f32=f32)
-
-
-def test_receipt_graph_replay_gbps_per_rank_shape():
-    """Receipt only (never gated): DRAM-cold GB/s of each rank shape at 1, 4 and 6 rows; under 200 GB/s is flagged."""
-
-    flush = torch.empty(max(4 * torch.cuda.get_device_properties(0).L2_cache_size, 1 << 27), dtype=torch.uint8,
-                        device="cuda")
-    rows = []
-    for name, (n, k, f32) in SHAPES.items():
-        lins = _wo_a() if name == "wo_a" else [_linear(name)]
-        for m in (1, 4, 6):
-            x = _x(m, k * len(lins), 30)
-            out = torch.empty((m, n * len(lins)), dtype=torch.float32 if f32 else torch.bfloat16, device="cuda")
-            nbytes = sum(p.nbytes() for p in lins) + x.nbytes + out.nbytes
-            gbps = _gbps(_projection(lins, x, out, f32), nbytes, flush)
-            rows.append({"shape": name, "n": n, "k": k, "groups": len(lins), "m": m, "fp32": f32,
-                         "bytes": nbytes, "gbps": round(gbps, 1), "slow": gbps < SLOW_GBPS})
-            flag = " SLOW" if gbps < SLOW_GBPS else ""
-            print(f"mx8 {name:11s} [{n} x {k}] x{len(lins)} M={m}: {gbps:7.1f} GB/s{flag}")
-    if os.environ.get("TF_DSV41_REPORT"):
-        with open(os.environ["TF_DSV41_REPORT"], "w") as f:
-            json.dump({"mx8_gbps": rows}, f, indent=1)
