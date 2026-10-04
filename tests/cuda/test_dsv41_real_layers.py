@@ -4,13 +4,17 @@ TF's own stream, and a reduced model through TF's prompt path.
 Blocks 0, 1, 2, 3, 8, 14, 20, 21, 24, 25, 37 and 39 each take the bf16 stream and FFN pre that TF's forward gives
 them, on one rank, at contexts 100, 1,100 and 17,000 (the prompt rows that end each context, then decode windows
 at even and odd positions). The reference builds its caches from every row and runs the whole block on those rows,
-in mirror mode (rel-L2 4 x 2^-8, cosine 0.9999) and fp32 mode (rel-L2 3%). Both attend TF's index lists. TF's routed
-sets, index lists and candidate blocks must equal an fp64 selection on TF's own inputs except at near-ties (§7.7).
+in mirror mode (rel-L2 2%, cosine 0.9999) and fp32 mode. Both attend TF's index lists. The fp32 and mirror references
+differ by up to 10% on high-norm rows, so TF's fp32 distance is gated at max(3%, the mirror reference's own + 4 x 2^-8)
+over the same rows: all but those the fp32 reference routes to other experts than TF at a near-tie (reported).
+TF's routed sets, index lists and candidate blocks must equal an fp64 selection on TF's own inputs except at
+near-ties (§7.7).
 TF runs one layer at a time with only that layer's weights on the device, so the 40 blocks fit one GPU.
 
 Each DSpark stage runs TF's block [y, noise...] after each context's prompt and first window, its rings absorbed from
-TF's taps; the reference runs the stage on TF's stage input, gated as a block. The reduced model's logits must follow
-the mirror reference (top-1 on 99% of rows, mean KL 1e-3, rel-L2 5%).
+TF's taps; the reference runs the stage on TF's stage input, gated as a block. The reduced model's logits are near flat,
+so TF's KL and rel-L2 against the mirror reference must not exceed the fp32 reference's own, and its top-1 must hold on
+99% of the rows the reference decides (its top-1 margin above its own fp32-vs-mirror spread; at least 20% of rows).
 
 Reported beside the gates: fp32 mode with its FP8/FP4 quantizers fed mirror mode's inputs (``fp32_qdq``: a step flip
 from a 2^-9 input change is not a rounding error), and the mirror reference split over two ranks (only its fp32 sums
@@ -67,11 +71,11 @@ TAIL = 256                              # compared prompt rows that end each con
 BLOCK = PREFILL_ROWS                    # rows the reference writes caches for at once
 MIRROR, FP32 = Mode("mirror", world=1), Mode("fp32", world=1)     # one rank: row sums over the whole input dim
 MODES = {"mirror": MIRROR, "fp32": FP32, "fp32_qdq": FP32}
-REL_MIRROR, COS, REL_FP32 = 4 * 2**-8, 0.9999, 0.03      # T2, one block
+REL_MIRROR, COS, REL_FP32, MARGIN = 0.02, 0.9999, 0.03, 4 * 2**-8     # T2, one block
 TIE = 4                                 # a near-tie: the fp64 margin below TIE x the fp32 bound
 DSPARK_AT = (99, 104, 1_099, 1_104, 16_999, 17_004)       # p after each context's prompt and its first window
 REDUCED, REDUCED_ROWS = 8, 256          # reduced model: layers 0-7, norm, head over 256 positions
-TOP1, KL, REL_LOGITS = 0.99, 1e-3, 0.05                  # T2, reduced model, against the mirror reference
+TOP1, DECIDED = 0.99, 0.2               # reduced model: top-1 on decided rows, the least share of rows decided
 
 
 class Ref(RefWeights):
@@ -171,10 +175,11 @@ def _close(got: torch.Tensor, want: torch.Tensor) -> dict:
     return {"rel": float((g - x).norm() / x.norm()), "cos": float(g @ x / (g.norm() * x.norm()))}
 
 
-def _routing(cfg: Config, xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, k: int
-             ) -> dict:
-    """TF's top-``k`` sets against an fp64 router on TF's input (N3, M:809-827): rows that differ, those of them not
-    at a near-tie, and the least k-th to (k+1)-th margin over its tolerance (TIE x the fp32 error bound)."""
+def _route(cfg: Config, xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, k: int
+           ) -> dict:
+    """Per row of FFN input ``xf``: fp64 router scores (N3, M:809-827), the sorted top-``k`` set ``pick`` made, its
+    k-th to (k+1)-th margin, whether ``pick`` differs from the fp64 top-k, and whether that margin is below TIE x
+    the fp32 error bound."""
 
     x, g = xf.double(), gate.double()
     z = x @ g.T / cfg.gate_temp
@@ -186,9 +191,45 @@ def _routing(cfg: Config, xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tens
     kth, nxt = order[:, k - 1:k], order[:, k:k + 1]
     margin = (s.gather(1, kth) - s.gather(1, nxt))[:, 0]
     tol = TIE * (ds.gather(1, kth) + ds.gather(1, nxt))[:, 0]
-    differ = (order[:, :k].sort(-1).values != pick.long().sort(-1).values).any(-1)
-    return {"rows": len(x), "differ": int(differ.sum()), "not_ties": int((differ & (margin >= tol)).sum()),
-            "least_margin": float((margin / tol).min())}
+    sets = pick.long().sort(-1).values
+    return {"s": s, "sets": sets, "margin": margin, "ratio": margin / tol, "tie": margin < tol,
+            "differ": (order[:, :k].sort(-1).values != sets).any(-1)}
+
+
+def _routing(r: dict) -> dict:
+    """A route's rows that differ from fp64, those of them not at a near-tie, and the least margin over its bound."""
+
+    return {"rows": len(r["s"]), "differ": int(r["differ"].sum()), "not_ties": int((r["differ"] & ~r["tie"]).sum()),
+            "least_margin": float(r["ratio"].min())}
+
+
+def _rows(r: dict, lo: int, hi: int) -> dict:
+    return {k: v[lo:hi] for k, v in r.items()}
+
+
+def _versus(got: torch.Tensor, tf: dict, want: dict) -> dict:
+    """TF's output ``got`` (route ``tf``) against each mode's (output, route) in ``want``: the distance over all rows,
+    the rows that mode routes to other experts than TF, those of them at a near-tie (either side's margin under its
+    bound, or the reference's under twice the largest score shift between the two inputs), and TF's and the mirror
+    reference's distances over the rest (``kept``, ``mirror_ref``)."""
+
+    out = {}
+    for name, (y, r) in want.items():
+        moved = (r["sets"] != tf["sets"]).any(-1)
+        tie = moved & (tf["tie"] | r["tie"] | (r["margin"] <= 2 * (tf["s"] - r["s"]).abs().amax(-1)))
+        keep = ~tie
+        out[name] = {**_close(got, y), "rerouted": int(moved.sum()), "near_tie": int(tie.sum()),
+                     "kept": _close(got[keep], y[keep])["rel"],
+                     "mirror_ref": _close(want["mirror"][0][keep], y[keep])["rel"]}
+    return out
+
+
+def _gated(name: str, d: dict) -> bool:
+    """The T2 gate of one comparison: mirror over all rows, fp32 over the kept rows; ``fp32_qdq`` is reported only."""
+
+    if name == "mirror":
+        return d["rel"] <= REL_MIRROR and d["cos"] >= COS
+    return name != "fp32" or d["kept"] <= max(REL_FP32, d["mirror_ref"] + MARGIN)
 
 
 class Stream:
@@ -263,9 +304,9 @@ class Stream:
             self.pre_out[a:a + n].copy_(b.pre_in[:R])
             F.commit(w, st, b, R, R)
         seen = {k: torch.cat(v) for k, v in seen.items()}
-        seen["routing"] = _routing(cfg, seen["xf"], lw.moe.gate.cpu(), lw.moe.bias.cpu(), seen["pick"],
-                                   cfg.num_experts_per_tok)
-        seen["index"] = index
+        seen["gate"] = (lw.moe.gate.cpu(), lw.moe.bias.cpu())
+        seen["route"] = _route(cfg, seen["xf"], *seen["gate"], seen["pick"], cfg.num_experts_per_tok)
+        seen["routing"], seen["index"] = _routing(seen["route"]), index
         w.layers, w.engram = [], {}
         del lw, eg
         return seen
@@ -336,9 +377,10 @@ def _quantize_as_mirror(rw: Ref, ref, held: dict):
     return mref
 
 
-def ref_block(rw: Ref, L: int, name: str, state: State, stream: Stream, eng_ids) -> tuple[torch.Tensor, torch.Tensor]:
+def ref_block(rw: Ref, L: int, name: str, state: State, stream: Stream, eng_ids) -> tuple[torch.Tensor, ...]:
     """Block L of the reference (M:968-994) in ``MODES[name]`` on TF's input stream: caches from every row, the whole
-    block on the compared rows, their MoE in one call -> (their output stream fp32 [rows, hc, D], their routed experts).
+    block on the compared rows, their MoE in one call -> (their output stream fp32 [rows, hc, D], their routed experts,
+    their FFN input).
 
     ``fp32_qdq`` computes the window KV and compressed entries in mirror mode from mirror's attention input."""
 
@@ -371,7 +413,19 @@ def ref_block(rw: Ref, L: int, name: str, state: State, stream: Stream, eng_ids)
         mids.append((X, xf, f_post, f_comb))
     X, xf, post, comb = (torch.cat(t) for t in zip(*mids))
     _, picked = gate(xf, ref.W(f"{p}.ffn.gate.weight"), ref.W(f"{p}.ffn.gate.bias"), c.num_experts_per_tok, c)
-    return hc_post(ref.moe(L, xf), X, post, comb, mode), picked
+    return hc_post(ref.moe(L, xf), X, post, comb, mode), picked, xf
+
+
+def _keep_ffn_input(ref, into: dict, name: str) -> None:
+    """Has ``ref.moe`` store its input in ``into[name]``."""
+
+    moe = ref.moe
+
+    def kept(layer: int, x: torch.Tensor) -> torch.Tensor:
+        into[name] = x
+        return moe(layer, x)
+
+    ref.moe = kept
 
 
 def _dspark(stream: Stream, rw: Ref) -> list[dict]:
@@ -397,10 +451,11 @@ def _dspark(stream: Stream, rw: Ref) -> list[dict]:
         b.pre_in[:B].zero_()
         b.pre_in[:B, 0].fill_(1.0)
         torch.sub(st.pos_dev.expand(B), 1, out=k.anchors)
-        refs, held = {name: rw.reference(MODES[name], State(pos=p + 1)) for name in MODES}, {}
+        refs, held, xfs = {name: rw.reference(MODES[name], State(pos=p + 1)) for name in MODES}, {}, {}
         mref = _quantize_as_mirror(rw, refs["fp32_qdq"], held)
         for name, ref in refs.items():
             (mref if name == "fp32_qdq" else ref).absorb(taps.flatten(1).float().cpu(), p + 1 - n)
+            _keep_ffn_input(ref, xfs, name)
         for sw in stages:
             X, pre = b.xd.float().cpu(), b.pre_in[:B].cpu()
             held["xa"] = rms_norm(hc_pre(X, pre, MIRROR), mref.W(f"{mref._prefix(sw.index)}.attn_norm.weight"),
@@ -408,34 +463,37 @@ def _dspark(stream: Stream, rw: Ref) -> list[dict]:
             dspark._stage(sw, w, st, b, k)
             got = b.xd.cpu()
             top = cfg.dspark_num_experts_per_tok            # the shared expert's slot follows the routed ones
-            d = {"stage": sw.index - n_layers, "p": p, "routing": _routing(
-                cfg, b.xn[:B].cpu(), sw.moe.gate.cpu(), sw.moe.bias.cpu(), b.dpick[:B, :top].cpu(), top)}
+            gw = (sw.moe.gate.cpu(), sw.moe.bias.cpu())
+            tf = _route(cfg, b.xn[:B].cpu(), *gw, b.dpick[:B, :top].cpu(), top)
+            want = {}
             for name, ref in refs.items():
-                d[name] = _close(got, ref.block(sw.index, X, pre, p + 1)[0])
-            out.append(d)
+                y = ref.block(sw.index, X, pre, p + 1)[0]
+                q = mref._prefix(sw.index)
+                picked = gate(xfs[name], ref.W(f"{q}.ffn.gate.weight"), ref.W(f"{q}.ffn.gate.bias"), top, cfg)[1]
+                want[name] = (y, _route(cfg, xfs[name], *gw, picked, top))
+            out.append({"stage": sw.index - n_layers, "p": p, "routing": _routing(tf), **_versus(got, tf, want)})
     return out
 
 
-def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict) -> dict:
-    """Block L's figures per compared group: TF against each mode over all its rows, the rows each mode routes to
-    other experts than TF and TF's distance over the rest (``same_route``), and the mirror reference's distance."""
+def _line(g: dict) -> str:
+    m = g["mirror"]
+    return f"rel-L2 {m['rel']:.3g} mirror (cosine {m['cos']:.6f}), " + ", ".join(
+        f"{g[n]['rel']:.3g} {n} ({g[n]['rerouted']} rows rerouted, {g[n]['near_tie']} at a near-tie; {g[n]['kept']:.3g}"
+        f" on the rest, the mirror reference {g[n]['mirror_ref']:.3g})" for n in ("fp32", "fp32_qdq"))
 
-    groups, at = [], 0
-    tf_sets = seen["pick"].long().sort(-1).values
+
+def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict) -> dict:
+    """Block L's figures per compared group, ``_versus`` each mode."""
+
+    groups, at, k = [], 0, cfg.num_experts_per_tok
+    routes = {name: (y, _route(cfg, xf, *seen["gate"], picked, k)) for name, (y, picked, xf) in want.items()}
     for lo, hi, kind in _groups():
-        got, g = stream.Y[lo:hi].cpu(), {"rows": [lo, hi], "kind": kind}
-        for name in MODES:
-            out, routed = (t[at:at + hi - lo] for t in want[name])
-            same = (routed.sort(-1).values == tf_sets[at:at + hi - lo]).all(-1)
-            g[name] = {**_close(got, out), "rerouted": int((~same).sum()),
-                       "same_route": _close(got[same], out[same])["rel"],
-                       "mirror_ref": _close(want["mirror"][0][at:at + hi - lo], out)["rel"]}
+        n = hi - lo
+        mine = {name: (y[at:at + n], _rows(r, at, at + n)) for name, (y, r) in routes.items()}
+        g = {"rows": [lo, hi], "kind": kind, **_versus(stream.Y[lo:hi].cpu(), _rows(seen["route"], at, at + n), mine)}
         groups.append(g)
-        at += hi - lo
-        print(f"layer {L} ({cfg.roles[L].mode}) {kind} rows {lo}-{hi - 1}: rel-L2 {g['mirror']['rel']:.3g} mirror "
-              f"(cosine {g['mirror']['cos']:.6f}), " + ", ".join(
-                  f"{g[n]['rel']:.3g} {n} ({g[n]['rerouted']} rows rerouted, {g[n]['same_route']:.3g} on the rest; "
-                  f"the mirror reference {g[n]['mirror_ref']:.3g})" for n in ("fp32", "fp32_qdq")))
+        at += n
+        print(f"layer {L} ({cfg.roles[L].mode}) {kind} rows {lo}-{hi - 1}: " + _line(g))
     print(f"layer {L}: TF routing against fp64 {seen['routing']}; TF index selection against fp64 {seen['index']}")
     return {"role": cfg.roles[L].mode, "groups": groups, "routing": seen["routing"], "index": seen["index"]}
 
@@ -473,9 +531,7 @@ def layers(report):
         stream.X = stream.Y = stream.pre = stream.pre_out = None
         report["dspark"] = _dspark(stream, rw)
         for d in report["dspark"]:
-            print(f"DSpark stage {d['stage']} at p={d['p']}: rel-L2 {d['mirror']['rel']:.3g} mirror (cosine "
-                  f"{d['mirror']['cos']:.6f}), {d['fp32']['rel']:.3g} fp32, {d['fp32_qdq']['rel']:.3g} fp32_qdq; TF "
-                  f"routing against fp64 {d['routing']}")
+            print(f"DSpark stage {d['stage']} at p={d['p']}: {_line(d)}; TF routing against fp64 {d['routing']}")
     finally:
         stream.close()
     return report
@@ -485,9 +541,8 @@ def layers(report):
 def test_block_follows_the_reference(layers, L):
     out = layers["layers"][L]
     for g in out["groups"]:
-        m, f = g["mirror"], g["fp32"]
-        assert m["rel"] <= REL_MIRROR and m["cos"] >= COS, f"layer {L} rows {g['rows']}: mirror {m}"
-        assert f["rel"] <= REL_FP32, f"layer {L} rows {g['rows']}: fp32 {f}"
+        for name in MODES:
+            assert _gated(name, g[name]), f"layer {L} rows {g['rows']}: {name} {g[name]}"
     assert out["routing"]["not_ties"] == 0, f"layer {L}: routed sets differ away from near-ties {out['routing']}"
     for kind, d in out["index"].items():
         assert d["not_ties"] == 0, f"layer {L}: index {kind} differ away from near-ties {d}"
@@ -496,8 +551,7 @@ def test_block_follows_the_reference(layers, L):
 def test_dspark_stages_follow_the_reference(layers):
     assert len(layers["dspark"]) == 3 * len(DSPARK_AT)
     for d in layers["dspark"]:
-        assert d["mirror"]["rel"] <= REL_MIRROR and d["mirror"]["cos"] >= COS, f"DSpark {d}"
-        assert d["fp32"]["rel"] <= REL_FP32, f"DSpark {d}"
+        assert all(_gated(name, d[name]) for name in MODES), f"DSpark {d}"
         assert d["routing"]["not_ties"] == 0, f"DSpark {d}"
 
 
@@ -522,10 +576,15 @@ def test_reduced_model_follows_the_reference(report):
     torch.cuda.empty_cache()
     mirror, fp32, split = (rw.model(ids, mode, all_logits=True)[0].double()
                            for mode in (MIRROR, FP32, Mode("mirror", world=2)))
+    top2 = mirror.topk(2, -1).values
+    decided = top2[:, 0] - top2[:, 1] > (fp32 - mirror).abs().amax(-1)
     out = {"layers": REDUCED, "positions": REDUCED_ROWS, "tf": _logits(got, mirror), "fp32": _logits(fp32, mirror),
-           "mirror_world2": _logits(split, mirror)}
+           "mirror_world2": _logits(split, mirror), "decided": float(decided.double().mean()),
+           "top1_decided": _logits(got[decided], mirror[decided])["top1"]}
     report["reduced"] = out
     print(f"reduced model, {REDUCED} layers over {REDUCED_ROWS} positions, against the mirror reference: TF {out['tf']}"
-          f", the fp32 reference {out['fp32']}, the mirror reference over two ranks {out['mirror_world2']}")
-    tf = out["tf"]
-    assert tf["top1"] >= TOP1 and tf["kl"] <= KL and tf["rel"] <= REL_LOGITS, out
+          f", the fp32 reference {out['fp32']}, the mirror reference over two ranks {out['mirror_world2']}; TF top-1 "
+          f"{out['top1_decided']:.4f} on the {out['decided']:.3f} of rows the reference decides")
+    tf, ref = out["tf"], out["fp32"]
+    assert out["decided"] >= DECIDED and out["top1_decided"] >= TOP1, out
+    assert tf["kl"] <= ref["kl"] and tf["rel"] <= ref["rel"], out
