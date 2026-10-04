@@ -100,6 +100,33 @@ class DeepSeekV41Engine:
         self.e = Engine(self.w, capacity, prefill_rows, graphs=graphs, hasher=hasher, reader=reader)
         self.kept = Kept(self.e, cache_bytes, entries)    # allocated now: a request allocates no snapshot memory
         self.eos = self.e.eos
+        self._warm()
+
+    def _warm(self) -> None:
+        """A full prompt chunk and decode rounds with top_k off, then an empty sequence and the fp16 overflow
+        guard's checks given back: the allocator then holds every transient a request's kernels take, so serving
+        reserves no more device memory."""
+
+        from tensorfold.engine.exact_sampling import Sampling
+
+        from . import MAX_ROWS
+        from .decode import dspark_decode, serial_decode
+        from .prefill import prefill
+
+        e, (drafts, confidence) = self.e, self.policy
+        guards = [(b.exl3, vars(b.exl3).get("guard_left")) for b in (e.pbuf, e.dbuf)]
+        sampling = Sampling(seed=0, temperature=1.0, top_k=0)
+        first = prefill(e, [self.w.cfg.bos_token_id] * min(e.pbuf.rows, e.st.capacity - 3 * MAX_ROWS), sampling)
+        if drafts == 0 or self.w.dspark is None:
+            serial_decode(e, first, 2 * MAX_ROWS, sampling, stop_eos=False)
+        else:
+            dspark_decode(e, first, 2 * MAX_ROWS, sampling, drafts=drafts, confidence=confidence, stop_eos=False)
+        e.reset()
+        for s, left in guards:
+            if left is None:
+                vars(s).pop("guard_left", None)
+            else:
+                s.guard_left = left
 
     @staticmethod
     def _engram(model_dir: Path, cfg):
