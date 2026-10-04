@@ -84,7 +84,7 @@ def layer(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tensor
     norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:R], b.pre_f[:R], b.post_f[:R], b.comb_f[:R], eps,
                  cfg.hc_eps, cfg.hc_sinkhorn_iters)
     xf = norms.collapse_norm(flat, b.pre_a[:R], lw.ffn_norm, b.xn[:R], eps)    # delayed mHC: the attention's pre
-    moe.backbone(cfg, lw.moe, xf, b, prompt=prompt)
+    moe.backbone(cfg, lw.moe, xf, b, prompt=prompt, comm=w.comm)
     glue.hc_post(flat, flat, _gather(w, b, R), b.post_f[:R], b.comb_f[:R])
     b.pre_in[:R].copy_(b.pre_f[:R])
 

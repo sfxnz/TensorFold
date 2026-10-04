@@ -110,18 +110,24 @@ def shared(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False) -> torch.Tensor
     return mx8.mm(m.shared_d, b.sact[:R], b.sd[:R], f32=True, prompt=prompt)
 
 
-def _guard(s: exl3.Scratch, pairs: int) -> None:
-    """Raise if the fp16 activations of an eager pass overflowed; skipped in graph capture and after GUARD_CALLS."""
+def _guard(s: exl3.Scratch, pairs: int, comm=None) -> None:
+    """Raise on every rank if any rank's eager fp16 activations overflowed; none in capture or past GUARD_CALLS."""
 
     left = getattr(s, "guard_left", GUARD_CALLS)
     if left <= 0 or torch.cuda.is_current_stream_capturing():
         return
     s.guard_left = left - 1
-    if bool(torch.isinf(s.xg[:pairs]).any() | torch.isinf(s.xu[:pairs]).any() | torch.isinf(s.xd[:pairs]).any()):
+    flag = (torch.isinf(s.xg[:pairs]).any() | torch.isinf(s.xu[:pairs]).any() | torch.isinf(s.xd[:pairs]).any())
+    flag = flag.to(torch.int32).reshape(1)
+    if comm is not None:                # xd holds this rank's intermediate columns: the verdict is every rank's
+        both = torch.empty((comm.world,), dtype=torch.int32, device=flag.device)
+        comm.all_gather(flag, both)
+        flag = both
+    if bool(flag.any()):
         raise FloatingPointError("EXL3 expert activations overflow fp16")
 
 
-def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False) -> torch.Tensor:
+def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) -> torch.Tensor:
     """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share b.part [R, D].
 
     Routed experts run in windows of the scratch's rows on the same kernels, so ``prompt`` changes only the shared
@@ -136,7 +142,7 @@ def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False) -> torch.Tens
         n = min(s.rows, R - r0)
         exl3.routed(xf[r0:r0 + n], b.pick[r0:r0 + n], b.wts[r0:r0 + n], m.experts, s, b.part[r0:r0 + n], n,
                     cfg.swiglu_limit, exl3.ACT_F32)
-        _guard(s, n * s.slots)
+        _guard(s, n * s.slots, comm)
     shared(cfg, m, xf, b, prompt=prompt)
     return b.part[:R].add_(b.sd[:R])
 

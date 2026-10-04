@@ -307,6 +307,24 @@ def test_fp16_overflow_raises_on_the_first_forwards_only():
     assert bool(torch.isinf(b.exl3.xg[:2 * K]).any())
 
 
+def test_an_overflow_on_one_rank_raises_on_both():
+    from dsv41_pair import run_pair
+
+    layers = [_random_layer(rank)[0] for rank in (0, 1)]
+    xs = [torch.full((2, D), 1e7, dtype=torch.bfloat16, device="cuda"), _x(2, 72)]
+
+    def rank(r):
+        def body(comm):
+            try:
+                moe.backbone(CFG, layers[r], xs[r], _buffers(), comm=comm)
+            except FloatingPointError:
+                return "raised"
+            return "went on"
+        return body
+
+    assert run_pair(rank(0), rank(1)) == ("raised", "raised"), "rank 1 would wait in the next gather"
+
+
 def _capture(step) -> torch.cuda.CUDAGraph:
     step()
     torch.cuda.synchronize()
