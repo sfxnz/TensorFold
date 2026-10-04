@@ -311,18 +311,18 @@ def test_a_window_row_equals_the_row_run_alone(geng, start):
     """Each row of an R-row verify forward, every layer through the head, gets the bits of the same row run alone as
     a 1-row window after the rows before it were committed: logits, window KV and DSpark taps."""
 
-    e, vocab = geng, geng.w.cfg.vocab_size
+    e, vocab, layers = geng, geng.w.cfg.vocab_size, geng.w.cfg.num_hidden_layers     # kvw's later rows are DSpark's
     prompt = _ids(start, start, vocab)
     tokens = [P.prefill(e, prompt, None)] + _ids(start + 1, MAX_ROWS - 1, vocab)
     alone = []
     for t in tokens:
         logits = e.forward([t])
-        alone.append((_bits(logits[0]), _bits(e.dbuf.kvw[:, 0]), _bits(e.dbuf.taps[0])))
+        alone.append((_bits(logits[0]), _bits(e.dbuf.kvw[:layers, 0]), _bits(e.dbuf.taps[0])))
         F.commit(e.w, e.st, e.dbuf, 1, 1)
     for R in range(2, MAX_ROWS + 1):
         P.prefill(e, prompt, None)
         logits = e.forward(tokens[:R])
-        got = [(_bits(logits[r]), _bits(e.dbuf.kvw[:, r]), _bits(e.dbuf.taps[r])) for r in range(R)]
+        got = [(_bits(logits[r]), _bits(e.dbuf.kvw[:layers, r]), _bits(e.dbuf.taps[r])) for r in range(R)]
         assert got == alone[:R], f"a {R}-row window at {start}"
 
 
