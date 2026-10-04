@@ -1,7 +1,7 @@
-"""Decode rounds: DSpark rounds emit exactly the serial reply (every fixed draft count and the confidence policy,
-greedy and keyed draws, one rank and two thread ranks), serial replies repeat, scripted drafts reach every window
-size and kept count, drafting does not depend on a resume or an earlier request, graphs replay the eager rounds, and
-long contexts cross the indexer's transitions.
+"""Decode rounds: DSpark rounds emit exactly the serial reply (every fixed draft count and the confidence policy, greedy
+and keyed draws, one rank and two thread ranks) with serial's logits bits on every kept row, a window's rows equal each
+row run alone, serial replies repeat, scripted drafts reach every window size and kept count, drafting does not depend
+on a resume or an earlier request, graphs replay the eager rounds, and long contexts cross the indexer's transitions.
 
 The tiny prompts put decode across the tiny config's transitions (16 visible entries, 32-entry candidate pools, the
 128-slot ring). The pack's check needs ``TF_DSV41_MODEL`` (layers 0-7, DSpark tapping their last three).
@@ -29,6 +29,7 @@ from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
 from tensorfold.families.deepseek_v41.cuda import BLOCK, MAX_ROWS, loader, snapshot
 from tensorfold.families.deepseek_v41.cuda import decode as D
+from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import prefill as P
 from tensorfold.families.deepseek_v41.engram_table import Reader
 
@@ -99,15 +100,15 @@ def _counts(res: D.DecodeResult, policy) -> None:
 
 
 def _recorded(e: D.Engine, *args, **kw) -> tuple[D.DecodeResult, list, list]:
-    """``_request`` with every verify forward's logits and every proposal (drafts, their confidences, the block's
-    logits) kept."""
+    """``_request`` with every verify forward's logits (each row's bits) and every proposal (drafts, their confidences,
+    the block's logits) kept."""
 
     forwards, proposals = [], []
     forward, propose = e.forward, e.propose
 
     def fwd(tokens):
         out = forward(tokens)
-        forwards.append(_bits(out))
+        forwards.append([_bits(row) for row in out])
         return out
 
     def prop(*a):
@@ -120,6 +121,26 @@ def _recorded(e: D.Engine, *args, **kw) -> tuple[D.DecodeResult, list, list]:
         return _request(e, *args, **kw), forwards, proposals
     finally:
         del e.forward, e.propose
+
+
+def _logit_rows(e: D.Engine, *args, **kw) -> tuple[D.DecodeResult, list[str]]:
+    """``_request`` -> (its result, the bits of each kept row's verify logits, in position order)."""
+
+    rows: list[list[str]] = []
+    forward = e.forward
+
+    def fwd(tokens):
+        out = forward(tokens)
+        rows.append([_bits(row) for row in out])
+        return out
+
+    e.forward = fwd
+    try:
+        res = _request(e, *args, **kw)
+    finally:
+        del e.forward
+    keeps = res.keeps or [1] * len(rows)
+    return res, [bits for window, k in zip(rows, keeps) for bits in window[:k]]
 
 
 @pytest.fixture(scope="module")
@@ -161,12 +182,13 @@ def test_engine_refuses_bad_settings(tiny, ref, geng):
 def test_drafted_equals_serial(geng, seed, temperature, top_k, top_p):
     sampling = Sampling(seed=seed, temperature=temperature, top_k=top_k, top_p=top_p)
     prompt = _ids(seed, PROMPTS[seed], geng.w.cfg.vocab_size)
-    want = _request(geng, prompt, REPLY, sampling)
+    want, want_rows = _logit_rows(geng, prompt, REPLY, sampling)
     assert len(want.tokens) == REPLY and want.rounds == REPLY - 1 and want.drafted == 0
     _counts(want, None)
     for policy in POLICIES:
-        got = _request(geng, prompt, REPLY, sampling, policy)
+        got, rows = _logit_rows(geng, prompt, REPLY, sampling, policy)
         assert got.tokens == want.tokens and _sha(got.tokens) == _sha(want.tokens), f"{policy}, {sampling}"
+        assert rows == want_rows[:len(rows)], f"a kept row's logits differ from serial: {policy}, {sampling}"
         _counts(got, policy)
 
 
@@ -227,13 +249,15 @@ def test_scripted_drafts_reach_every_window_and_keep(geng):
     e = geng
     prompt = _ids(4, 30, e.w.cfg.vocab_size)
     count = 1 + sum(k for _, k in SCHEDULE)             # the schedule emits exactly the reply
-    want = _request(e, prompt, count, KEYED).tokens
+    serial, want_rows = _logit_rows(e, prompt, count, KEYED)
+    want = serial.tokens
     e.propose = _scripted(e, want, len(prompt), iter(SCHEDULE))
     try:
-        got = _request(e, prompt, count, KEYED, (BLOCK, None))
+        got, rows = _logit_rows(e, prompt, count, KEYED, (BLOCK, None))
     finally:
         del e.propose
     assert got.tokens == want
+    assert rows == want_rows, "every kept row's logits, rows 0 to 5 of every window size, equal serial's bits"
     assert [(d + 1, k) for d, k in zip(got.depths, got.keeps)] == SCHEDULE
     assert got.drafted == sum(R - 1 for R, _ in SCHEDULE) and got.accepted == sum(k - 1 for _, k in SCHEDULE)
     assert got.tokens_per_round == (count - 1) / len(SCHEDULE)
@@ -264,8 +288,8 @@ def test_drafting_does_not_depend_on_a_resume_or_an_earlier_request(geng, policy
     prompt = _ids(8, 301, vocab)
 
     def run(**kw):
-        res, _, proposals = _recorded(e, prompt, REPLY, KEYED, policy, **kw)
-        return res.tokens, res.drafted, res.accepted, res.tokens_per_round, res.keeps, proposals
+        res, forwards, proposals = _recorded(e, prompt, REPLY, KEYED, policy, **kw)
+        return res.tokens, res.drafted, res.accepted, res.tokens_per_round, res.keeps, forwards, proposals
 
     solo = run()
     _request(e, _ids(9, 700, vocab), REPLY, None, (2, None))
@@ -280,6 +304,26 @@ def test_drafting_does_not_depend_on_a_resume_or_an_earlier_request(geng, policy
         snapshot.load_rows(e, snap)
         snap.rows = None
         assert run(resume=snap) == solo, f"resumed at {K}"
+
+
+@pytest.mark.parametrize("start", [5, 30, 62, 125, 600, 1010])     # the 16/32-entry transitions, the ring's wrap
+def test_a_window_row_equals_the_row_run_alone(geng, start):
+    """Each row of an R-row verify forward, every layer through the head, gets the bits of the same row run alone as
+    a 1-row window after the rows before it were committed: logits, window KV and DSpark taps."""
+
+    e, vocab = geng, geng.w.cfg.vocab_size
+    prompt = _ids(start, start, vocab)
+    tokens = [P.prefill(e, prompt, None)] + _ids(start + 1, MAX_ROWS - 1, vocab)
+    alone = []
+    for t in tokens:
+        logits = e.forward([t])
+        alone.append((_bits(logits[0]), _bits(e.dbuf.kvw[:, 0]), _bits(e.dbuf.taps[0])))
+        F.commit(e.w, e.st, e.dbuf, 1, 1)
+    for R in range(2, MAX_ROWS + 1):
+        P.prefill(e, prompt, None)
+        logits = e.forward(tokens[:R])
+        got = [(_bits(logits[r]), _bits(e.dbuf.kvw[:, r]), _bits(e.dbuf.taps[r])) for r in range(R)]
+        assert got == alone[:R], f"a {R}-row window at {start}"
 
 
 def test_graphs_replay_the_eager_rounds(tiny, ref, geng):
