@@ -2,7 +2,7 @@
 request rank 0 serves (equal stats, kept snapshots and live ids), the serial reference equals the drafted reply, a
 resend resumes from its kept snapshot with the fresh reply and drafting stats, several conversations keep their
 snapshots, ``stop_eos`` False decodes to ``max_tokens``, a refused prompt reaches no collective, and serving
-allocates no device memory once warm."""
+reserves no device memory past what construction reserved."""
 
 from __future__ import annotations
 
@@ -33,8 +33,7 @@ def _ids(seed: int, n: int, vocab: int = 1024) -> list[int]:
     return torch.randint(2, vocab, (n,), generator=g).tolist()
 
 
-@pytest.fixture(scope="module")
-def ranks(tiny_dir):
+def _build(tiny_dir):
     comms = pair()
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("TF_DSV41_CACHE_GIB", "0.25")
@@ -47,6 +46,11 @@ def ranks(tiny_dir):
         engines = run_pair(build(0), build(1), comms)
     assert [e.rank for e in engines] == [0, 1] and engines[0].limit == CONTEXT
     return engines
+
+
+@pytest.fixture(scope="module")
+def ranks(tiny_dir):
+    return _build(tiny_dir)
 
 
 def _serve(ranks, requests):
@@ -80,6 +84,19 @@ def _serve(ranks, requests):
 
 def req(prompt, max_tokens=REPLY, sampling=KEYED, **kw):
     return (prompt, max_tokens, sampling), kw
+
+
+def test_a_new_engine_reserves_no_more_to_serve(tiny_dir):
+    torch.cuda.empty_cache()
+    engines = _build(tiny_dir)
+    assert all("guard_left" not in vars(e.e.pbuf.exl3) for e in engines), "the warm left the overflow guard's checks"
+    torch.cuda.synchronize()
+    reserved = torch.cuda.memory_reserved()
+    open_k = Sampling(seed=4, temperature=1.0, top_k=0)
+    short = _ids(41, 300)
+    _serve(engines, [req(_ids(40, LONG)), req(short, sampling=open_k), req(short, sampling=open_k)])
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_reserved() == reserved
 
 
 def test_rank1_mirrors_and_serial_equals_drafted_and_a_resend_resumes(ranks):
