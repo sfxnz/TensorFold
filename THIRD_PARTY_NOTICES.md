@@ -92,9 +92,9 @@ The MTP layer TensorFold drafts with comes from that checkpoint's last shard (MI
 `tests/fixtures/deepseek_v41/` holds its test cases, MIT License, Copyright (c) 2023 DeepSeek.
 `tests/dsv41_reference.py` ports the forward pass of that checkpoint's `inference/model.py` and the arithmetic of
 its `inference/kernel.py` to plain PyTorch as a test comparator, MIT License, Copyright (c) 2023 DeepSeek.
-The same directory's `config.json` is the configuration of the EXL3 export the family serves (DeepSeek's, with the
-export's quantization fields), and `engram_ids.json` holds n-gram row ids computed by the checkpoint's
-`inference/engram.py` (MIT). The family's CUDA engine (`src/tensorfold/families/deepseek_v41/`) implements the model
+`tests/fixtures/deepseek_v41/config.json` is the configuration of the EXL3 export the family serves (DeepSeek's, with
+the export's quantization fields), and `tests/fixtures/deepseek_v41/engram_ids.json` holds n-gram row ids computed by
+that checkpoint's `inference/engram.py` (MIT). The family's CUDA engine (`src/tensorfold/families/deepseek_v41/`) implements the model
 math of `inference/model.py` and `inference/kernel.py`, and `engram_hash.py` the n-gram hashing of
 `inference/engram.py`, without including that source (MIT License, Copyright (c) 2023 DeepSeek).
 

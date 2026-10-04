@@ -93,16 +93,18 @@ resumes of it, `torch.cuda.memory_reserved` stayed at 80.7 GiB on rank 0.
 
 ## Precision
 
-Where TensorFold's sums differ from DeepSeek's reference (`inference/model.py` and `inference/kernel.py` of the
-checkpoint). None trades precision for speed; each is equal or higher precision, or a reorder, and each changes bits.
+Where TensorFold's sums differ from DeepSeek's reference (`inference/model.py` and `inference/kernel.py` of
+deepseek-ai/DeepSeek-V4.1-Flash at `dba1be0`; the EXL3 export does not ship them, and source comments cite their
+lines as `M:n` and `K:n`). None trades precision for speed; each is equal or higher precision, or a reorder, and each
+changes bits.
 
 | Operation | DeepSeek's reference | TensorFold |
 | --- | --- | --- |
 | FP8 projections | Activations quantized to FP8 (1x32, power-of-two scales) before each FP8 matmul | bf16 activations against the exact FP8 weights (`Mx8Linear`, the 32x32 scales repeated per row): higher |
-| Row-parallel partials (`wo_b`, the shared expert's `w2`) | Each rank's partial rounded to bf16, then an fp32 all-reduce | fp32 partials gathered and added in rank order: higher |
+| Row-parallel partials (`wo_b`) | Each rank's partial rounded to bf16, then an fp32 all-reduce | fp32 partials gathered and added in rank order: higher |
 | Indexer scores | bf16, heads split over the ranks, a bf16 all-reduce | fp32, every head on both ranks: higher, and a row can keep a different 512th entry |
 | Routed experts | FP8 activations x FP4 weights; the routing weight applied before `w2`, rounded to bf16 | fp16 activations x the EXL3 weights; the routing weight applied after `w2` in the fp32 combine: a reorder at equal or higher precision |
-| Shared expert | Its bf16 output added after the all-reduce | Its fp32 `w2` partial added into the rank's fp32 MoE share before the gather: a reorder |
+| Shared expert | Computed whole on every rank; its bf16 `w2` output added to the fp32 sum after the routed all-reduce | Inner dim split over the ranks; each rank's fp32 `w2` partial added into its fp32 MoE share, then the shares gathered and added in rank order: higher, and a reorder |
 | LM head | fp32 logits of bf16 activations | bf16 activations against the MXFP8 weights, fp32 logits: equal |
 | Window, compressed and index keys | FP8 / FP4 quantize-dequantize, trained with it | The same quantize-dequantize, stored as bf16 values (the same numbers packed storage would hold): equal |
 | Decode indexer at even positions | Layers 2, 8 and 14 (and the layers that reuse their lists) score against layer 20's index keys when their own compressor emitted no entry | Every layer scores its own source's index keys, as the reference's prompt path does |
@@ -132,14 +134,17 @@ default sampling drafted, serial and resent, gave equal `token_sha`; a cold 64k 
 equal replies. The two-rank check script (`tests/cuda/dsv41_tp_check.py`) gives the same logits hashes, step by
 step, over NCCL on two Sparks as two threads on one GPU.
 
-Quality against the vLLM recipe on the same weights (its own runs as the noise floor): teacher-forced NLL 0.1371
-against vLLM's 0.1391 over ten Project Gutenberg books, top-1 disagreement with vLLM 1.1%; GSM8K 97/100 (vLLM 97),
-MMLU 204/228 (vLLM 204), tool calls 22/22, needles 9/9.
+Quality against the vLLM recipe on the same weights, with vLLM's own repeat runs as the noise floor: teacher-forced
+NLL 0.1371 over 40 passages from ten Project Gutenberg books (19,828 positions), against vLLM's 0.1389-0.1391;
+TensorFold's repeat is bit-identical. Top-1 disagreement with vLLM is 1.08% and the median |dlogprob| 1.0e-4.
+GSM8K 97/100 (vLLM 96 in its run on these weights, 97 in the recipe's baseline), MMLU 204/228 (vLLM 204 and 205),
+tool calls 22/22 with exact arguments, needles 9/9 up to about 130k tokens.
 
 ## Speed
 
 Two DGX Sparks over their direct cable, `--context 65538`, default drafting (3 drafts a round), against the vLLM
-recipe for this checkpoint on the same machines and weights. `tools/bench_openai.py` (64 tokens, median tok/s of 5):
+recipe for this checkpoint on the same machines and weights, measured in a separate session (not interleaved; vLLM's
+sampled fibonacci-raw runs ranged from 40 to 65 tok/s). `tools/bench_openai.py` (64 tokens, median tok/s of 5):
 
 | Prompt | Temperature | TensorFold | vLLM |
 | --- | --- | ---: | ---: |
@@ -148,18 +153,20 @@ recipe for this checkpoint on the same machines and weights. `tools/bench_openai
 | fibonacci-raw | 0 | 56.4 | (its reply is end tokens) |
 | gpu-chat-no-think | 0 | 41.3 | 43.1 |
 
-The vLLM recipe's own decode cells (greedy, thinking off, 200 tokens, one stream), with tokens a round for
-TensorFold and vLLM's mean acceptance length:
+The vLLM recipe's own decode cells (greedy, thinking off, 200 tokens, one stream), with TensorFold's decode tokens a
+round (the 199 after the prompt's first token over its rounds) and vLLM's mean acceptance length, both with 3 drafts
+a round:
 
 | Cell | TensorFold | Tokens a round | vLLM | Acceptance length |
 | --- | ---: | ---: | ---: | ---: |
-| prose | 45.8 | 2.82 | 50.7 | 2.45 |
-| structured | 64.2 | 3.92 | 84.3 | 4.00 |
-| prose_long | 34.4 | 2.13 | 43.8 | 2.17 |
+| prose | 45.8 | 2.80 | 50.7 | 2.45 |
+| structured | 64.2 | 3.90 | 84.3 | 4.00 |
+| prose_long | 34.4 | 2.12 | 43.8 | 2.17 |
 
-DSpark's full 5-row block drafts at least as well as vLLM's; the gap is the round: about 61 ms against vLLM's 48,
-of which the host's Engram reads take 4-6 ms and target sampling 2 ms (both on the critical path), and a serial
-token 35 ms of device time.
+Drafting is not the gap: TensorFold keeps more tokens a round on prose and slightly fewer on structured and
+prose_long. The gap is the round: about 61 ms against vLLM's 48, of which the host's Engram reads take 3.5-6 ms and
+target sampling 2 ms (both on the critical path), and a serial token 35 ms of device time. The prose cell stops
+naturally at 74 tokens, so most of its 200 measured tokens come after the end token.
 
 Cold prompts, `tools/prefill_cold.py` (median of 3; vLLM ran the same messages):
 
@@ -168,15 +175,7 @@ Cold prompts, `tools/prefill_cold.py` (median of 3; vLLM ran the same messages):
 | TensorFold, tok/s | 524 | 546 | 562 | 561 | 563 |
 | vLLM, tok/s | 778 | 769 | 772 | 777 | 774 |
 
-In a prompt chunk the routed experts decode each EXL3 tile again for every 16 rows. The levers being worked on,
-each keeping every bit: in the last 20 layers, computing only the prompt rows a later row or the reply reads (their
-other rows feed nothing), an EXL3 prompt kernel that reuses a decoded tile for more rows, CUDA graphs over whole
-rounds, a native Engram reader off the critical path, DSpark's draws on the device, and the `top_k`-off draw on the
-device.
-
-On GB10 a CPU core that has idled for a few milliseconds takes about half a millisecond to wake from its deepest
-idle state, and every round waits on the host. A host-wide PM QoS request (`/dev/cpu_dma_latency`, a 20 us limit
-held open while serving) keeps cores out of it; it has not been measured with this engine.
+In a prompt chunk the routed experts decode each EXL3 tile again for every 16 rows.
 
 ## Not yet
 

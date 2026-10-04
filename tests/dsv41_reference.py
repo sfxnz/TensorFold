@@ -1,11 +1,12 @@
 """A plain-torch port of DeepSeek-V4.1's MIT ``inference/model.py``: the comparator for the CUDA family.
 
-``M:n`` and ``K:n`` cite lines of the checkpoint's ``inference/model.py`` and ``inference/kernel.py``. Every chunk
-follows the per-position rules for any start position: window ``[max(0, i-127), i]``, compressed entry ``j``
-visible once ``j < (i+1)//ratio`` and rotated at ``j*ratio``, groups ``{2j, 2j+1}`` carried across forwards. The
-``start_pos > 0`` branches are not ported, and an indexer always scores its own KV source's index-K, where
-model.py's decode path reads whichever owner wrote last (M:537-554). Mode ``fp32`` rounds only where the model
-quantizes; ``mirror`` also rounds to bf16 (and fp16 at the EXL3 experts) where the CUDA family stores values.
+``M:n`` and ``K:n`` cite lines of deepseek-ai/DeepSeek-V4.1-Flash's (revision dba1be0) ``inference/model.py`` and
+``inference/kernel.py``. Every chunk follows the per-position rules for any start position: window
+``[max(0, i-127), i]``, compressed entry ``j`` visible once ``j < (i+1)//ratio`` and rotated at ``j*ratio``, groups
+``{2j, 2j+1}`` carried across forwards. The ``start_pos > 0`` branches are not ported, and an indexer always scores its
+own KV source's index-K, where model.py's decode path reads whichever owner wrote last (M:537-554). Mode ``fp32`` rounds
+only where the model quantizes; ``mirror`` also rounds to bf16 (and fp16 at the EXL3 experts) where the CUDA family
+stores values.
 """
 
 from __future__ import annotations
