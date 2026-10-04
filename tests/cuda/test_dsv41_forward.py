@@ -240,6 +240,8 @@ def test_two_ranks_are_deterministic_and_agree(tiny_dir, tiny, ref):
         def go(_):
             e = engs[r]
             e.st.reset()
+            for buf in (e.pbuf, e.dbuf):
+                buf.exl3.guard_left = 0         # the overflow guard's own gather is tested in test_dsv41_moe
             recs[r].log = []
             logits = e.run(PAIR_PLAN, windows)
             return [_sha(x) for x in logits], logits, recs[r].log
