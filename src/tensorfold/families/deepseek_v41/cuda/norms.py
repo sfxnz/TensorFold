@@ -1,9 +1,4 @@
-"""DeepSeek RMSNorm and the mHC coefficient and collapse kernels: one program per row, IEEE divides and roots.
-
-The mixing dots reuse GLM's private ``_hc_partial`` (fixed K blocks), so a row's bits depend on the shape only.
-Launches turn off FMA contraction: each product and sum rounds where model.py writes it, so a cancelling collapse
-keeps the reference's bits.
-"""
+"""DeepSeek RMSNorm and the mHC kernels: a row a program, IEEE divides and roots, no FMA contraction."""
 
 from __future__ import annotations
 
@@ -42,7 +37,7 @@ def _rmsnorm(X, x_stride, W, OUT, o_stride, eps, D: tl.constexpr, BLOCK: tl.cons
 
 
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, out: torch.Tensor) -> torch.Tensor:
-    """N1: x [R, D] (rows may be strided) -> out [R, D] bf16."""
+    """RMSNorm: x [R, D] (rows may be strided) -> out [R, D] bf16."""
 
     rows, d = x.shape
     if x.stride(-1) != 1 or out.stride(-1) != 1:
@@ -95,7 +90,7 @@ def _hc_coeffs(PART, BASE, SCALE, PRE, POST, COMB, eps_norm, hc_eps, WIDE: tl.co
 def hc_mix(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, part: torch.Tensor,
            pre: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, eps_norm: float = 1e-20, hc_eps: float = 1e-6,
            iters: int = 20) -> None:
-    """N2: x [R, 4*D] bf16 streams -> pre [R, 4], post [R, 4], comb [R, 4, 4] fp32 (part: [R, 16, 32] fp32 scratch)."""
+    """mHC: x [R, 4*D] bf16 streams -> pre [R, 4], post [R, 4], comb [R, 4, 4] fp32 (part: [R, 16, 32] scratch)."""
 
     rows, wide = x.shape
     if fn.shape != (MIX, wide) or part.numel() < rows * HC_BLOCKS * 32 or not x.is_contiguous():
@@ -123,10 +118,7 @@ def _collapse_norm(X, PRE, W, OUT, RAW, eps, D: tl.constexpr, BLOCK: tl.constexp
 
 def collapse_norm(x: torch.Tensor, pre: torch.Tensor, w: torch.Tensor, out: torch.Tensor, eps: float = 1e-20,
                   raw: torch.Tensor | None = None) -> torch.Tensor:
-    """N2c + N1: out = rmsnorm(bf16(((p0 x0 + p1 x1) + p2 x2) + p3 x3)) with a given pre [R, 4] fp32.
-
-    Also the final collapse (``norm.weight``) and the DSpark head's, whose confidence reads the collapsed row: ``raw``.
-    """
+    """out = rmsnorm(bf16(((p0 x0 + p1 x1) + p2 x2) + p3 x3)) for a given pre; ``raw`` keeps the collapse."""
 
     rows, wide = x.shape
     d = w.shape[0]

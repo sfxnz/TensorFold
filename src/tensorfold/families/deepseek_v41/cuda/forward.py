@@ -1,11 +1,4 @@
-"""DeepSeek-V4.1's target forward on one rank: embedding, Engram, the 40 mHC blocks, the final norm and head rows;
-``commit`` then keeps a window's first rows.
-
-``M:n`` cites the checkpoint's ``inference/model.py``. ``stage`` is the host work before a forward (token ids,
-Engram rows); ``compute`` is device work on static buffers and ``state.pos_dev`` only, so a graph replays it. Every
-exchange is one ``fast_gather`` on the compute stream; ranks add their fp32 partials in rank order, and one rank
-gathers nothing. ``prompt`` is the call site's, never read off R.
-"""
+"""The target forward on one rank: embedding, Engram, the mHC blocks, the final norm and head rows."""
 
 from __future__ import annotations
 
@@ -25,8 +18,7 @@ from .weights import LayerW, Weights
 
 
 def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int], hasher=None, reader=None, half: int = 0) -> int:
-    """Host work before a forward of ``tokens`` at ``st.pos``: ids through the pinned twin, the rank's Engram rows
-    (``hasher``/``reader`` from engram_hash/engram_table) through pinned half ``half`` -> R."""
+    """Host work before a forward of ``tokens``: ids and this rank's Engram rows through pinned halves -> R."""
 
     R = len(tokens)
     if not 0 < R <= b.rows or st.pos + R > st.capacity:
@@ -53,7 +45,7 @@ def _gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
 
 def _tap(b: Buffers, R: int, slot: int) -> None:
-    """L3: bf16(mean of the 4 copies) of the forward's last min(R, taps) rows into DSpark input slot ``slot``."""
+    """bf16(mean of the 4 copies) of the forward's last min(R, taps) rows into DSpark input slot ``slot``."""
 
     n = min(R, b.taps.shape[0])
     glue.stream_mean(b.X[R - n:R].view(n, -1), b.hidden[:n])
@@ -61,9 +53,7 @@ def _tap(b: Buffers, R: int, slot: int) -> None:
 
 
 def layer(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tensor | None, prompt: bool) -> None:
-    """One block (M:968-994) on ``b.X[:R]`` in place: Engram, tap, attention, MoE; ``b.pre_in`` becomes its FFN pre.
-
-    ``e`` is the forward's exchanged Engram rows [R, layers, columns * head_dim]."""
+    """One block (M:968-994) on ``b.X[:R]`` in place: Engram, tap, attention, MoE; ``b.pre_in`` is its FFN pre."""
 
     cfg, L = w.cfg, lw.index
     eps = cfg.rms_norm_eps
@@ -90,16 +80,14 @@ def layer(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tensor
 
 
 def head(w: Weights, b: Buffers, a: int, n: int, out: torch.Tensor, *, prompt: bool) -> torch.Tensor:
-    """F1-F2 for rows a..a+n of the last forward: final collapse and norm, then the rank's vocabulary rows, fp32."""
+    """Rows a..a+n of the last forward: final collapse and norm, then the rank's vocabulary rows, fp32."""
 
     norms.collapse_norm(b.X[a:a + n].view(n, -1), b.pre_in[a:a + n], w.norm, b.fnormed[:n], w.cfg.rms_norm_eps)
     return mx8.mm(w.head, b.fnormed[:n], out, f32=True, prompt=prompt)
 
 
 def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_rows: int) -> torch.Tensor | None:
-    """The staged rows at ``st.pos_dev`` + r through every loaded layer -> the last ``head_rows`` rows' logits fp32
-    [head_rows, V / world] in ``b.logits`` (None for 0). Writes ``b.kvw``, ``b.taps`` and position-addressed caches;
-    commits nothing."""
+    """Staged rows through every loaded layer -> the last ``head_rows`` rows' fp32 logits; commits nothing."""
 
     if not 0 < R <= b.rows or not 0 <= head_rows <= min(R, b.logits.shape[0]):
         raise ValueError(f"compute: {R} rows, head on {head_rows}, for {b.rows}-row buffers and "
@@ -120,8 +108,7 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_row
 
 @torch.no_grad()
 def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
-    """Keep the last forward's first ``keep`` rows (a prompt chunk keeps all): their window KV into ring slots
-    (pos + r) % window, the last ``window`` of them per layer, compressor tails, the token tail, ``pos += keep``."""
+    """Keep the last forward's first ``keep`` rows: window KV into the rings, the tails, then ``pos += keep``."""
 
     if not 0 < keep <= R <= b.rows or (b.prefill and keep != R):
         raise ValueError(f"commit: keep {keep} of {R} rows ({'a prompt chunk keeps all' if b.prefill else 'decode'})")

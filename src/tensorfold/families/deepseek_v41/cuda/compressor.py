@@ -1,10 +1,4 @@
-"""A KV source's compressor: pooled latents, their index keys and compressed entries, written by absolute position.
-
-``M:n`` cites the checkpoint's ``inference/model.py``. Row r of a window or prompt chunk sits at ``pos_dev + r``;
-which rows complete a group is decided on the device, so one CUDA graph serves odd and even start positions. Every
-row is computed (rows that complete no group pool zeros) and only completing rows are stored, at entry
-``q // ratio``: rows of rejected drafts are rewritten by whichever forward next processes their positions.
-"""
+"""A KV source's compressor: pooled latents, their index keys and compressed entries, stored by position."""
 
 from __future__ import annotations
 
@@ -23,7 +17,7 @@ from .weights import LayerW
 
 @triton.jit
 def _pool(CMP, TAIL, W, LAT, EPOS, POS, eps, D: tl.constexpr, BLOCK: tl.constexpr):
-    """N6 (M:473-485): row r at an odd q pools group q // 2 from row r - 1 (or the committed tail) and itself."""
+    """Pooling (M:473-485): row r at an odd q pools group q // 2 from row r - 1 (or the committed tail) and itself."""
 
     r = tl.program_id(0)
     q = tl.load(POS) + r
@@ -65,12 +59,7 @@ def _store(LAT, KI, COMP, INDEX_K, POS, RATIO: tl.constexpr, D: tl.constexpr, DK
 
 
 def compress(lw: LayerW, xa: torch.Tensor, state: State, buf: Buffers, table: torch.Tensor, eps: float) -> None:
-    """L10-L12 for KV source ``lw`` on attention inputs ``xa`` [R, D] bf16 at ``state.pos_dev`` + r.
-
-    Ratio 2: ``[kv | score] = f32(xa) @ [wkv | wgate]^T`` into ``buf.cmp`` and N6. Ratio 1: ``norm(wkv(xa))`` per
-    row. Then the index key ``N7(RoPE(k_norm(wk(latent))))`` and the entry ``N6q(RoPE(latent))``, both rotated at
-    ``j * ratio`` with the layer's ``table``, into the layer's own ``state.index_k`` and ``state.comp`` (D8).
-    """
+    """Pool, index-key and entry rows of KV source ``lw`` from ``xa`` [R, D] at ``state.pos_dev`` + r."""
 
     layer, comp, idx = lw.index, lw.attn.comp, lw.attn.idx
     rows, hd = xa.shape[0], comp.norm.shape[0]

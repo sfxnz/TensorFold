@@ -1,9 +1,4 @@
-"""DeepSeek-V4.1-Flash on two ranks: rank 0 serves requests, rank 1 mirrors each one in ``follow``.
-
-Both ranks draw every token by one keyed rule from candidates they both gather, so they emit, keep and commit alike
-without a broadcast, and both decode to ``max_tokens`` or an end token whatever the client does. Torch is imported
-when an engine is built, so the CLI can name this class on any machine.
-"""
+"""DeepSeek-V4.1-Flash on two ranks: rank 0 serves requests and rank 1 mirrors each one in ``follow``."""
 
 from __future__ import annotations
 
@@ -20,12 +15,7 @@ NO_DIGEST = 0           # the agreement's Engram digest for a checkpoint without
 
 
 class DeepSeekV41Engine:
-    """One rank (``rank``) of the two: weights, sequence state and graphs, kept prompt snapshots, the rank protocol.
-
-    ``policy`` is (drafts a round, confidence the chain stops below or None); 0 drafts or ``serial_only`` decode
-    one token a round. ``comm`` replaces NCCL between two machines (tests), ``layers`` keeps the first N backbone
-    layers (tests), and ``graphs`` False runs every forward eagerly (a communicator graphs cannot capture).
-    """
+    """One rank; ``policy`` is (drafts a round, confidence stop or None); ``comm``/``layers``/``graphs`` for tests."""
 
     tp = 2
     supports_logprobs = False
@@ -103,9 +93,7 @@ class DeepSeekV41Engine:
         self._warm()
 
     def _warm(self) -> None:
-        """A full prompt chunk and decode rounds with top_k off, then an empty sequence and the fp16 overflow
-        guard's checks given back: the allocator then holds every transient a request's kernels take, so serving
-        reserves no more device memory."""
+        """Run a prompt chunk and decode rounds once and reset, so serving reserves no more device memory."""
 
         from tensorfold.engine.exact_sampling import Sampling
 
@@ -151,8 +139,7 @@ class DeepSeekV41Engine:
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], Any],
                  draft: bool = True, stop_eos: bool = True) -> dict[str, Any]:
-        """Serve one request on rank 0 (rank 1 mirrors it); ``draft`` False is the serial reference: a fresh
-        prefill, one token a round, nothing kept."""
+        """Serve one request on rank 0 while rank 1 mirrors it; ``draft`` False is the serial reference."""
 
         prompt = [int(t) for t in prompt]
         if not prompt:

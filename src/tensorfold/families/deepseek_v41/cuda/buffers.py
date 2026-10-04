@@ -14,7 +14,7 @@ from ..config import Config
 from . import MOE_WINDOW, PREFILL_ROWS, SCORE_BYTES
 
 HC_PART = 32            # glue._hc_partial's values a K block: the 24 mixing dots and the sum of squares, padded
-ATTN_CHUNK = 128        # list entries one N8 decode partial covers
+ATTN_CHUNK = 128        # list entries one sparse-attention decode partial covers
 
 
 def score_rows(entries: int) -> int:

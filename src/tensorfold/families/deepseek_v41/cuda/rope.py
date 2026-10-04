@@ -1,8 +1,4 @@
-"""N4: DeepSeek-V4.1's RoPE on the last ``qk_rope_head_dim`` dims, adjacent pairs, from fp32 tables built on the device.
-
-``M:n`` cites the checkpoint's ``inference/model.py``. Each element reads only its own pair and its row's table
-entry, so a row's bits do not depend on the other rows or on how many there are.
-"""
+"""DeepSeek-V4.1's RoPE on the last ``qk_rope_head_dim`` dims, adjacent pairs, from fp32 device tables."""
 
 from __future__ import annotations
 
@@ -56,8 +52,7 @@ def _rope(X, P, T, sr, sh, H, D: tl.constexpr, HALF: tl.constexpr, PER_ROW: tl.c
 
 
 def apply(x: torch.Tensor, positions: torch.Tensor, table: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """M:392-406 in place on bf16 ``x`` [rows, D] or [rows, heads, D]: row r at ``positions[r]``, or at
-    ``positions[0] + r`` when ``positions`` holds one value (a device scalar a graph replays with)."""
+    """M:392-406 in place on bf16 ``x`` at ``positions`` (one value: ``positions[0] + r``, as graphs replay)."""
 
     if x.dtype != torch.bfloat16 or x.dim() not in (2, 3) or x.stride(-1) != 1:
         raise ValueError("rope.apply: bf16 [rows, D] or [rows, heads, D] with unit stride in D")

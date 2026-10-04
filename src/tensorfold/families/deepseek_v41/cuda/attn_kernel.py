@@ -1,10 +1,4 @@
-"""N8: one row's attention over its window (committed ring, then this forward's rows) and an extra list, with a sink.
-
-Row r's entries are its window positions ``max(0, a_r-127) .. a_r`` ascending, then ``extra[lists[r, :counts[r]]]``
-in list order. Each program reads one row only and cuts that row's list at fixed offsets, so a row's bits depend on
-its list alone, never on the other rows or on where the forward starts. P is rounded to bf16 for P.V while the
-denominator sums the fp32 P, and the sink joins the denominator after the merge, as model.py's kernel (K:355-387).
-"""
+"""Sparse attention, a row a program: its window, then its list, with a sink, as model.py's kernel (K:355-387)."""
 
 from __future__ import annotations
 
@@ -183,14 +177,7 @@ def attention(q: torch.Tensor, ring: torch.Tensor, kvw: torch.Tensor | None, pos
               anchors: torch.Tensor, extra: torch.Tensor | None, lists: torch.Tensor | None,
               counts: torch.Tensor | None, sink: torch.Tensor, out: torch.Tensor, *, prompt: bool,
               part: torch.Tensor | None = None) -> torch.Tensor:
-    """N8: q [R, H, 512] bf16 -> out [R, H, 512] bf16 over each row's window and extra list.
-
-    ring [WIN, 512] holds committed positions at slot ``w % WIN``; kvw [rows, 512] holds positions ``pos[0] + i``
-    (None when no window reaches ``pos``); anchors int32 [R] (a row's last window position, < 0 for none);
-    extra [E, 512] rows picked by lists int32 [R, W] (first counts[r] used), or all three None; sink fp32 [H].
-    ``prompt`` picks the partition (set by the call site, never by R); decode needs ``part`` fp32
-    [>= R, H, >= chunks(W), 514]. Every size comes from shapes, so the call is graph-safe.
-    """
+    """q [R, H, 512] bf16 -> out bf16 over each row's ring window, this forward's rows and its list."""
 
     R, H, LW = q.shape
     WIN = ring.shape[0]

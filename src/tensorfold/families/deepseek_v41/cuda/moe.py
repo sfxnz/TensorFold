@@ -1,10 +1,4 @@
-"""DeepSeek's MoE on one rank: sqrt-softplus routing, EXL3 routed experts and the shared expert into one fp32 share,
-and DSpark's NVFP4 experts.
-
-A rank holds every expert's intermediate columns ``[I r / world, I (r + 1) / world)``, so its share is a partial sum
-the forward gathers and adds in rank order. The shared expert's fp32 ``w2`` output is added to the routed share with
-one fp32 add: the bits of a seventh slot of weight 1 at the end of ``down_combine``'s fma chain.
-"""
+"""DeepSeek's MoE on one rank: routing, EXL3 routed experts, the shared expert, DSpark's NVFP4 experts."""
 
 from __future__ import annotations
 
@@ -26,9 +20,7 @@ GUARD_CALLS = 160                   # eager routed passes a scratch checks for f
 @triton.jit
 def _route(L, BIAS, PICK, WTS, temp, scale, NE: tl.constexpr, TOPK: tl.constexpr, SLOTS: tl.constexpr,
            BLOCK: tl.constexpr, SLOTP: tl.constexpr):
-    """N3 for one row: sqrt(softplus(l / temp)), softplus linear past torch's threshold 20; top-k of score + bias,
-    lower ids first on ties; raw scores normalized by their pick-order sum and scaled; a slot past top-k is the
-    shared expert (id NE, weight 1)."""
+    """Routing for one row: sqrt-softplus scores, top-k of score + bias (lower ids win ties), normalized."""
 
     r = tl.program_id(0).to(tl.int64)
     ar = tl.arange(0, BLOCK)
@@ -57,10 +49,7 @@ def _route(L, BIAS, PICK, WTS, temp, scale, NE: tl.constexpr, TOPK: tl.constexpr
 
 def route(xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, mlog: torch.Tensor, pick: torch.Tensor,
           wts: torch.Tensor, top_k: int, scale: float, temp: float = 1.0) -> None:
-    """Router logits of xf [R, D] into mlog [R, E] fp32 (``glue.router``), then N3 into pick/wts [R, slots].
-
-    ``slots`` is ``top_k``, or ``top_k + 1`` with the shared expert last (id E, weight 1) for ``glue.combine``.
-    """
+    """Router logits of xf [R, D] into mlog fp32, then the routing into pick/wts [R, slots], shared last."""
 
     rows, slots = pick.shape
     experts = gate.shape[0]
@@ -77,7 +66,7 @@ def route(xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, mlog: torch.
 
 @triton.jit
 def _swiglu(GU, g_stride, OUT, o_stride, limit, I: tl.constexpr, BLOCK: tl.constexpr):
-    """N3b: bf16(silu(min(g, limit)) * clamp(u, -limit, limit)) from bf16 [g | u], the math in fp32."""
+    """SwiGLU: bf16(silu(min(g, limit)) * clamp(u, -limit, limit)) from bf16 [g | u], the math in fp32."""
 
     r = tl.program_id(0).to(tl.int64)
     c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -90,7 +79,7 @@ def _swiglu(GU, g_stride, OUT, o_stride, limit, I: tl.constexpr, BLOCK: tl.const
 
 
 def swiglu(gu: torch.Tensor, out: torch.Tensor, limit: float) -> torch.Tensor:
-    """N3b: gu [R, 2I] bf16 (gate columns, then up) -> out [R, I] bf16."""
+    """SwiGLU: gu [R, 2I] bf16 (gate columns, then up) -> out [R, I] bf16."""
 
     rows, width = out.shape
     if gu.shape != (rows, 2 * width) or gu.stride(-1) != 1 or out.stride(-1) != 1:
@@ -102,7 +91,7 @@ def swiglu(gu: torch.Tensor, out: torch.Tensor, limit: float) -> torch.Tensor:
 
 
 def shared(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False) -> torch.Tensor:
-    """The rank's half of the shared expert: Mx8 [w1 | w3] rows, N3b, Mx8 w2 columns -> b.sd [R, D] fp32."""
+    """The rank's half of the shared expert: Mx8 [w1 | w3] rows, SwiGLU, Mx8 w2 columns -> b.sd [R, D] fp32."""
 
     R = xf.shape[0]
     mx8.mm(m.shared_gu, xf, b.sgu[:R], prompt=prompt)
@@ -128,11 +117,7 @@ def _guard(s: exl3.Scratch, pairs: int, comm=None) -> None:
 
 
 def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) -> torch.Tensor:
-    """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share b.part [R, D].
-
-    Routed experts run in windows of the scratch's rows on the same kernels, so ``prompt`` changes only the shared
-    expert's projections (the call site's choice, as everywhere).
-    """
+    """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share b.part [R, D]."""
 
     R = xf.shape[0]
     route(xf, m.gate, m.bias, b.mlog[:R], b.pick[:R], b.wts[:R], cfg.num_experts_per_tok,
@@ -148,11 +133,7 @@ def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) ->
 
 
 def dspark_moe(cfg, m, xf: torch.Tensor, b) -> torch.Tensor:
-    """A DSpark stage's MoE for its block rows xf [B, D] bf16 -> the rank's fp32 share b.part [B, D].
-
-    ``Experts4`` runs the routed pairs (the shared expert's id is skipped), the shared expert's fp32 output fills
-    the last slot, and ``glue.combine`` adds the slots in order.
-    """
+    """A DSpark stage's MoE for its block rows xf [B, D] bf16 -> the rank's fp32 share b.part [B, D]."""
 
     R = xf.shape[0]
     E = cfg.dspark_n_routed_experts

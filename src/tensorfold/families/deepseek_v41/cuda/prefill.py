@@ -1,11 +1,4 @@
-"""A prompt through the prompt path on one rank: chunks with a forced boundary at the keep point, each chunk's Engram
-rows read while the chunk before it computes, every chunk's last rows absorbed into the DSpark rings, the keep
-point's snapshot, then the first token.
-
-``e`` holds ``w``, ``st``, ``pbuf`` (prompt-chunk buffers; its rows are the chunk size), ``dwork`` (DSpark scratch),
-``hasher`` and ``reader``. Every prompt kernel is chunk- and row-set-invariant, so any chunking, and a resume from a
-snapshot, ends in the bits of the whole prompt as one chunk.
-"""
+"""A prompt on one rank in chunks cut at the keep point, ending in the bits of the whole prompt at once."""
 
 from __future__ import annotations
 
@@ -42,8 +35,7 @@ def _stage_ids(b: Buffers, tokens: Sequence[int]) -> None:
 
 
 class _Rows:
-    """The prompt's Engram rows from ``begin`` (this rank's columns of both layers, as global table rows), each chunk
-    read on the reader's thread into pinned half ``i % 2`` while the device still works on earlier chunks."""
+    """The prompt's Engram rows, each chunk's read on the reader's thread into pinned half ``i % 2``."""
 
     def __init__(self, e, prompt: Sequence[int], begin: int, spans: list[tuple[int, int]]) -> None:
         w, st, b = e.w, e.st, e.pbuf
@@ -95,9 +87,7 @@ class _Rows:
 def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapshot | None = None,
             keep_at: int | None = None, keep: Callable[[Snapshot], object] | None = None,
             space: torch.Tensor | None = None) -> int:
-    """Commit ``prompt`` from position 0 (or from ``resume``, a snapshot of a strict prefix) and sample its first
-    token at position ``len(prompt)``; with ``keep_at``, ``keep`` receives the snapshot at that point, copied into
-    ``space`` when given (see ``snapshot.take``)."""
+    """Commit ``prompt`` from 0 or ``resume`` and draw its first token; ``keep`` takes the ``keep_at`` snapshot."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")

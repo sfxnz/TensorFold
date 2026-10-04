@@ -1,9 +1,4 @@
-"""CUDA graphs of one engine's decode-side device work: a verify forward per window size, DSpark's absorb per kept
-row count, its block and each Markov step.
-
-Each reads static buffers and ``st.pos_dev`` only, so one graph serves every position and replays the eager path's
-kernels with its launch parameters; the exchanges run on the compute stream, so the graphs capture them too.
-"""
+"""CUDA graphs of decode's device work: a verify forward per window size, DSpark's absorb, block and steps."""
 
 from __future__ import annotations
 
@@ -45,8 +40,7 @@ class Graphs:
 
     @torch.no_grad()
     def warm(self) -> int:
-        """Capture every graph -> how many. Each runs eagerly first at positions from MAX_ROWS, which writes the
-        sequence's state: the engine resets it after."""
+        """Capture every graph -> how many; each runs eagerly first, so the engine resets the sequence after."""
 
         e = self.e
         w, st, b = e.w, e.st, e.dbuf

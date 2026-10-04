@@ -1,11 +1,4 @@
-"""Kept prompt prefixes on one rank: a copy of the committed rings (DSpark stages included) and compressor tails,
-the position-addressed cache rows saved aside only when another conversation would overwrite them.
-
-Rings and tails are written at commit only, so a copy taken after the keep point's commit and DSpark absorb is the
-whole committed state but the position-addressed rows; restoring it and prefilling the rest gives a fresh prefill's
-bits. ``e`` holds ``w`` and ``st``. A ``space`` is a caller's preallocated uint8 device slice (an arena's), aligned
-to ``ALIGN``; without one a copy is a new allocation.
-"""
+"""Kept prompt prefixes on one rank: committed rings and tails, cache rows saved aside when overwritten."""
 
 from __future__ import annotations
 
@@ -94,8 +87,7 @@ def row_bytes(e, snap: Snapshot) -> int:
 
 @torch.no_grad()
 def save_rows(e, snap: Snapshot, space: torch.Tensor | None = None) -> None:
-    """Copy the snapshot's position-addressed rows out of the live caches into ``space`` before another conversation
-    overwrites them."""
+    """Copy the snapshot's position-addressed rows from the live caches into ``space`` before an overwrite."""
 
     snap.rows = _copy(e.st.row_views(len(snap.ids)), space)
     snap.nbytes = row_bytes(e, snap)

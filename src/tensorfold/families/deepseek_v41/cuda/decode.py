@@ -1,11 +1,4 @@
-"""DeepSeek-V4.1 decode on one rank: the engine's sequence and buffers, verify windows (a CUDA graph per row count,
-or eager), serial rounds, and DSpark rounds whose drafts are kept only while they equal the target's keyed draws.
-
-Row r of a window at ``st.pos`` is drawn with position ``st.pos + 1 + r``'s key from candidates every rank gathers,
-so the ranks pick the same tokens, keep the same rows and commit alike without a broadcast; every emitted token is
-the target's. ``on_tokens`` receives the pending token first (before any draft is proposed), then each round's
-kept tokens; its return value is ignored, so two ranks always finish a request together.
-"""
+"""Decode on one rank: verify windows, serial rounds and DSpark rounds that keep drafts equal to the draws."""
 
 from __future__ import annotations
 
@@ -35,11 +28,7 @@ def _clock() -> dict[str, float]:
 
 
 class Engine:
-    """One rank's weights, sequence state, prompt-chunk and decode buffers, DSpark scratch and Engram host side.
-
-    With ``graphs`` every decode-side graph is captured at construction and the state reset after. ``propose`` is
-    the drafter a round calls; tests replace it with a scripted one of the same signature.
-    """
+    """One rank's weights, sequence state, buffers, DSpark scratch and Engram host side; tests replace ``propose``."""
 
     def __init__(self, w: Weights, capacity: int, prefill_rows: int = PREFILL_ROWS, graphs: bool = False, *,
                  hasher=None, reader=None) -> None:
@@ -69,8 +58,7 @@ class Engine:
         return now
 
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
-        """A verify window at ``st.pos``: ids and Engram rows staged, then its graph replayed (eager without one)
-        -> logits fp32 [R, V / world], computed; nothing committed."""
+        """A verify window at ``st.pos``, staged then replayed (or eager) -> logits fp32 [R, V / world]."""
 
         w, st, b = self.w, self.st, self.dbuf
         t = time.perf_counter()
@@ -141,8 +129,7 @@ class Engine:
 
     def propose(self, y: int, p: int, sampling: Sampling | None, d: int,
                 threshold: float | None = None) -> tuple[list[int], list[float]]:
-        """``dspark.propose`` through the graphs, each draft's Engram rows advised as it lands -> (drafts,
-        confidence logits). The Markov part of the clock is what the other parts leave of its time."""
+        """``dspark.propose`` through the graphs, advising each draft's Engram rows -> (drafts, logits)."""
 
         start, other = time.perf_counter(), sum(self.clock.values())
         context = [*self.st.history, y]
@@ -185,8 +172,7 @@ class DecodeResult:
 
 
 def accept(sampled: Sequence[int], drafts: Sequence[int], ends: Sequence[int] = ()) -> int:
-    """Rows a window keeps: 1 plus the leading drafts equal to the sampled token before them, stopping after an end
-    token is sampled."""
+    """Rows a window keeps: 1 plus the leading drafts equal to the draw before them, up to a drawn end token."""
 
     keep = 1
     for s, d in zip(sampled, drafts):
@@ -203,8 +189,7 @@ def _emit(on_tokens: Callable | None, tokens: list[int]) -> None:
 
 def _rounds(e: Engine, pending: int, count: int, sampling: Sampling | None, stop_eos: bool, on_tokens,
             drafter: Callable[[int, int], list[int]] | None) -> DecodeResult:
-    """Verify windows until ``count`` tokens or an end token; ``drafter(pending, tokens still to emit)`` gives a
-    round's drafts after the last round's kept rows are absorbed."""
+    """Verify windows until ``count`` tokens or an end token; ``on_tokens``' return is ignored, so ranks agree."""
 
     w, st = e.w, e.st
     ends = e.eos if stop_eos else ()
@@ -253,11 +238,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 @torch.no_grad()
 def dspark_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, drafts: int = DEFAULT_DRAFTS,
                   confidence: float | None = None, stop_eos: bool = True, on_tokens=None) -> DecodeResult:
-    """``serial_decode``'s tokens in windows of the pending token and up to ``drafts`` DSpark drafts (with
-    ``confidence``, as many as ``dspark.policy`` keeps), each round's kept rows absorbed before the next block.
-
-    Prefill has absorbed the prompt; drafts never outnumber the tokens a round could still emit.
-    """
+    """``serial_decode``'s tokens in windows of the pending token and up to ``drafts`` DSpark drafts."""
 
     if e.w.dspark is None:
         raise ValueError("DSpark rounds need the checkpoint's DSpark stages")

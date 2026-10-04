@@ -1,5 +1,8 @@
 """DeepSeek-V4.1-Flash on two GPUs: row-invariant kernels, fp32 partials gathered and added in rank order."""
 
+# M:n and K:n in this package cite lines of inference/model.py and inference/kernel.py of
+# deepseek-ai/DeepSeek-V4.1-Flash at revision dba1be0
+
 MAX_ROWS = 6                        # a verify window's rows: the target token and up to BLOCK drafts
 GRAPH_ROWS = tuple(range(1, MAX_ROWS + 1))
 BLOCK = 5                           # rows of one DSpark block (the most drafts a round)

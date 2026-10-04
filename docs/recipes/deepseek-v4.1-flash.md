@@ -119,7 +119,10 @@ graph, at any context. The prompt path and decode path take different kernels, c
 the row count, so a prompt's rows never depend on its chunking; their bits differ from decode's, so each request
 keeps its prompt's state one token before its end, and a follow-up turn resumes there. DSpark drafts with the same
 keyed draws (over each rank's 1,024 best candidates when top-k is off), and the target keeps a draft only when it
-equals its own draw.
+equals its own draw. Each row is drawn with its absolute position's key from candidates both ranks gather, so the
+ranks pick the same tokens, keep the same rows and commit alike without a broadcast, and both decode every request
+to `max_tokens` or an end token. Fp32 partials are gathered and added in rank order, and every collective, the
+request header included, runs on both ranks in the same order.
 
 Receipts on two Sparks at `--context 65538`: `tools/bench_concurrent.py --alone --serial` found every reply equal
 to its solo run (48 of 48) and every solo run equal to its `"draft": false` run (10 of 10), at temperatures 1 and 0; a

@@ -1,10 +1,4 @@
-"""One DeepSeek-V4.1 attention sublayer (M:765-789) of a decode window or prompt chunk, to the rank's fp32 share.
-
-Row r sits at ``state.pos_dev + r``. Its window KV goes to ``buf.kvw[layer, r]`` (the ring takes it at commit); a KV
-source writes compressed entries and index keys by position; an index layer scores its KV source's own index-K, at
-even decode positions too (where M:537-554 reads another owner's); other compressed layers attend the latest index
-layer's lists. ``prompt`` is the caller's and goes to every kernel that has a prompt path; it is never read off R.
-"""
+"""One attention sublayer (M:765-789); an index layer always scores its own KV source's index keys."""
 
 from __future__ import annotations
 
@@ -41,8 +35,7 @@ def _index(w: Weights, lw: LayerW, xa: torch.Tensor, qr: torch.Tensor, state: St
 
 
 def attention(lw: LayerW, w: Weights, state: State, buf: Buffers, rows: int, prompt: bool) -> torch.Tensor:
-    """``buf.X[:rows]`` collapsed with ``buf.pre_in`` -> ``buf.part[:rows]`` fp32 [rows, D], the rank's heads summed
-    through ``wo_b`` before the rank sum. Layers run in order: reuse layers read the lists the last index layer left."""
+    """``buf.X[:rows]`` collapsed with ``buf.pre_in`` -> the rank's fp32 share ``buf.part[:rows]`` after ``wo_b``."""
 
     cfg, a, role, L = w.cfg, lw.attn, lw.role, lw.index
     if role.mode == "dspark" or not 0 < rows <= buf.rows:

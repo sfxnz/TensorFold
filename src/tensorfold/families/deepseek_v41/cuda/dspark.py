@@ -1,11 +1,4 @@
-"""DSpark drafting on one rank: committed rows into the stage rings, a 5-row block through the three stages, then
-the Markov chain that draws each draft in order, its confidence, and the draft-count policy.
-
-``M:n`` cites the checkpoint's ``inference/model.py``. ``e`` holds ``w``, ``st``, ``dbuf`` (decode buffers) and
-``dwork`` (a ``Work``). ``absorb``, ``block``, ``markov_input`` and ``markov_step`` are device work on static buffers
-and ``st.pos_dev`` only, so a graph replays each; the draws between Markov steps are host work. Drafts are proposals:
-no DSpark state is written for them, and every emitted token is the target's.
-"""
+"""DSpark drafting on one rank: stage rings, a 5-row block through three stages, then Markov draws."""
 
 from __future__ import annotations
 
@@ -46,11 +39,7 @@ class Work:
 
 @torch.no_grad()
 def absorb(e, b: Buffers, n: int, *, prompt: bool) -> None:
-    """The last ``n`` committed positions' taps (``b.taps[:n]``) into every stage's ring (M:1039-1051, 1128-1130):
-    main_x = main_norm(main_proj(taps)), then per stage the window KV of main_x at its own position.
-
-    ``prompt`` is the call site's (a prompt chunk's absorb or a decode round's), never read off ``n``.
-    """
+    """The last ``n`` committed positions' taps into every stage's ring (M:1039-1051, 1128-1130)."""
 
     w, st, k = e.w, e.st, e.dwork
     cfg, ds = w.cfg, w.dspark
@@ -77,8 +66,7 @@ def absorb(e, b: Buffers, n: int, *, prompt: bool) -> None:
 
 
 def _stage(sw: StageW, w: Weights, st: State, b: Buffers, k: Work) -> None:
-    """One stage (M:968-994 with M:1054-1074's attention) on the block stream ``b.xd`` in place; ``b.pre_in``
-    becomes its FFN pre. Row r sits at ``st.pos_dev + r`` and attends the ring at p - 127 .. p and all block rows."""
+    """One stage (M:968-994, attention as M:1054-1074) on the block stream ``b.xd`` in place."""
 
     cfg, a, L = w.cfg, sw.attn, sw.index
     B, eps, table, pos = cfg.dspark_block_size, cfg.rms_norm_eps, w.rope[sw.role.rope], st.pos_dev
@@ -111,9 +99,7 @@ def _stage(sw: StageW, w: Weights, st: State, b: Buffers, k: Work) -> None:
 
 @torch.no_grad()
 def block(e) -> torch.Tensor:
-    """M:1128-1146 for the ids in ``dwork.bids`` at ``st.pos_dev`` + r (p = pos - 1): the three stages, the collapse
-    (kept in ``dbuf.hidden`` for the confidence) and ``mtp.2.norm``, then the target's head on every row ->
-    ``dbuf.dlog`` fp32 [B, V / world], no Markov bias yet."""
+    """The three stages, collapse and norm for ``dwork.bids`` (M:1128-1146), then the head into ``dbuf.dlog``."""
 
     w, st, b, k = e.w, e.st, e.dbuf, e.dwork
     cfg, ds = w.cfg, w.dspark
@@ -145,8 +131,7 @@ def _markov_in(IDS, EMB, X, PROJ, ME, CONF, i, D: tl.constexpr, RK: tl.constexpr
 
 
 def markov_input(e, i: int) -> None:
-    """Row i's Markov embedding of ``dwork.mids[i]`` into ``dbuf.me[i]`` and its confidence logit into
-    ``dbuf.conf[i]`` (M:1149-1156), from the collapse ``block`` kept."""
+    """Row i's Markov embedding into ``dbuf.me[i]`` and confidence logit into ``dbuf.conf[i]`` (M:1149-1156)."""
 
     w, b, k = e.w, e.dbuf, e.dwork
     D, RK = w.cfg.hidden_size, w.cfg.dspark_markov_rank
@@ -167,8 +152,7 @@ def _sigmoid(c: float) -> float:
 
 
 def policy(confidence: Sequence[float], d_fixed: int, conf_threshold: float | None = None) -> int:
-    """Drafts a round: ``d_fixed``, or with a threshold P the largest i <= min(d_fixed, len(confidence)) with
-    prod_{j<i} sigmoid(confidence_j) >= P, at least 1 (``d_fixed`` caps it)."""
+    """Drafts a round: ``d_fixed``, or the most whose sigmoid product is >= ``conf_threshold``, at least 1."""
 
     if conf_threshold is None:
         return d_fixed
@@ -183,13 +167,7 @@ def policy(confidence: Sequence[float], d_fixed: int, conf_threshold: float | No
 @torch.no_grad()
 def propose(e, y: int, p: int, sampling: Sampling | None, d: int, conf_threshold: float | None = None, *,
             steps=None, landed=None) -> tuple[list[int], list[float]]:
-    """The block for pending token ``y`` after the last committed position ``p``, then Markov steps i < d (with a
-    threshold: while ``policy`` keeps row i) -> (drafts for positions p+2.., their confidence logits).
-
-    Each draft is ``sample.draft_rows`` of its row at its own absolute position, the same on every rank.
-    ``steps`` stands in for (``block``, ``markov_input``, ``markov_step``), e.g. graph replays; ``landed(i, token)``
-    runs as each draft is drawn.
-    """
+    """The block for ``y`` after position ``p``, then Markov draws -> (drafts, confidence logits), alike on ranks."""
 
     w, st, b, k = e.w, e.st, e.dbuf, e.dwork
     B = w.cfg.dspark_block_size

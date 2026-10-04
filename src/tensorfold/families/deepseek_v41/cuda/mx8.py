@@ -42,10 +42,7 @@ def _f32(lin: Mx8Linear, x: torch.Tensor, out: torch.Tensor | None, prompt: bool
 
 def mm(lin: Mx8Linear, x: torch.Tensor, out: torch.Tensor | None = None, *, f32: bool = False,
        prompt: bool = False) -> torch.Tensor:
-    """x (M, K) -> (M, n): bf16 exactly as ``lin`` (decode) or ``lin.prefill`` (prompt), or fp32 before that rounding.
-
-    ``prompt`` is the call site's to set, never inferred from M: a row's bits follow the kernel, not the row count.
-    """
+    """x (M, K) -> (M, n) bf16 as ``lin`` or (``prompt``) ``lin.prefill``, or fp32 before that rounding."""
 
     if f32:
         return _f32(lin, x, out, prompt)

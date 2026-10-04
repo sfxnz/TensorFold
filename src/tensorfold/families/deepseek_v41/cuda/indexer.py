@@ -1,9 +1,4 @@
-"""L13-L16: DeepSeek-V4.1's lightning indexer, from index Q to each row's ascending top-k entries.
-
-``M:n`` cites the checkpoint's ``inference/model.py``. Scores are tiled by absolute entry and a row reads only its
-own query, weights and the entries it sees, so its bits do not depend on the other rows or on how many there are.
-Selections read one row's scores; ties go to the lower entry or block, with -0 counted as +0.
-"""
+"""DeepSeek-V4.1's lightning indexer: index Q to each row's ascending top-k entries, each row alone."""
 
 from __future__ import annotations
 
@@ -32,7 +27,7 @@ _SMS: dict[int, int] = {}
 
 def index_q(w: IdxW, qr: torch.Tensor, table: torch.Tensor, positions: torch.Tensor, out: torch.Tensor, *,
             prompt: bool = False) -> torch.Tensor:
-    """M:550-552: out [rows, heads, head_dim] = N7(RoPE(wq_b(qr))) in bf16, rows at ``positions`` (as rope.apply)."""
+    """M:550-552: out [rows, heads, head_dim] = FP4 QDQ of RoPE(wq_b(qr)) in bf16, rows at ``positions``."""
 
     rows, heads, dim = out.shape
     if not out.is_contiguous() or heads * dim != w.wq_b.n:
@@ -111,9 +106,7 @@ def _sms(device: torch.device) -> int:
 def scores(qI: torch.Tensor, wI: torch.Tensor, keys: torch.Tensor, ratio: int, pos: torch.Tensor,
            out: torch.Tensor, *, row0: int = 0, cand: torch.Tensor | None = None,
            cand_n: torch.Tensor | None = None, block: int = 8) -> torch.Tensor:
-    """N8a (M:556-567): out[r, t] = sum_h relu(qI[r, h] . keys[t]) * wI[r, h] fp32 for entries t < (q_r + 1) // ratio,
-    q_r = pos + row0 + r (-inf after them up to the last row's entries); with ``cand`` [rows, blocks] (+ ``cand_n``),
-    column c holds entry cand[r, c // block] * block + c % block of the row's ascending blocks, if the row sees it."""
+    """Each row's fp32 sum_h relu(q_h . k_t) * w_h over the entries it sees (M:556-567), -inf past them."""
 
     R, H, D = qI.shape
     if qI.dtype != torch.bfloat16 or keys.dtype != torch.bfloat16 or not qI.is_contiguous() or keys.shape[1] != D \
@@ -175,8 +168,7 @@ def _items(S, CAND, c0, n, vis, G: tl.constexpr, BLOCKS: tl.constexpr, CANDIDATE
 @triton.jit
 def _select(S, OUT, OUTN, POS, CAND, CANDN, row0, ratio, K, ss, so, sc, G: tl.constexpr,
             BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr, B: tl.constexpr):
-    """Program r: radix select (8 bits a pass) of the K-th best key, then one pass in item order writes the items
-    above it and the lowest-numbered ties; the count is min(K, items taking part)."""
+    """Program r: radix select of the K-th best key, then the items above it and the lowest-numbered ties."""
 
     r = tl.program_id(0).to(tl.int64)
     vis = (tl.load(POS).to(tl.int64) + row0 + r + 1) // ratio
@@ -232,8 +224,7 @@ def _check(s: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor) -> int:
 
 def candidates(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor, *,
                block: int = 8, row0: int = 0) -> torch.Tensor:
-    """N9 (M:583-610): row r's best min(out.shape[1], blocks) blocks of ``block`` entries by their best score (the
-    newest block pinned, -inf blocks dropped), ascending into out[r], their count into out_n[r]."""
+    """Each row's best blocks of ``block`` entries by their best score (M:583-610), ascending into out."""
 
     R = _check(s, out, out_n)
     if R:
@@ -245,8 +236,7 @@ def candidates(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor
 def topk(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor, *,
          row0: int = 0, cand: torch.Tensor | None = None, cand_n: torch.Tensor | None = None,
          block: int = 8) -> torch.Tensor:
-    """N9b (M:577-580): row r's best min(out.shape[1], visible) entries, ascending into out[r], the count into
-    out_n[r]; with ``cand``, ``s`` holds candidate slots as ``scores`` writes them and out gets their entries."""
+    """Each row's best visible entries (M:577-580), ascending into out; with ``cand``, of its candidates."""
 
     R = _check(s, out, out_n)
     if R:
@@ -260,9 +250,7 @@ def select(cfg: Config, qI: torch.Tensor, wI: torch.Tensor, keys: torch.Tensor, 
            buf: torch.Tensor, lists: torch.Tensor, list_n: torch.Tensor, *, pos: int | None = None,
            source: tuple[torch.Tensor, torch.Tensor] | None = None,
            within: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
-    """L14-L16 for rows at pos_dev + r: scores into ``buf``, the candidate source's blocks into ``source``, scoring
-    restricted to ``within``'s blocks, top-k into lists/list_n. ``pos`` (host) marks a prompt chunk, scored in row
-    blocks of score_rows(the last row's visible entries); without it all rows go at once (a decode window)."""
+    """Scores, candidate blocks and top-k lists for rows at pos_dev + r; ``pos`` marks a prompt chunk."""
 
     R = qI.shape[0]
     step = R if pos is None else min(score_rows((pos + R) // ratio), buf.shape[0])

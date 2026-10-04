@@ -1,9 +1,4 @@
-"""One rank's DeepSeek-V4.1-Flash weights from the checkpoint: its part of each tensor read with O_DIRECT, then built
-into the objects ``weights.py`` names, every value unchanged.
-
-A part made of whole rows is read alone; a part made of columns (EXL3 w1/w3 tile columns, ``wo_b``, shared ``w2``,
-DSpark ``w2``) is read whole and cut on the device. The next group's reads run while a group is built.
-"""
+"""One rank's weights from the checkpoint: its part of each tensor read with O_DIRECT, every value unchanged."""
 
 from __future__ import annotations
 
@@ -208,8 +203,7 @@ class _Build:
 
 def load(model_dir: str | Path, cfg: Config, rank: int, world: int, comm, layers=None, dspark: bool = True, *,
          capacity: int | None = None, device: str | torch.device = "cuda") -> Weights:
-    """Rank ``rank`` of ``world`` (1 loads whole tensors, for tests): backbone ``layers`` (all by default), DSpark
-    unless ``dspark`` is False, and RoPE tables of ``capacity`` slots (the native window and the reserve by default)."""
+    """Rank ``rank`` of ``world`` (1 for tests): backbone ``layers``, DSpark unless ``dspark`` is False, RoPE."""
 
     if world not in (1, 2) or not 0 <= rank < world:
         raise ValueError(f"rank {rank} of {world}: the engine runs on one or two GPUs")

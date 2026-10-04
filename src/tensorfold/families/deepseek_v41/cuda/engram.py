@@ -1,10 +1,4 @@
-"""Engram on the device: file rows staged through pinned halves, N10a dequant, the column exchange, ``wkv``, N10b.
-
-``M:n`` cites the checkpoint's ``inference/model.py``. Each rank reads its own hash columns of both layers (rank 0
-the first half); one gather puts every rank's dequantized rows side by side in column order, the flatten order of
-M:353. Each rank projects them through its rows of ``wkv``, and a second gather hands every rank the whole key and
-value. Bytes are the file's, the dequant is exact, the gathers copy, and every kernel is per row.
-"""
+"""Engram on the device: file rows staged, dequantized, exchanged by column, projected and injected."""
 
 from __future__ import annotations
 
@@ -23,11 +17,7 @@ CLAMP = 1e-6            # M:341: the gate's floor on |dot| before its square roo
 
 
 def stage_rows(ids: np.ndarray, reader, host: torch.Tensor, done: torch.cuda.Event, eraw: torch.Tensor) -> int:
-    """E2: rows ``ids`` (int [R, layers, columns], each layer's own row ids) from the files into ``eraw`` -> R.
-
-    ``host`` is one pinned half (u8 [rows, layers, columns, row bytes]) and ``done`` its event: the host writes the
-    half only once its previous copy to the device has finished, and ``done`` then marks this copy.
-    """
+    """Rows ``ids`` [R, layers, columns] from the files into ``eraw`` through pinned half ``host`` -> R."""
 
     ids = np.asarray(ids)
     if ids.ndim != 3 or ids.shape[1:] != tuple(host.shape[1:3]) or ids.shape[0] > min(host.shape[0], eraw.shape[0]):
@@ -56,7 +46,7 @@ def _dequant(RAW, OUT, W: tl.constexpr, S: tl.constexpr):
 
 
 def dequant_rows(eraw: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """N10a: u8 [R, layers, columns, W + W/32] -> out bf16 [R, layers, columns * W], exactly M:312-320's rows."""
+    """Dequant: u8 [R, layers, columns, W + W/32] -> out bf16 [R, layers, columns * W], exactly M:312-320's rows."""
 
     R, layers, cols, width = eraw.shape
     w = width * 32 // 33
@@ -76,10 +66,7 @@ def _lead(buf: torch.Tensor, R: int) -> torch.Tensor:
 
 
 def exchange(eloc: torch.Tensor, comm, gat: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """E3: this rank's rows [R, layers, W] -> every rank's [R, layers, world * W] in out, rank 0's columns first.
-
-    ``gat`` [world, rows, layers, W] receives the gather; world 1 returns ``eloc`` itself.
-    """
+    """This rank's rows [R, layers, W] -> every rank's [R, layers, world * W] in ``out``, rank 0's first."""
 
     world, R = gat.shape[0], eloc.shape[0]
     if world == 1:
@@ -93,11 +80,7 @@ def exchange(eloc: torch.Tensor, comm, gat: torch.Tensor, out: torch.Tensor) -> 
 
 def kv(e: torch.Tensor, wkv: Mx8Linear, comm, out: torch.Tensor, gat: torch.Tensor, *,
        prompt: bool = False) -> torch.Tensor:
-    """L1: one layer's rows e [R, K] -> [keys | value] as world column blocks [world, R, (hc + 1) * D / world].
-
-    Block r is rank r's rows of ``wkv`` (``out`` [rows, n] takes this rank's, ``gat`` [world, rows, n] the
-    gather); world 1 is the whole projection, [1, R, (hc + 1) * D], with no gather.
-    """
+    """One layer's rows e [R, K] -> [keys | value] as world column blocks [world, R, (hc + 1) * D / world]."""
 
     R = e.shape[0]
     y = mx8.mm(wkv, e, out[:R], prompt=prompt)
@@ -139,11 +122,7 @@ def _inject(X, KV, part_stride, row_stride, WQK, eps, clamp, scale, D: tl.conste
 
 
 def inject(X: torch.Tensor, kv: torch.Tensor, wqk: torch.Tensor, eps: float = 1e-20) -> torch.Tensor:
-    """N10b in place: X [R, hc, D] bf16 += gate * value per (row, copy), rounded to bf16 once (M:350-365).
-
-    ``kv`` is ``kv()``'s [world, R, (hc + 1) * D / world] (a [R, (hc + 1) * D] tensor is one block); ``wqk`` is
-    fp32 [hc, D], q_weight * k_weight.
-    """
+    """X [R, hc, D] bf16 += gate * value per (row, copy) in place, rounded to bf16 once (M:350-365)."""
 
     if kv.dim() == 2:
         kv = kv[None]

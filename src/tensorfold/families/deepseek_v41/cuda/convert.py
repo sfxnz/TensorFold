@@ -28,11 +28,7 @@ def fp8_block_rows(scale: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def mxfp4_to_nvfp4(words: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One MXFP4 matrix (e2m1 x2 [N, K/2], E8M0 [N, K/32]) -> NVFP4 (same words, e4m3 [N, K/16], fp32 scale).
-
-    With ``top`` the largest exponent byte, each 16 inputs get 2^(e - top + 8) and the matrix 2^(top - 135),
-    so every product is the source's 2^(e - 127) exactly; a span over ``SPAN`` cannot be held and is refused.
-    """
+    """One MXFP4 matrix -> NVFP4 words, e4m3 scales per 16 and one fp32 scale, every product exact."""
 
     w, e = _bytes(words), _bytes(scale)
     if w.dim() != 2 or (2 * w.shape[1]) % BLOCK or tuple(e.shape) != (w.shape[0], 2 * w.shape[1] // BLOCK):

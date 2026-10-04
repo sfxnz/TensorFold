@@ -1,9 +1,4 @@
-"""What the two ranks say to each other: the startup settings they must share, the request doorbell, a request's
-header, and rank 0's integers on both ranks.
-
-Rank 1 idles on the rendezvous store, not inside the all-gather; each request then crosses as a header and the
-prompt, and both ranks decode exactly what the header says (rank 0 decodes its own), so they run the same calls.
-"""
+"""What the two ranks say to each other: startup settings, the doorbell, request headers, rank 0's ints."""
 
 from __future__ import annotations
 
@@ -42,8 +37,7 @@ def _from_f64(lo: int, hi: int) -> float:
 
 def encode(max_tokens: int, stop_eos: bool, draft: bool, cached: int, sampling: Sampling | None,
            policy: tuple[int, float | None]) -> list[int]:
-    """``[max_tokens, stop_eos, draft, cached, seed x3, temperature x2, top_k, top_p x2, min_p x2, drafts,
-    confidence_ppm]`` as int32 values; floats travel as the two halves of an f64, the seed as 31+31+2 bits."""
+    """A request as 16 int32 values; floats travel as an f64's two halves, the seed as 31+31+2 bits."""
 
     if max_tokens < 1:
         raise ValueError(f"max_tokens {max_tokens}: a request decodes at least one token")
@@ -136,8 +130,7 @@ def settings(*, start_error: bool, dspark: bool, capacity: int, prefill_rows: in
 
 
 def agree(both: list[list[int]]) -> tuple[int, int]:
-    """Refuse ranks started with different settings, naming each that differs with both values -> (kept-snapshot
-    bytes, entries) both ranks use."""
+    """Refuse ranks started with different settings, naming each -> (snapshot bytes, entries) both use."""
 
     n = len(SETTINGS)
     differ = [f"{name} rank 0 {a}, rank 1 {b}" for name, a, b in zip(SETTINGS, both[0][:n], both[1][:n]) if a != b]

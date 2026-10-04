@@ -1,9 +1,4 @@
-"""N5, N7, N6q: DeepSeek-V4.1's activation quantize-dequantize, per group of the last dim, bf16 in and out.
-
-``K:n`` cites the checkpoint's ``inference/kernel.py``. Each group's bits depend on that group alone. Scales come
-from the same fp32 operations as the reference (reciprocal multiply, exponent-bit ceil-log2, IEEE divides), and
-FP4 values round to the nearest e2m1 with ties to even.
-"""
+"""DeepSeek-V4.1's activation quantize-dequantize per group of the last dim, bf16 in and out."""
 
 from __future__ import annotations
 
@@ -50,14 +45,14 @@ def _qdq(X, Y, n, per_row, sx, sy, G: tl.constexpr, KIND: tl.constexpr, B: tl.co
     j = tl.arange(0, G)[None, :]
     x = tl.load(X + row[:, None] * sx + col[:, None] + j, mask=ok, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=1)
-    if KIND == 0:                                   # N5, K:70-86: FP8 e4m3, scale 2^ceil(log2(amax / 448))
+    if KIND == 0:                                   # K:70-86: FP8 e4m3, scale 2^ceil(log2(amax / 448))
         s = _pow2_ceil(tl.maximum(amax, FLOOR8) * INV448)[:, None]
         q = tl.minimum(tl.maximum(tl.math.div_rn(x, s), -448.0), 448.0)
         q = q.to(tl.float8e4nv).to(tl.float32)
     else:
-        if KIND == 1:                               # N7, K:165-166: FP4 e2m1, scale 2^ceil(log2(amax / 6))
+        if KIND == 1:                               # K:165-166: FP4 e2m1, scale 2^ceil(log2(amax / 6))
             s = _pow2_ceil(tl.maximum(amax, FLOOR4_E8M0) * INV6)[:, None]
-        else:                                       # N6q, K:162-163: FP4 e2m1, scale e4m3(amax / 6)
+        else:                                       # K:162-163: FP4 e2m1, scale e4m3(amax / 6)
             s = tl.math.div_rn(tl.maximum(amax, FLOOR4_E4M3), 6.0).to(tl.float8e4nv).to(tl.float32)[:, None]
         q = _e2m1(tl.minimum(tl.maximum(tl.math.div_rn(x, s), -6.0), 6.0))
     tl.store(Y + row[:, None] * sy + col[:, None] + j, (q * s).to(tl.bfloat16), mask=ok)
@@ -81,18 +76,18 @@ def _run(x: torch.Tensor, out: torch.Tensor | None, group: int, kind: int) -> to
 
 
 def fp8_qdq_1x32(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """N5: FP8 e4m3 per 32 with a power-of-two scale (the window KV); in place unless ``out`` is given."""
+    """FP8 e4m3 per 32 with a power-of-two scale (the window KV); in place unless ``out`` is given."""
 
     return _run(x, out, 32, FP8)
 
 
 def fp4_qdq_1x32_e8m0(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """N7: FP4 e2m1 per 32 with a power-of-two scale (index Q and index-K); in place unless ``out`` is given."""
+    """FP4 e2m1 per 32 with a power-of-two scale (index Q and index-K); in place unless ``out`` is given."""
 
     return _run(x, out, 32, FP4_E8M0)
 
 
 def fp4_qdq_1x16_e4m3(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """N6q: FP4 e2m1 per 16 with an e4m3 scale (compressed KV entries); in place unless ``out`` is given."""
+    """FP4 e2m1 per 16 with an e4m3 scale (compressed KV entries); in place unless ``out`` is given."""
 
     return _run(x, out, 16, FP4_E4M3)

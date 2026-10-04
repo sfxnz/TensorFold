@@ -1,10 +1,4 @@
-"""Kept prompt snapshots of one rank, every copy in one device arena allocated at startup: a request's keep point
-gets its span before the prefill, and another conversation's live cache rows are saved aside before a prefill
-overwrites them.
-
-Both ranks call these with the same ids in the same order, so they keep, save and drop the same snapshots at the
-same arena offsets; rank 1 finds the snapshot rank 0 resumes by its length and prefix.
-"""
+"""Kept prompt snapshots of one rank in one arena allocated at startup, kept and dropped alike on both ranks."""
 
 from __future__ import annotations
 
@@ -119,8 +113,7 @@ class Kept:
         return at
 
     def reserve(self, hit: Snapshot | None) -> torch.Tensor | None:
-        """The span a new keep point's snapshot is copied into (an entry dropped first at the entry cap), or None
-        when the arena cannot hold one; ``hit`` is never dropped."""
+        """The span a new keep point's snapshot is copied into, or None when the arena cannot hold one."""
 
         if self.entries == 0:
             return None
@@ -154,8 +147,7 @@ class Kept:
         self._reserved = None
 
     def take_over(self, hit: Snapshot | None) -> None:
-        """Before a prefill from ``hit`` (None: from position 0): save the live rows of every snapshot it does not
-        resume (dropping one there is no room for, or whose rows are gone), then put ``hit``'s saved rows back."""
+        """Before a prefill from ``hit``: save the rows of snapshots it does not resume, then restore its own."""
 
         e, keep = self.e, hit.ids if hit is not None else []
 

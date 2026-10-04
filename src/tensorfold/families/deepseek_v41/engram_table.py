@@ -86,10 +86,7 @@ class Layout:
 
     @classmethod
     def read(cls, model_dir: str | Path, layer_ids: Sequence[int], buckets: Sequence[Sequence[int]]) -> Layout:
-        """Tables from the index and shard headers, each byte range checked against its file's size.
-
-        ``buckets[i]`` are layer ``layer_ids[i]``'s hash-column bucket sizes (its primes, in column order).
-        """
+        """Tables from the index and shard headers, byte ranges checked; ``buckets[i]`` are layer i's primes."""
 
         model_dir = Path(model_dir)
         weight_map = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
