@@ -110,6 +110,29 @@ def test_a_best_too_close_to_a_ranks_runner_up_falls_back_to_the_host_rule(monke
     assert decided == [None, None]
 
 
+def test_a_rank_that_ranks_its_winner_second_falls_back_to_the_host_rule(monkeypatch):
+    real = cs._best_two
+
+    def swapped(scaled, positions, s, floor, offset, id_map):        # rank 0 reports its runner-up as its best
+        f, i = real(scaled, positions, s, floor, offset, id_map)
+        if offset:
+            return f, i
+        rest = scaled.clone().scatter_(1, i[:, :1], -float("inf"))
+        g, j = real(rest, positions, s, floor, offset, id_map)
+        return torch.stack([g[:, 0], f[:, 0], g[:, 2]], 1), j
+
+    monkeypatch.setattr(cs, "_best_two", swapped)
+    decided = []
+    real_keyed = cs._keyed
+    monkeypatch.setattr(cs, "_keyed", lambda *a: decided.append(real_keyed(*a)) or decided[-1])
+    for seed in range(4):
+        logits = _logits(seed, "cpu")
+        s = Sampling(seed + 21, 1.0, 0, 1.0, 0.0)
+        positions = [3 + seed + r for r in range(6)]
+        assert two_ranks(logits, positions, s, 10000) == host_rule(monkeypatch, logits, positions, s, 10000)
+    assert decided == [None] * 8                                       # the runner-up bound rejects every call
+
+
 def test_device_scores_only_pick_the_candidates(monkeypatch):
     real = cs.uniform_rows                                             # device logs a few ulps off the host's
     monkeypatch.setattr(cs, "uniform_rows", lambda *a: real(*a) * (1.0 - 2.0 ** -50))
