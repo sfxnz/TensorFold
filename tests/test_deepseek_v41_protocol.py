@@ -35,6 +35,24 @@ def test_header_round_trip(sampling, policy):
     assert protocol.decode(protocol.encode(1, True, False, 0, sampling, policy))[:4] == (1, True, False, 0)
 
 
+def test_a_top_k_past_int32_travels_as_the_largest_int32():
+    header = protocol.encode(5, True, True, 0, Sampling(seed=9, temperature=1.0, top_k=2**31 + 5), (3, None))
+    assert all(-2**31 <= v < 2**31 for v in header)
+    assert protocol.decode(header).sampling.top_k == protocol.TOP_K_MAX
+
+
+def test_a_list_int32_cannot_hold_fails_before_any_gather():
+    calls = []
+
+    class Comm:
+        def all_gather(self, send, recv):
+            calls.append(send.numel())
+
+    with pytest.raises(RuntimeError):
+        protocol.share(Comm(), 0, [1, 2**31], "cpu")
+    assert calls == [], "rank 1 would be left inside the gather"
+
+
 def test_greedy_temperatures_decode_to_no_sampling_and_stop_is_no_header():
     zero = protocol.encode(5, True, True, 0, Sampling(seed=9, temperature=0.0), (3, None))
     assert protocol.decode(zero).sampling is None

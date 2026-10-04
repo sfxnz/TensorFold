@@ -20,6 +20,7 @@ ENGRAM_SPLIT = 0            # each rank reads a contiguous half of every Engram 
 SETTINGS = ("engram_error", "dspark_loaded", "capacity", "prefill_rows", "max_rows", "ring", "drafts",
             "confidence_ppm", "layers", "world", "kv_storage", "engram_split", "engram_digest_hi", "engram_digest_lo")
 SPARE = ("cache_mib", "cache_entries")      # each rank's room for kept snapshots: both use the smaller
+TOP_K_MAX = 2**31 - 1       # a header's largest top_k; any top_k past the vocabulary keeps every token
 
 
 class Request(NamedTuple):
@@ -50,7 +51,7 @@ def encode(max_tokens: int, stop_eos: bool, draft: bool, cached: int, sampling: 
     drafts, confidence = policy
     return [int(max_tokens), int(stop_eos), int(draft), int(cached),
             seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
-            *_f64(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
+            *_f64(sampling.temperature if sampling else 0.0), min(int(sampling.top_k), TOP_K_MAX) if sampling else 0,
             *_f64(sampling.top_p if sampling else 1.0), *_f64(sampling.min_p if sampling else 0.0),
             int(drafts), -1 if confidence is None else round(confidence * 1e6)]
 
@@ -114,9 +115,9 @@ def share(comm, rank: int, values: list[int] | None, device: str = "cuda") -> li
 
     import torch
 
+    mine = torch.tensor(values, dtype=torch.int32, device=device) if rank == 0 else None   # raises before any gather
     count = gather_ints(comm, [len(values) if rank == 0 else 0], device)[0][0]
-    send = (torch.tensor(values, dtype=torch.int32, device=device) if rank == 0
-            else torch.zeros((count,), dtype=torch.int32, device=device))
+    send = mine if rank == 0 else torch.zeros((count,), dtype=torch.int32, device=device)
     got = torch.empty((2 * count,), dtype=torch.int32, device=device)
     comm.all_gather(send, got)
     return [int(v) for v in got[:count].tolist()]

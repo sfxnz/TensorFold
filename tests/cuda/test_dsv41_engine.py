@@ -161,6 +161,15 @@ def test_refused_requests_reach_no_collective(ranks):
         del e0.comm.all_gather
 
 
+def test_a_top_k_past_int32_is_served_on_both_ranks_and_the_next_request_too(ranks):
+    prompt = _ids(5, 90)
+    huge, whole, after = _serve(ranks, [req(prompt, sampling=Sampling(seed=7, temperature=1.0, top_k=2**31)),
+                                        req(prompt, sampling=Sampling(seed=7, temperature=1.0, top_k=1024)),
+                                        req(_ids(6, 40))])
+    assert huge[0] == whole[0], "a top_k past the vocabulary keeps every token, as its size (1024) does"
+    assert len(after[0]) == REPLY
+
+
 def test_serving_allocates_nothing_once_warm(ranks):
     long = _ids(30, LONG)
     others = [_ids(31, LONG), _ids(32, 200)]
