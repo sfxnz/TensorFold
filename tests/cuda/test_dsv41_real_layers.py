@@ -4,16 +4,14 @@ DSpark's stage MoE, and a reduced model through TF's prompt path.
 Blocks 0, 1, 2, 3, 8, 14, 20, 21, 24, 25, 37 and 39 each take the bf16 stream and FFN pre that TF's forward gives
 them, on one rank, at contexts 100, 1,100 and 17,000 (the prompt rows that end each context, then decode windows
 at even and odd positions). The reference builds its caches from every row and runs the whole block on those rows,
-in mirror mode (rel-L2 4 x 2^-8, cosine 0.9999) and fp32 mode (rel-L2 3%, or the mirror reference's own distance
-to fp32 mode plus 4 x 2^-8 where that is larger: rows carrying massive activations, and rows whose fp32 FFN input
-takes another expert at a near-tie, move further than ten bf16 roundings explain). Both attend TF's index lists; the
-reference's own picks are counted against them. Routed sets must equal an fp64 router's on TF's own input except
-at near-ties. TF runs one layer at a time with only that layer's weights on the device, so the 40 blocks fit one GPU.
+in mirror mode (rel-L2 4 x 2^-8, cosine 0.9999) and fp32 mode (rel-L2 3% over the rows it routes as TF does; the
+rows it reroutes are counted). Both attend TF's index lists. TF's routed sets, index lists and candidate blocks must
+equal an fp64 selection on TF's own inputs except at near-ties (§7.7). TF runs one layer at a time with only that
+layer's weights on the device, so the 40 blocks fit one GPU.
 
-DSpark's stages have no TF block yet: each stage's MoE runs on the stage input of the reference's own DSpark pass
-from TF's taps. The reduced model amplifies roundings (the reference's fp32 and mirror modes disagree on top-1 where
-margins are small), so it must follow the mirror reference as closely as the fp32 reference does and keep top-1 on
-99% of rows wherever the reference's own modes agree on it.
+Each DSpark stage's MoE runs on the stage input of the reference's own DSpark pass from TF's taps (whole stages
+against the reference are ``test_dsv41_dspark.py``'s). The reduced model's logits must follow the mirror reference
+(top-1 on 99% of rows, mean KL 1e-3, rel-L2 5%); the fp32 reference's distance to it is reported beside TF's.
 
 The tokens are DeepSeek's MIT reference sources shipped in the checkpoint (``CORPUS``): paragraphs in the order a
 seeded ``random.Random`` shuffles them, tokenized after BOS. ``TF_DSV41_REPORT=<path>`` writes every figure as JSON.
@@ -42,18 +40,7 @@ if not MODEL or not Path(MODEL).is_dir():
 
 import torch.nn.functional as tnf
 from dsv41_ref_weights import RefWeights, exl3_weight
-from dsv41_reference import (
-    Mode,
-    State,
-    fp4_act_quant,
-    gate,
-    hc_post,
-    hc_pre,
-    linear,
-    rms_norm,
-    rope,
-    select_candidate_blocks,
-)
+from dsv41_reference import Mode, State, gate, hc_post, hc_pre, rms_norm
 from safetensors import safe_open
 from tokenizers import Tokenizer
 
@@ -76,13 +63,11 @@ CAP = 17_024
 TAIL = 256                              # compared prompt rows that end each context
 BLOCK = PREFILL_ROWS                    # rows the reference writes caches for at once
 MIRROR, FP32 = Mode("mirror", world=1), Mode("fp32", world=1)     # one rank: row sums over the whole input dim
-REL_MIRROR, COS, REL_FP32 = 4 * 2**-8, 0.9999, 0.03      # T2, one block (fp32: or the mirror reference's distance)
-PICKS = 0.01                            # the reference's index picks that may differ from TF's (near-ties)
+REL_MIRROR, COS, REL_FP32 = 4 * 2**-8, 0.9999, 0.03      # T2, one block
 TIE = 4                                 # a near-tie: the fp64 margin below TIE x the fp32 bound
 DSPARK_AT = (99, 104, 1_099, 1_104, 16_999, 17_004)       # p after each context's prompt and its first window
 REDUCED, REDUCED_ROWS = 8, 256          # reduced model: layers 0-7, norm, head over 256 positions
-TOP1 = 0.99                             # top-1 agreement where the reference's own modes agree on the decision
-DECIDED = 0.2                           # least share of rows decided, so the top-1 gate cannot go vacuous
+TOP1, KL, REL_LOGITS = 0.99, 1e-3, 0.05                  # T2, reduced model, against the mirror reference
 
 
 class Ref(RefWeights):
@@ -232,6 +217,7 @@ class Stream:
         w.layers, w.engram = [lw], ({L: eg} if eg is not None else {})
         role, spans, seen = lw.role, _compared(), {"xf": [], "pick": []}
         own_lists = role.ratio and role.idx_src == L
+        index = {k: {"picked": 0, "differ": 0, "not_ties": 0, "worst": 0.0} for k in ("lists", "blocks")}
         st.reset()
         for f, (a, n, prompt) in enumerate(_forwards()):
             b = self.pbuf if prompt else self.dbuf
@@ -264,6 +250,7 @@ class Stream:
                     seen["xf"].append(b.xn[lo - a:hi - a].cpu())
                     seen["pick"].append(b.pick[lo - a:hi - a].cpu())
                     if own_lists:
+                        _index(cfg, role, b, st.index_k[role.kv_src], lo - a, hi - a, lo, index)
                         counts = b.list_n[lo - a:hi - a].tolist()
                         rows = b.lists[lo - a:hi - a].cpu().long()
                         self.picked.setdefault(L, []).extend(rows[i, :c] for i, c in enumerate(counts))
@@ -272,6 +259,7 @@ class Stream:
             F.commit(w, st, b, R, R)
         seen = {k: torch.cat(v) for k, v in seen.items()}
         seen["routing"] = _routing(cfg, seen["xf"], lw.moe.gate.cpu(), lw.moe.bias.cpu(), seen["pick"])
+        seen["index"] = index
         w.layers, w.engram = [], {}
         del lw, eg
         return seen
@@ -283,69 +271,63 @@ class Stream:
         self.pack.close()
 
 
-class Picks:
-    """The reference's own index picks (M:550-580, its scores recomputed for their margins) against TF's lists.
+def _ties(out: dict, s: torch.Tensor, tol: torch.Tensor, k: torch.Tensor, given: torch.Tensor) -> None:
+    """Adds to ``out`` how many of the masks ``given`` [rows, n] differ from fp64 top-k of ``s`` (ties to the lower
+    index), those not at a near-tie (|s - k-th| >= the two tolerances), and the worst |s - k-th| over its tolerance."""
 
-    A differing pick's gap is |score - k-th score| over the row's largest |score|; ``outside`` counts TF picks in
-    blocks the reference's own candidate selection left out (a near-tie of layer 20's block scores).
-    """
+    ranked = torch.sort(s, dim=-1, descending=True, stable=True)
+    mine = torch.arange(s.shape[1], device=s.device) < k[:, None]
+    mine = torch.zeros_like(given).scatter_(1, ranked.indices, mine)
+    at = (k - 1).clamp_min(0)[:, None]
+    kth = torch.where(k[:, None] > 0, ranked.values.gather(1, at), -math.inf)
+    lim = tol + tol.gather(1, ranked.indices.gather(1, at))
+    ratio = ((s - kth).abs() / lim).nan_to_num(math.inf)[mine ^ given]
+    out["picked"] += int(k.sum())
+    out["differ"] += len(ratio)
+    out["not_ties"] += int((ratio >= 1).sum())
+    out["worst"] = max(out["worst"], float(ratio.max()) if len(ratio) else 0.0)
 
-    def __init__(self) -> None:
-        self.cand: dict[int, torch.Tensor] = {}     # first compared row -> the candidate source's entry mask
-        self.take()
 
-    def take(self) -> dict:
-        """The counts so far (one layer's), then zero them."""
+def _index(cfg: Config, role, b, keys: torch.Tensor, i: int, j: int, first: int, out: dict) -> None:
+    """TF's lists of forward rows i..j (at ``first`` on), and the candidate source's blocks, against an fp64
+    selection on TF's own index Q, weights and keys (M:556-610): every difference must be a near-tie (§7.7)."""
 
-        out = {k: getattr(self, k, 0) for k in ("differ", "picked", "outside", "worst_gap")}
-        self.differ = self.picked = self.outside = 0
-        self.worst_gap = 0.0
-        return out
-
-    def count(self, ref, L: int, x: torch.Tensor, qr: torch.Tensor, start: int, given: list[torch.Tensor]) -> None:
-        c, m, st, role, p = ref.cfg, ref.mode, ref.state, ref.cfg.roles[L], f"layers.{L}"
-        keys, rows = st.index_k[role.kv_src], torch.arange(start, start + len(x))
-        H, D = c.index_n_heads, c.index_head_dim
-        q = m.bf16(linear(qr, ref.W(f"{p}.attn.indexer.wq_b.weight"), m)).unflatten(-1, (H, D))
-        q = fp4_act_quant(rope(q, ref.cis(role.rope, rows), m), 32)
-        wt = m.bf16(linear(x, ref.W(f"{p}.attn.indexer.weights_proj.weight"), m, fp8=False)) * (D**-0.5 * H**-0.5)
-        score = (torch.einsum("shd,td->sht", q, keys).relu() * wt[..., None]).sum(1)
-        visible = (rows + 1) // role.ratio
-        score = score.masked_fill(torch.arange(len(keys)) >= visible[:, None], -math.inf)
+    H, D, G = cfg.index_n_heads, cfg.index_head_dim, cfg.candidate_block_size
+    bound = TIE * 8 * math.sqrt(H * D) * 2.0**-24          # T1 fp32 bound, the scale summed below
+    visible = (torch.arange(first, first + j - i, device=keys.device) + 1) // role.ratio
+    K = keys[:int(visible.max())].double()
+    t = torch.arange(len(K), device=K.device)
+    for r in range(i, j, 8):
+        n = min(8, j - r)
+        q, w, v = b.qI[r:r + n].double(), b.wI[r:r + n].double(), visible[r - i:r - i + n, None]
+        s = (torch.einsum("nhd,td->nht", q, K).relu() * w[..., None]).sum(1).masked_fill(t >= v, -math.inf)
+        tol = bound * torch.einsum("nhd,td->nt", q.abs() * w.abs()[..., None], K.abs())
+        if role.candidate_source or role.uses_candidates:
+            blocks = torch.zeros((n, -(-len(K) // G)), dtype=torch.bool, device=K.device)
+            for x, c in enumerate(b.cand_n[r:r + n].tolist()):
+                blocks[x, b.cand[r + x, :c].long()] = True
         if role.candidate_source:
-            self.cand[start] = select_candidate_blocks(score, visible, c.candidate_topk_blocks, c.candidate_block_size)
-        elif role.uses_candidates:
-            cand = self.cand[start]
-            score = score.masked_fill(~tnf.pad(cand, (0, score.shape[1] - cand.shape[1])), -math.inf)
-        ranked = torch.sort(score, dim=-1, descending=True, stable=True)
-        for i, theirs in enumerate(given):
-            k = min(c.index_topk, int(visible[i]))
-            d = sorted(set(ranked.indices[i, :k].tolist()) ^ set(theirs.tolist()))
-            self.differ, self.picked = self.differ + len(d), self.picked + k
-            if d and k:
-                s, kth = score[i, d], ranked.values[i, k - 1]
-                seen = s.isfinite()
-                self.outside += int((~seen).sum())
-                if seen.any():
-                    scale = ranked.values[i, :k].abs().max()
-                    self.worst_gap = max(self.worst_gap, float(((s[seen] - kth).abs() / scale).max()))
+            bs = tnf.pad(s, (0, -len(K) % G), value=-math.inf).unflatten(-1, (-1, G)).amax(-1)
+            bs = bs.masked_fill(torch.arange(bs.shape[1], device=K.device) == (v - 1) // G, math.inf)
+            bt = tnf.pad(tol, (0, -len(K) % G)).unflatten(-1, (-1, G)).amax(-1)
+            k = (bs > -math.inf).sum(-1).clamp_max(cfg.candidate_topk_blocks)
+            _ties(out["blocks"], bs, bt, k, blocks)
+        if role.uses_candidates:
+            s = s.masked_fill(~blocks.repeat_interleave(G, -1)[:, :len(K)], -math.inf)
+        given = torch.zeros_like(s, dtype=torch.bool)
+        for x, c in enumerate(b.list_n[r:r + n].tolist()):
+            given[x, b.lists[r + x, :c].long()] = True
+        _ties(out["lists"], s, tol, (s > -math.inf).sum(-1).clamp_max(cfg.index_topk), given)
 
 
-def ref_block(rw: Ref, L: int, mode: Mode, state: State, stream: Stream, eng_ids,
-              picks: Picks | None) -> tuple[torch.Tensor, torch.Tensor]:
+def ref_block(rw: Ref, L: int, mode: Mode, state: State, stream: Stream, eng_ids) -> tuple[torch.Tensor, torch.Tensor]:
     """Block L of the reference (M:968-994) on TF's input stream: caches from every row, the whole block on the
     compared rows, their MoE in one call -> (their output stream fp32 [rows, hc, D], their routed experts)."""
 
     c, role, p, eps = rw.cfg, rw.cfg.roles[L], f"layers.{L}", rw.cfg.rms_norm_eps
     ref = rw.reference(mode, state)
     given: list[torch.Tensor] = []
-
-    def indexer(layer: int, x: torch.Tensor, qr: torch.Tensor, start: int) -> list[torch.Tensor]:
-        if picks is not None:
-            picks.count(ref, layer, x, qr, start, given)
-        return given
-
-    ref.indexer = indexer
+    ref.indexer = lambda *_: given
     at, mids = 0, []
     for a, b, full in _segments(ROWS):
         X, pre = stream.X[a:b].float().cpu(), stream.pre[a:b].cpu()
@@ -409,9 +391,11 @@ def _dspark(stream: Stream, rw: Ref) -> list[dict]:
     return out
 
 
-def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict, index: dict) -> dict:
-    """Block L's figures per compared group: TF against each mode, the mirror reference against fp32 mode, and the
-    rows each mode routes to other experts than TF (fp32 mode's FFN input crosses near-ties TF's bf16 one does not)."""
+def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict) -> dict:
+    """Block L's figures per compared group: TF against each mode and the rows each mode routes to other experts
+    than TF. Against fp32 mode ``rel`` covers the rows it routes as TF does (its FFN input moves further than T1, so
+    a near-tie it crosses is no discrete-rule failure); ``all_rows`` and the mirror reference's distance are
+    reported."""
 
     groups, at = [], 0
     tf_sets = seen["pick"].long().sort(-1).values
@@ -419,16 +403,18 @@ def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict, index:
         got, g = stream.Y[lo:hi].cpu(), {"rows": [lo, hi], "kind": kind}
         for name, mode in (("mirror", MIRROR), ("fp32", FP32)):
             out, routed = (t[at:at + hi - lo] for t in want[mode])
-            g[name] = {**_close(got, out), "rerouted": int((routed.sort(-1).values != tf_sets[at:at + hi - lo])
-                                                             .any(-1).sum())}
+            same = (routed.sort(-1).values == tf_sets[at:at + hi - lo]).all(-1)
+            g[name] = {**_close(got, out), "rerouted": int((~same).sum())}
+        g["fp32"] = {**g["fp32"], "all_rows": g["fp32"]["rel"], **_close(got[same], out[same])}
         g["fp32"]["mirror_ref"] = _close(want[MIRROR][0][at:at + hi - lo], want[FP32][0][at:at + hi - lo])["rel"]
         groups.append(g)
         at += hi - lo
         print(f"layer {L} ({cfg.roles[L].mode}) {kind} rows {lo}-{hi - 1}: rel-L2 {g['mirror']['rel']:.3g} mirror "
-              f"(cosine {g['mirror']['cos']:.6f}), {g['fp32']['rel']:.3g} fp32 (the mirror reference "
-              f"{g['fp32']['mirror_ref']:.3g}; {g['fp32']['rerouted']} rows rerouted)")
-    print(f"layer {L}: TF routing against fp64 {seen['routing']}; index picks {index}")
-    return {"role": cfg.roles[L].mode, "groups": groups, "routing": seen["routing"], "index": index}
+              f"(cosine {g['mirror']['cos']:.6f}), {g['fp32']['rel']:.3g} fp32 where it routes as TF ("
+              f"{g['fp32']['rerouted']} rows rerouted; all rows {g['fp32']['all_rows']:.3g}, the mirror reference "
+              f"{g['fp32']['mirror_ref']:.3g})")
+    print(f"layer {L}: TF routing against fp64 {seen['routing']}; TF index selection against fp64 {seen['index']}")
+    return {"role": cfg.roles[L].mode, "groups": groups, "routing": seen["routing"], "index": seen["index"]}
 
 
 @pytest.fixture(scope="module")
@@ -452,15 +438,14 @@ def layers(report):
     tokens = corpus(cfg, ROWS + 1)      # one more: the token after the last row, DSpark's y there
     eng_ids = rw.hasher.ids([], tokens[:ROWS])
     stream = Stream(cfg, tokens, rw.hasher, rw.reader)
-    states, picks = {MIRROR: State(), FP32: State()}, Picks()
+    states = {MIRROR: State(), FP32: State()}
     try:
         for L in range(cfg.num_hidden_layers):
             seen = stream.layer(L)
             if L in LAYERS:
-                want = {mode: ref_block(rw, L, mode, states[mode], stream, eng_ids, picks if mode is MIRROR else None)
-                        for mode in (MIRROR, FP32)}
+                want = {mode: ref_block(rw, L, mode, states[mode], stream, eng_ids) for mode in (MIRROR, FP32)}
                 rw.forget()
-                report["layers"][L] = _figures(cfg, L, stream, want, seen, picks.take())
+                report["layers"][L] = _figures(cfg, L, stream, want, seen)
             stream.advance()
         stream.X = stream.Y = stream.pre = stream.pre_out = stream.pbuf = None
         report["dspark"] = _dspark(stream, rw)
@@ -478,9 +463,10 @@ def test_block_follows_the_reference(layers, L):
     for g in out["groups"]:
         m, f = g["mirror"], g["fp32"]
         assert m["rel"] <= REL_MIRROR and m["cos"] >= COS, f"layer {L} rows {g['rows']}: mirror {m}"
-        assert f["rel"] <= max(REL_FP32, f["mirror_ref"] + REL_MIRROR), f"layer {L} rows {g['rows']}: fp32 {f}"
+        assert f["rel"] <= REL_FP32, f"layer {L} rows {g['rows']}: fp32 {f}"
     assert out["routing"]["not_ties"] == 0, f"layer {L}: routed sets differ away from near-ties {out['routing']}"
-    assert out["index"]["differ"] <= PICKS * out["index"]["picked"], f"layer {L}: index picks {out['index']}"
+    for kind, d in out["index"].items():
+        assert d["not_ties"] == 0, f"layer {L}: index {kind} differ away from near-ties {d}"
 
 
 def test_dspark_stage_moe_follows_the_reference(layers):
@@ -510,17 +496,9 @@ def test_reduced_model_follows_the_reference(report):
     del e, w
     torch.cuda.empty_cache()
     mirror, fp32 = (rw.model(ids, mode, all_logits=True)[0].double() for mode in (MIRROR, FP32))
-    pick, want = got.argmax(-1), mirror.argmax(-1)
-    spread = (mirror - fp32).abs().amax(-1)             # the reference's own disagreement on each row
-    margin = (mirror.gather(-1, want[:, None]) - mirror.gather(-1, pick[:, None]))[:, 0]
-    top2 = mirror.topk(2, -1).values
-    out = {"layers": REDUCED, "positions": REDUCED_ROWS, "tf": _logits(got, mirror), "fp32": _logits(fp32, mirror),
-           "top1_decided": float(((pick == want) | (margin <= spread)).double().mean()),
-           "decided": float((top2[:, 0] - top2[:, 1] > spread).double().mean())}
+    out = {"layers": REDUCED, "positions": REDUCED_ROWS, "tf": _logits(got, mirror), "fp32": _logits(fp32, mirror)}
     report["reduced"] = out
     print(f"reduced model, {REDUCED} layers over {REDUCED_ROWS} positions, against the mirror reference: TF {out['tf']}"
-          f", the fp32 reference {out['fp32']}; top-1 {out['top1_decided']:.4f} where the reference decides "
-          f"({out['decided']:.2f} of rows)")
-    assert out["decided"] >= DECIDED, f"only {out['decided']} of rows decided"
-    assert out["top1_decided"] >= TOP1, out
-    assert out["tf"]["kl"] <= out["fp32"]["kl"] and out["tf"]["rel"] <= out["fp32"]["rel"], out
+          f", the fp32 reference {out['fp32']}")
+    tf = out["tf"]
+    assert tf["top1"] >= TOP1 and tf["kl"] <= KL and tf["rel"] <= REL_LOGITS, out
