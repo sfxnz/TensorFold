@@ -362,9 +362,8 @@ def test_real_layers_track_the_reference_indexer():
     B8's mirror-mode Indexer (its own Q, bf16 weights) differing only within the measured score change."""
 
     pytest.importorskip("safetensors")
+    from dsv41_layouts import mx8_from_block
     from dsv41_ref_pack import RefPack
-
-    from tensorfold.families.deepseek_v41.cuda.convert import mx8_from_block
 
     pack = RefPack(MODEL)
     cfg = Config.read(MODEL)

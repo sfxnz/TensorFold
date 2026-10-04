@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1's load-time weight rewrites change no value: FP8 32x32 blocks, MXFP4 experts, EXL3 tile columns."""
+"""DeepSeek-V4.1's load-time weight rewrites change no value: FP8 32x32 blocks, MXFP4 experts."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 torch = pytest.importorskip("torch")
+
+from dsv41_layouts import mx8_from_block
 
 from tensorfold.cuda.nvfp4 import experts as nvfp4
 from tensorfold.families.deepseek_v41.cuda import convert
@@ -76,7 +78,7 @@ def test_row_repeat_equals_block_dequant(n):
     k = 128
     weight = _e4m3(gen, n, k)
     scale = torch.randint(100, 141, (-(-n // 32), k // 32), generator=gen, dtype=torch.uint8)
-    lin = convert.mx8_from_block(weight, scale.view(torch.float8_e8m0fnu))
+    lin = mx8_from_block(weight, scale.view(torch.float8_e8m0fnu))
     assert (lin.n, lin.k) == (n, k)
     assert torch.equal(_bits(_mx8_dequant(lin)), _bits(_block_dequant(weight, scale)))
 
@@ -125,23 +127,6 @@ def test_mxfp4_span_18_is_refused():
         convert.mxfp4_to_nvfp4(words, nan)
 
 
-@pytest.mark.parametrize("world", [1, 2])
-def test_dim1_half_is_the_column_slice(world):
-    gen = torch.Generator().manual_seed(world)
-    trellis = torch.randint(-2 ** 15, 2 ** 15, (24, 16, 32), generator=gen, dtype=torch.int32).to(torch.int16)
-    per = 16 // world
-    for rank in range(world):
-        half = convert.exl3_dim1_half(trellis, rank, world)
-        assert half.is_contiguous() and half.data_ptr() != trellis.data_ptr()
-        want = [[trellis[kt, rank * per + j] for j in range(per)] for kt in range(trellis.shape[0])]
-        assert torch.equal(half, torch.stack([torch.stack(row) for row in want]))
-
-
-def test_dim1_half_refuses_a_split_inside_a_hadamard_block():
-    with pytest.raises(ValueError, match="Hadamard"):
-        convert.exl3_dim1_half(torch.zeros((8, 8, 32), dtype=torch.int16), 0, 2)
-
-
 def _pack(name: str) -> torch.Tensor:
     safetensors = pytest.importorskip("safetensors")
     root = Path(MODEL)
@@ -153,7 +138,7 @@ def _pack(name: str) -> torch.Tensor:
 @needs_model
 def test_real_wq_b_row_repeat_is_exact():
     weight, scale = _pack("layers.0.attn.wq_b.weight"), _pack("layers.0.attn.wq_b.scale")
-    lin = convert.mx8_from_block(weight, scale)
+    lin = mx8_from_block(weight, scale)
     assert torch.equal(_bits(_mx8_dequant(lin)), _bits(_block_dequant(weight, scale)))
 
 
@@ -168,10 +153,3 @@ def test_real_dspark_expert_rank_half_is_exact(rank):
     ex = convert.make_experts4(gate, up, down)
     assert (ex.width, ex.dims) == (1152, 5120)
     _assert_experts_exact(ex, gate, up, down)
-
-
-@needs_model
-def test_real_trellis_dim1_half_is_the_column_slice():
-    trellis = _pack("layers.0.ffn.experts.0.w1.trellis")
-    for rank in (0, 1):
-        assert torch.equal(convert.exl3_dim1_half(trellis, rank, 2), trellis[:, 72 * rank:72 * rank + 72])

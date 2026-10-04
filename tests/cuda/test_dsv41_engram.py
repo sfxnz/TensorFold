@@ -349,9 +349,9 @@ def test_real_layers_track_the_reference_in_mirror_mode(world, monkeypatch):
     """kv against the fp64 product (T1); the gate against B8's Engram fed this kv, so its inputs are identical."""
 
     pytest.importorskip("safetensors")
+    from dsv41_layouts import mx8_from_block
     from dsv41_ref_weights import RefWeights
 
-    from tensorfold.families.deepseek_v41.cuda.convert import mx8_from_block
     from tensorfold.families.deepseek_v41.cuda.split import slice_for
 
     cfg, layout, reader = _real()

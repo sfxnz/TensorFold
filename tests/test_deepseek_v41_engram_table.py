@@ -8,12 +8,32 @@ import struct
 import time
 from itertools import pairwise
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pytest
 
 from tensorfold.families.deepseek_v41 import engram_table
 from tensorfold.families.deepseek_v41.engram_table import Layout, Reader, Table
+
+
+class Range(NamedTuple):
+    """One rank's hash columns of a table: global rows [lo, hi) and their absolute byte ranges in the file."""
+
+    rows: tuple[int, int]
+    weight: tuple[int, int]
+    scale: tuple[int, int]
+
+
+def rank_range(layout: Layout, layer: int, rank: int, world: int = 2) -> Range:
+    """Rank ``rank``'s contiguous hash columns of ``layer`` (ceil(columns / world) each, rank order)."""
+
+    t = layout.table(layer)
+    cols = len(t.bounds) - 1
+    per = -(-cols // world)
+    lo, hi = t.bounds[min(cols, per * rank)], t.bounds[min(cols, per * (rank + 1))]
+    return Range((lo, hi), (t.weight_abs + t.wrow * lo, t.weight_abs + t.wrow * hi),
+                 (t.scale_abs + t.srow * lo, t.scale_abs + t.srow * hi))
 
 BUCKETS = ((7, 11, 13, 17, 19, 23, 29, 31), (37, 41, 43, 47, 53, 59, 61, 67))    # 150 and 408 rows
 STARTS = (664, 672)                     # the pack's data starts: 152 and 160 past a 256-byte row boundary
@@ -98,11 +118,11 @@ def test_rank_ranges_equal_the_pack_tables_byte_offsets():
     layout = Layout(tuple(tables), (), (0, tables[0].rows, tables[0].rows + tables[1].rows))
     assert layout.table(1).bounds[12] == 192_001_740 and layout.table(14).bounds[12] == 192_007_016
     for (layer, rank), (weight, scale) in want.items():
-        got = layout.rank_range(layer, rank)
+        got = rank_range(layout, layer, rank)
         assert (got.weight, got.scale) == (weight, scale)
         assert got.rows == ((0, 192_001_740), (192_001_740, 384_006_168), (0, 192_007_016),
                             (192_007_016, 384_016_682))[2 * (layer == 14) + rank]
-    assert layout.rank_range(1, 0, world=1).rows == (0, 384_006_168)
+    assert rank_range(layout, 1, 0, world=1).rows == (0, 384_006_168)
 
 
 def test_rows_by_global_id_are_byte_exact_through_symlinks_and_page_straddles(pack):
@@ -243,7 +263,7 @@ def test_real_rows_equal_the_memory_map(capsys):
     ids = []
     for i, layer in enumerate(layers):
         for rank in (0, 1):
-            lo, hi = layout.rank_range(layer, rank).rows
+            lo, hi = rank_range(layout, layer, rank).rows
             ids.append(layout.starts[i] + rng.integers(lo, hi, 256))
     ids = np.concatenate(ids)
     reader = Reader(layout)

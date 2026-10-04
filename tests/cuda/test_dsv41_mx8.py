@@ -12,10 +12,11 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
+from dsv41_layouts import mx8_from_block
+
 from tensorfold.cuda import prompt_precision
 from tensorfold.cuda.nvfp4.linear import Mx8Linear
 from tensorfold.families.deepseek_v41.cuda import mx8
-from tensorfold.families.deepseek_v41.cuda.convert import mx8_from_block
 from tensorfold.families.deepseek_v41.cuda.split import slice_for
 
 MODEL = os.environ.get("TF_DSV41_MODEL")

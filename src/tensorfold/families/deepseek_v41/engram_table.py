@@ -11,7 +11,6 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
 
 import numpy as np
 
@@ -20,14 +19,6 @@ from tensorfold.families.qwen4_exp.ssd_table import _fill, _no_cache
 WORKERS = 32                # reads in flight at once: os.pread releases the GIL
 PAGE = 4096
 _DTYPES = {"weight": "F8_E4M3", "scale": "F8_E8M0"}
-
-
-class Range(NamedTuple):
-    """One rank's hash columns of a table: global rows [lo, hi) and their absolute byte ranges in the file."""
-
-    rows: tuple[int, int]
-    weight: tuple[int, int]
-    scale: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -132,16 +123,6 @@ class Layout:
             if t.layer == layer:
                 return t
         raise ValueError(f"layer {layer} has no Engram table here")
-
-    def rank_range(self, layer: int, rank: int, world: int = 2) -> Range:
-        """Rank ``rank``'s contiguous hash columns of ``layer`` (ceil(columns / world) each, rank order)."""
-
-        t = self.table(layer)
-        cols = len(t.bounds) - 1
-        per = -(-cols // world)
-        lo, hi = t.bounds[min(cols, per * rank)], t.bounds[min(cols, per * (rank + 1))]
-        return Range((lo, hi), (t.weight_abs + t.wrow * lo, t.weight_abs + t.wrow * hi),
-                     (t.scale_abs + t.srow * lo, t.scale_abs + t.srow * hi))
 
 
 def _release(fds: list[int], pools: tuple[ThreadPoolExecutor, ...]) -> None:

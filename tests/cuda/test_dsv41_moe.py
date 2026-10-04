@@ -18,13 +18,14 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 pytest.importorskip("safetensors")
 
+from dsv41_layouts import exl3_dim1_half, mx8_from_block
 from dsv41_ref_weights import hadamard
 
 from tensorfold.cuda.exl3 import experts as exl3
 from tensorfold.families.deepseek_v41.config import Config
 from tensorfold.families.deepseek_v41.cuda import moe
 from tensorfold.families.deepseek_v41.cuda.buffers import Buffers
-from tensorfold.families.deepseek_v41.cuda.convert import exl3_dim1_half, make_experts4, mx8_from_block
+from tensorfold.families.deepseek_v41.cuda.convert import make_experts4
 from tensorfold.families.deepseek_v41.cuda.weights import MoEW
 
 CFG = Config.read(Path(__file__).parents[1] / "fixtures" / "deepseek_v41")

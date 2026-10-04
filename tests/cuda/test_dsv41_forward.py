@@ -19,13 +19,14 @@ pytest.importorskip("safetensors")
 if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
+import dsv41_score as score
 import dsv41_tiny
 from dsv41_pair import pair, run_pair
 from dsv41_ref_weights import RefWeights
 from dsv41_reference import Mode, State, hc_pre, rms_norm
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, loader, score
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, loader
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.engram_table import Reader
 

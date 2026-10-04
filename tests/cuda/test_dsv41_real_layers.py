@@ -46,6 +46,7 @@ MODEL = os.environ.get("TF_DSV41_MODEL", "")
 if not MODEL or not Path(MODEL).is_dir():
     pytest.skip("set TF_DSV41_MODEL to the checkpoint", allow_module_level=True)
 
+import dsv41_score as score
 import torch.nn.functional as tnf
 from dsv41_ref_weights import RefWeights, exl3_weight
 from dsv41_reference import Mode, State, gate, hc_post, hc_pre, rms_norm
@@ -53,7 +54,7 @@ from safetensors import safe_open
 from tokenizers import Tokenizer
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, dspark, engram, loader, score
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, dspark, engram, loader
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import rope as tf_rope
 from tensorfold.families.deepseek_v41.cuda.weights import Weights

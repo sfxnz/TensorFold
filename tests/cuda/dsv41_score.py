@@ -1,4 +1,4 @@
-"""Every row's logits of a DeepSeek-V4.1 prompt through the prompt path: a development NLL tool and model-level tests."""
+"""Every row's logits of a DeepSeek-V4.1 prompt through the prompt path, for the model-level tests."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from .forward import commit, compute, head, stage
+from tensorfold.families.deepseek_v41.cuda.forward import commit, compute, head, stage
 
 ROWS = 256              # head rows a block
 

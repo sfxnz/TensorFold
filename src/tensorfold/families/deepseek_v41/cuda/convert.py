@@ -7,12 +7,9 @@ import math
 import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvfp4
-from tensorfold.cuda.nvfp4.linear import Mx8Linear
 
 BLOCK = 32                # rows and inputs of a DeepSeek FP8 scale block; inputs of an MXFP4 scale
 SPAN = 17                 # widest exponent spread a matrix's e4m3 scales hold exactly: 2^-9 (subnormal) .. 2^8
-TILE = 16                 # an EXL3 tile's rows and columns
-HADAMARD = 128            # an EXL3 Hadamard block, which a split must keep whole
 
 
 def _bytes(t: torch.Tensor) -> torch.Tensor:
@@ -28,12 +25,6 @@ def fp8_block_rows(scale: torch.Tensor, n: int) -> torch.Tensor:
     if s.dim() != 2 or s.shape[0] != -(-n // BLOCK):
         raise ValueError(f"block scales {tuple(scale.shape)} do not cover {n} rows in blocks of {BLOCK}")
     return s.repeat_interleave(BLOCK, dim=0)[:n].contiguous()
-
-
-def mx8_from_block(weight: torch.Tensor, scale: torch.Tensor) -> Mx8Linear:
-    """e4m3 [N, K] with 32x32 E8M0 block scales -> ``Mx8Linear`` (each row carries its block's 1x32 scales)."""
-
-    return Mx8Linear.from_checkpoint(weight, fp8_block_rows(scale, int(weight.shape[0])))
 
 
 def mxfp4_to_nvfp4(words: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -66,14 +57,3 @@ def make_experts4(gate: list, up: list, down: list, limit: float = 10.0) -> nvfp
     """Per-expert (words, E8M0) pairs of one rank's gate, up and down -> ``Experts4``, each matrix scaled alone."""
 
     return nvfp4.make(_stacked(gate), _stacked(up), _stacked(down), limit=limit)
-
-
-def exl3_dim1_half(trellis: torch.Tensor, rank: int, world: int) -> torch.Tensor:
-    """EXL3 trellis [K/16, N/16, 32] -> rank's tile columns [K/16, N/16/world, 32] as a contiguous copy."""
-
-    if trellis.dim() != 3 or trellis.shape[1] % world or (trellis.shape[1] // world * TILE) % HADAMARD:
-        raise ValueError(f"trellis {tuple(trellis.shape)} does not split into {world} whole Hadamard blocks")
-    if not 0 <= rank < world:
-        raise ValueError(f"rank {rank} of {world}")
-    part = trellis.shape[1] // world
-    return trellis[:, rank * part:(rank + 1) * part].clone(memory_format=torch.contiguous_format)
