@@ -207,6 +207,7 @@ while it is still thinking, with a newline, the closing think marker and a blank
 The cut depends on token count, so serial and drafted decoding use the same cut. A model that closes the block
 earlier is left alone. The MLX engine forces the close inside its rounds; CUDA stops the engine at the cut and
 decodes on from the reply, as for a required tool call.
+DeepSeek-V4.1-Flash, whose two ranks decode every request to its end, refuses a thinking budget with HTTP 400.
 
 ## Context and errors
 

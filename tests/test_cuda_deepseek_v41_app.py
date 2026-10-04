@@ -1,5 +1,5 @@
 """DeepSeek-V4.1's CUDA App: the encoder's prompts, DSML calls parsed at the end and never streamed as content, integer
-efforts, a thinking budget closed by </think> alone, and DeepSeek's no-top-k default."""
+efforts, thinking budgets refused, and DeepSeek's no-top-k default."""
 
 import json
 import re
@@ -58,7 +58,7 @@ def ids(text):
 
 class Engine:
     """Reasons up to </think> when the prompt opened a think block, then answers with a DSML block, three tokens a
-    round; the family engine's ``generate`` signature."""
+    round; the family engine's ``generate`` signature, and like it decodes on whatever ``on_tokens`` returns."""
 
     eos = (EOS,)
 
@@ -70,8 +70,7 @@ class Engine:
         reply = (ids(REASONING) + [END] if prompt[-1] == THINK else []) + ids(ANSWER) + [EOS]
         reply = reply[:max_tokens]
         for at in range(0, len(reply), 3):
-            if on_tokens(reply[at:at + 3]):
-                break
+            on_tokens(reply[at:at + 3])
         return {"rounds": 1 + len(reply) // 3}
 
 
@@ -161,11 +160,17 @@ def test_tokenize_without_the_generation_prompt_drops_the_header():
     assert reply["tokens"] == ids(SMOKE_CHAT)[:-2] and reply["tokens"][-1] != ASSISTANT
 
 
-def test_the_thinking_budget_closes_with_think_end_alone():
+@pytest.mark.parametrize("server_budget, request_budget", [(0, 4), (8, None)])
+def test_a_thinking_budget_is_refused_before_decoding(server_budget, request_budget):
     engine = Engine()
-    ask(app_for(engine, thinking=True), tools=None, thinking_budget=4)
-    first, after = engine.calls[0][0], engine.calls[1][0]
-    assert first[-1] == THINK and after[len(first):] == ids(REASONING)[:3] + [END]
+    app = app_for(engine, thinking=True)
+    app.thinking_budget = server_budget
+    body = {"messages": SMOKE, **({"thinking_budget": request_budget} if request_budget else {})}
+    with http_server(app) as port:
+        status, reply = post(port, body, True)
+    assert status == 400 and "thinking_budget" in reply and engine.calls == []
+    ask(app, tools=None, chat_template_kwargs={"thinking": False})        # thinking off: no budget applies
+    assert len(engine.calls) == 1
 
 
 def test_default_sampling_has_no_top_k(tmp_path):

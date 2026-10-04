@@ -85,9 +85,11 @@ resumes of it, `torch.cuda.memory_reserved` stayed at 80.7 GiB on rank 0.
   the host, and `top_p` 1.0 does so for every row: exact, and slow until that draw runs on the device. On the
   same prompt at temperature 1, sampling took 69 ms a round with the default and 2 ms with `top_k` 20, and the
   reply decoded at 24.3 tok/s against 50.7.
-- `ignore_eos`, `stop`, `seed`, `min_p`, `thinking_budget` and `"draft": false` work as on the other CUDA families.
+- `ignore_eos`, `stop`, `seed`, `min_p` and `"draft": false` work as on the other CUDA families.
 - Refused with HTTP 400: images, `response_format` and the `guided_*` and `structured_outputs` fields, `logprobs`,
-  `tool_choice: "required"` or a named function, and `n` above 1.
+  `tool_choice: "required"` or a named function, `thinking_budget` (and every thinking request on a server started
+  with `--thinking-budget`), and `n` above 1. Both ranks decode a request to its end, so a budget's cut would decode
+  the whole first reply before the budgeted one.
 
 ## Precision
 
