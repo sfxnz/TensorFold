@@ -95,7 +95,7 @@ def _counts(res: D.DecodeResult, policy) -> None:
             assert d == min(policy[0], len(res.tokens) - done - 1)
             done += k
     stats = res.stats()
-    assert set(stats["host_ms"]) == {*D.HOST_PARTS, "device"} and stats["host_budget_ms"] == D.HOST_BUDGET_MS
+    assert set(stats["stages_ms"]) == {*D.HOST_PARTS, "device"}
 
 
 def _recorded(e: D.Engine, *args, **kw) -> tuple[D.DecodeResult, list, list]:
@@ -331,4 +331,4 @@ def test_pack_reduced_model_drafts_the_serial_reply():
             stats = got.stats()
             print(f"pack, 8 layers, {sampling}, {policy}: {PACK_REPLY} tokens equal to serial "
                   f"({_sha(got.tokens)}), {stats['tokens_per_round']} tokens a round, "
-                  f"{stats['accepted']}/{stats['drafted']} drafts kept, host ms a round {stats['host_ms']}")
+                  f"{stats['accepted']}/{stats['drafted']} drafts kept, host ms a round {stats['stages_ms']}")

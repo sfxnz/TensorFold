@@ -25,7 +25,7 @@ CONTEXT = 4096
 REPLY = 24
 LONG = 2500                             # past one 2048-row prompt chunk
 KEYED = Sampling(seed=11, temperature=1.0, top_k=20, top_p=0.95)
-TIMED = ("prefill_s", "decode_s", "stages_ms", "rounds_over_budget")     # stats that measure time
+TIMED = ("prefill_s", "decode_s", "stages_ms")     # stats that measure time
 
 
 def _ids(seed: int, n: int, vocab: int = 1024) -> list[int]:

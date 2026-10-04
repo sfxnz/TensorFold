@@ -222,7 +222,6 @@ class DeepSeekV41Engine:
                                 stop_eos=req.stop_eos, on_tokens=on_tokens)
         kept.live = list(prompt) + res.tokens[:e.st.pos - len(prompt)]
         stats.update(res.stats())
-        stats["stages_ms"] = stats.pop("host_ms")     # each host part's and the device's mean ms a round
         stats.update(min_rows=1 + min(res.depths, default=0), drafts=req.draft,
                      policy="0" if serial else f"{drafts}" if confidence is None else f"c{drafts}:{confidence:g}",
                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])

@@ -25,7 +25,6 @@ from .buffers import Buffers, State
 from .graphs import Graphs
 from .weights import Weights
 
-HOST_BUDGET_MS = 2.0    # a round's host time the stats compare against (reported, never enforced)
 HOST_PARTS = ("engram", "sampling", "markov", "launch")
 
 
@@ -177,14 +176,12 @@ class DecodeResult:
         return (len(self.tokens) - 1) / self.rounds if self.rounds else 0.0
 
     def stats(self) -> dict:
-        """The keys the server and receipts read, and each host part's mean per round in ms against the budget."""
+        """The request's decode stats, with each host part's and the device's mean ms a round as ``stages_ms``."""
 
         n = max(len(self.clocks), 1)
-        host = [sum(c[k] for k in HOST_PARTS) * 1e3 for c in self.clocks]
         return {"decode_s": self.seconds, "rounds": self.rounds, "drafted": self.drafted, "accepted": self.accepted,
                 "tokens_per_round": round(self.tokens_per_round, 3),
-                "host_ms": {k: round(sum(c[k] for c in self.clocks) * 1e3 / n, 3) for k in (*HOST_PARTS, "device")},
-                "host_budget_ms": HOST_BUDGET_MS, "rounds_over_budget": sum(h > HOST_BUDGET_MS for h in host)}
+                "stages_ms": {k: round(sum(c[k] for c in self.clocks) * 1e3 / n, 3) for k in (*HOST_PARTS, "device")}}
 
 
 def accept(sampled: Sequence[int], drafts: Sequence[int], ends: Sequence[int] = ()) -> int:
