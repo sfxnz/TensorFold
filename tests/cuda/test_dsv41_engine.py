@@ -86,6 +86,32 @@ def req(prompt, max_tokens=REPLY, sampling=KEYED, **kw):
     return (prompt, max_tokens, sampling), kw
 
 
+def test_a_startup_failure_on_one_rank_is_named_on_both(tiny_dir, tmp_path, monkeypatch):
+    bad = tmp_path / "rank1"
+    bad.symlink_to(tiny_dir)
+    engram = E.DeepSeekV41Engine._engram
+
+    def broken(model_dir, cfg):
+        if model_dir == bad:
+            raise KeyError("weight_map")
+        return engram(model_dir, cfg)
+
+    monkeypatch.setattr(E.DeepSeekV41Engine, "_engram", staticmethod(broken))
+
+    def build(r, model_dir):
+        def body(comm):
+            try:
+                E.DeepSeekV41Engine(model_dir, rank=r, master="", port=0, policy=(3, None), context=CONTEXT,
+                                    context_explicit=True, comm=comm, graphs=False)
+            except ValueError as exc:
+                return str(exc)
+            return "started"
+        return body
+
+    zero, one = run_pair(build(0, tiny_dir), build(1, bad))
+    assert "on rank 1" in zero and "on this rank: KeyError" in one and "weight_map" in one
+
+
 def test_a_new_engine_reserves_no_more_to_serve(tiny_dir):
     torch.cuda.empty_cache()
     engines = _build(tiny_dir)

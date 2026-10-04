@@ -17,7 +17,7 @@ BELL = "tf_dsv41_request_{}"
 STOP = [0]                  # a header no request sends (max_tokens is at least 1): rank 1 leaves ``follow``
 KV_STORAGE = 0              # caches hold the model's QDQ'd values as bf16
 ENGRAM_SPLIT = 0            # each rank reads a contiguous half of every Engram table's hash columns
-SETTINGS = ("engram_error", "dspark_loaded", "capacity", "prefill_rows", "max_rows", "ring", "drafts",
+SETTINGS = ("start_error", "dspark_loaded", "capacity", "prefill_rows", "max_rows", "ring", "drafts",
             "confidence_ppm", "layers", "world", "kv_storage", "engram_split", "engram_digest_hi", "engram_digest_lo")
 SPARE = ("cache_mib", "cache_entries")      # each rank's room for kept snapshots: both use the smaller
 TOP_K_MAX = 2**31 - 1       # a header's largest top_k; any top_k past the vocabulary keeps every token
@@ -123,14 +123,14 @@ def share(comm, rank: int, values: list[int] | None, device: str = "cuda") -> li
     return [int(v) for v in got[:count].tolist()]
 
 
-def settings(*, engram_error: bool, dspark: bool, capacity: int, prefill_rows: int, max_rows: int, ring: int,
+def settings(*, start_error: bool, dspark: bool, capacity: int, prefill_rows: int, max_rows: int, ring: int,
              policy: tuple[int, float | None], layers: int, world: int, engram_digest: int, cache_bytes: int,
              cache_entries: int) -> list[int]:
     """This rank's agreement vector: SETTINGS, then SPARE."""
 
     drafts, confidence = policy
     lo, hi = struct.unpack("<2i", struct.pack("<q", engram_digest))
-    return [int(engram_error), int(dspark), capacity, prefill_rows, max_rows, ring, drafts,
+    return [int(start_error), int(dspark), capacity, prefill_rows, max_rows, ring, drafts,
             -1 if confidence is None else round(confidence * 1e6), layers, world, KV_STORAGE, ENGRAM_SPLIT, hi, lo,
             cache_bytes >> 20, cache_entries]
 

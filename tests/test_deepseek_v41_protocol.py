@@ -15,7 +15,7 @@ from tensorfold.families.deepseek_v41.cuda import protocol
 
 torch = pytest.importorskip("torch")
 TCPStore = pytest.importorskip("torch.distributed").TCPStore
-SETTINGS = {"engram_error": False, "dspark": True, "capacity": 65544, "prefill_rows": 2048, "max_rows": 6,
+SETTINGS = {"start_error": False, "dspark": True, "capacity": 65544, "prefill_rows": 2048, "max_rows": 6,
             "ring": 128, "policy": (3, None), "layers": 43, "world": 2, "engram_digest": -0x123456789ABCDEF0,
             "cache_bytes": 3 << 30, "cache_entries": 8}
 

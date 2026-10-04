@@ -71,22 +71,22 @@ class DeepSeekV41Engine:
         self.capacity_plan, self.limit = plan, plan["context_window"]
         capacity = plan["cache_slots"]
         hasher = reader = None
-        failure, digest = None, NO_DIGEST
-        try:
+        failure, digest, wanted, entries = None, NO_DIGEST, 0, 0
+        try:                                    # a failure here reaches the gather, so both ranks name it
+            wanted, entries = kept_bytes(plan, cache_wanted()), entries_wanted()
             hasher, reader = self._engram(model_dir, cfg)
             digest = reader.layout.digest() if reader is not None else NO_DIGEST
-        except (OSError, ValueError) as exc:
+        except Exception as exc:                # noqa: BLE001 - raised below on both ranks
             failure = f"{type(exc).__name__}: {exc}"
         prefill_rows = min(PREFILL_ROWS, capacity)
-        wanted = kept_bytes(plan, cache_wanted())
-        mine = protocol.settings(engram_error=failure is not None, dspark=dspark, capacity=capacity,
+        mine = protocol.settings(start_error=failure is not None, dspark=dspark, capacity=capacity,
                                  prefill_rows=prefill_rows, max_rows=MAX_ROWS, ring=RING, policy=self.policy,
                                  layers=cfg.num_hidden_layers, world=2, engram_digest=digest, cache_bytes=wanted,
-                                 cache_entries=entries_wanted())
+                                 cache_entries=entries)
         both = self._gather_ints(mine)
         if failure is not None or both[1 - rank][0]:
-            raise ValueError("the Engram tables could not be read on " +
-                             (f"this rank: {failure}" if failure else f"rank {1 - rank}; check its checkpoint files"))
+            raise ValueError("the TF_DSV41_* variables or the Engram tables could not be read on " +
+                             (f"this rank: {failure}" if failure else f"rank {1 - rank}; see its log"))
         cache_bytes, entries = protocol.agree(both)
         plan["kept_bytes"] = cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
