@@ -1,17 +1,20 @@
-"""Real weights against the fp32 reference port (memory class M, ``TF_DSV41_MODEL``): blocks fed TF's own stream,
-DSpark's stage MoE, and a reduced model through TF's prompt path.
+"""Real weights against the fp32 reference port (memory class M, ``TF_DSV41_MODEL``): blocks and DSpark stages fed
+TF's own stream, and a reduced model through TF's prompt path.
 
 Blocks 0, 1, 2, 3, 8, 14, 20, 21, 24, 25, 37 and 39 each take the bf16 stream and FFN pre that TF's forward gives
 them, on one rank, at contexts 100, 1,100 and 17,000 (the prompt rows that end each context, then decode windows
 at even and odd positions). The reference builds its caches from every row and runs the whole block on those rows,
-in mirror mode (rel-L2 4 x 2^-8, cosine 0.9999) and fp32 mode (rel-L2 3% over the rows it routes as TF does; the
-rows it reroutes are counted). Both attend TF's index lists. TF's routed sets, index lists and candidate blocks must
-equal an fp64 selection on TF's own inputs except at near-ties (§7.7). TF runs one layer at a time with only that
-layer's weights on the device, so the 40 blocks fit one GPU.
+in mirror mode (rel-L2 4 x 2^-8, cosine 0.9999) and fp32 mode (rel-L2 3%). Both attend TF's index lists. TF's routed
+sets, index lists and candidate blocks must equal an fp64 selection on TF's own inputs except at near-ties (§7.7).
+TF runs one layer at a time with only that layer's weights on the device, so the 40 blocks fit one GPU.
 
-Each DSpark stage's MoE runs on the stage input of the reference's own DSpark pass from TF's taps (whole stages
-against the reference are ``test_dsv41_dspark.py``'s). The reduced model's logits must follow the mirror reference
-(top-1 on 99% of rows, mean KL 1e-3, rel-L2 5%); the fp32 reference's distance to it is reported beside TF's.
+Each DSpark stage runs TF's block [y, noise...] after each context's prompt and first window, its rings absorbed from
+TF's taps; the reference runs the stage on TF's stage input, gated as a block. The reduced model's logits must follow
+the mirror reference (top-1 on 99% of rows, mean KL 1e-3, rel-L2 5%).
+
+Reported beside the gates: fp32 mode with its FP8/FP4 quantizers fed mirror mode's inputs (``fp32_qdq``: a step flip
+from a 2^-9 input change is not a rounding error), and the mirror reference split over two ranks (only its fp32 sums
+reordered) against itself, the reduced model's floor for any implementation that is not bit-identical.
 
 The tokens are DeepSeek's MIT reference sources shipped in the checkpoint (``CORPUS``): paragraphs in the order a
 seeded ``random.Random`` shuffles them, tokenized after BOS. ``TF_DSV41_REPORT=<path>`` writes every figure as JSON.
@@ -45,7 +48,7 @@ from safetensors import safe_open
 from tokenizers import Tokenizer
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, engram, loader, moe, score
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, dspark, engram, loader, score
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import rope as tf_rope
 from tensorfold.families.deepseek_v41.cuda.weights import Weights
@@ -63,6 +66,7 @@ CAP = 17_024
 TAIL = 256                              # compared prompt rows that end each context
 BLOCK = PREFILL_ROWS                    # rows the reference writes caches for at once
 MIRROR, FP32 = Mode("mirror", world=1), Mode("fp32", world=1)     # one rank: row sums over the whole input dim
+MODES = {"mirror": MIRROR, "fp32": FP32, "fp32_qdq": FP32}
 REL_MIRROR, COS, REL_FP32 = 4 * 2**-8, 0.9999, 0.03      # T2, one block
 TIE = 4                                 # a near-tie: the fp64 margin below TIE x the fp32 bound
 DSPARK_AT = (99, 104, 1_099, 1_104, 16_999, 17_004)       # p after each context's prompt and its first window
@@ -167,11 +171,12 @@ def _close(got: torch.Tensor, want: torch.Tensor) -> dict:
     return {"rel": float((g - x).norm() / x.norm()), "cos": float(g @ x / (g.norm() * x.norm()))}
 
 
-def _routing(cfg: Config, xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor) -> dict:
-    """TF's routed sets against an fp64 router on TF's input (N3, M:809-827): rows that differ, those of them not at
-    a near-tie, and the least k-th to (k+1)-th margin over its tolerance (TIE x the fp32 error bound)."""
+def _routing(cfg: Config, xf: torch.Tensor, gate: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, k: int
+             ) -> dict:
+    """TF's top-``k`` sets against an fp64 router on TF's input (N3, M:809-827): rows that differ, those of them not
+    at a near-tie, and the least k-th to (k+1)-th margin over its tolerance (TIE x the fp32 error bound)."""
 
-    x, g, k = xf.double(), gate.double(), cfg.num_experts_per_tok
+    x, g = xf.double(), gate.double()
     z = x @ g.T / cfg.gate_temp
     dz = 8 * math.sqrt(x.shape[1]) * 2.0**-24 * (x.abs() @ g.abs().T) / cfg.gate_temp
     f = tnf.softplus(z).sqrt()
@@ -258,7 +263,8 @@ class Stream:
             self.pre_out[a:a + n].copy_(b.pre_in[:R])
             F.commit(w, st, b, R, R)
         seen = {k: torch.cat(v) for k, v in seen.items()}
-        seen["routing"] = _routing(cfg, seen["xf"], lw.moe.gate.cpu(), lw.moe.bias.cpu(), seen["pick"])
+        seen["routing"] = _routing(cfg, seen["xf"], lw.moe.gate.cpu(), lw.moe.bias.cpu(), seen["pick"],
+                                   cfg.num_experts_per_tok)
         seen["index"] = index
         w.layers, w.engram = [], {}
         del lw, eg
@@ -320,20 +326,35 @@ def _index(cfg: Config, role, b, keys: torch.Tensor, i: int, j: int, first: int,
         _ties(out["lists"], s, tol, (s > -math.inf).sum(-1).clamp_max(cfg.index_topk), given)
 
 
-def ref_block(rw: Ref, L: int, mode: Mode, state: State, stream: Stream, eng_ids) -> tuple[torch.Tensor, torch.Tensor]:
-    """Block L of the reference (M:968-994) on TF's input stream: caches from every row, the whole block on the
-    compared rows, their MoE in one call -> (their output stream fp32 [rows, hc, D], their routed experts)."""
+def _quantize_as_mirror(rw: Ref, ref, held: dict):
+    """Points ``ref``'s window KV and compressor at a mirror reference on its state fed ``held["xa"]``, so the model's
+    FP8/FP4 quantizers take mirror mode's inputs -> that mirror reference."""
 
-    c, role, p, eps = rw.cfg, rw.cfg.roles[L], f"layers.{L}", rw.cfg.rms_norm_eps
-    ref = rw.reference(mode, state)
-    given: list[torch.Tensor] = []
+    mref = rw.reference(MIRROR, ref.state)
+    ref._kv = lambda p_, x, cis: mref._kv(p_, held["xa"], cis)
+    ref.compress = lambda layer, x, start: mref.compress(layer, held["xa"], start)
+    return mref
+
+
+def ref_block(rw: Ref, L: int, name: str, state: State, stream: Stream, eng_ids) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block L of the reference (M:968-994) in ``MODES[name]`` on TF's input stream: caches from every row, the whole
+    block on the compared rows, their MoE in one call -> (their output stream fp32 [rows, hc, D], their routed experts).
+
+    ``fp32_qdq`` computes the window KV and compressed entries in mirror mode from mirror's attention input."""
+
+    c, role, p, eps, mode = rw.cfg, rw.cfg.roles[L], f"layers.{L}", rw.cfg.rms_norm_eps, MODES[name]
+    ref, given, held = rw.reference(mode, state), [], {}
     ref.indexer = lambda *_: given
+    mref = _quantize_as_mirror(rw, ref, held) if name == "fp32_qdq" else None
     at, mids = 0, []
     for a, b, full in _segments(ROWS):
-        X, pre = stream.X[a:b].float().cpu(), stream.pre[a:b].cpu()
-        if role.engram:
-            X = ref.engram(L, X, torch.as_tensor(eng_ids[a:b, c.engram_layer_ids.index(L)]))
+        X0, pre = stream.X[a:b].float().cpu(), stream.pre[a:b].cpu()
+        ids = torch.as_tensor(eng_ids[a:b, c.engram_layer_ids.index(L)]) if role.engram else None
+        X = ref.engram(L, X0, ids) if role.engram else X0
         xa = rms_norm(hc_pre(X, pre, mode), ref.W(f"{p}.attn_norm.weight"), eps, mode)
+        if name == "fp32_qdq":
+            Xm = mref.engram(L, X0, ids) if role.engram else X0
+            held["xa"] = rms_norm(hc_pre(Xm, pre, MIRROR), ref.W(f"{p}.attn_norm.weight"), eps, MIRROR)
         if not full:
             ref._commit(L, ref._kv(p, xa, ref.cis(role.rope, torch.arange(a, b))), a)
             if role.ratio and role.kv_src == L:
@@ -353,66 +374,68 @@ def ref_block(rw: Ref, L: int, mode: Mode, state: State, stream: Stream, eng_ids
     return hc_post(ref.moe(L, xf), X, post, comb, mode), picked
 
 
-def _record_moe(ref) -> list[tuple]:
-    """(layer, input, output) of every MoE call ``ref`` makes from now on."""
-
-    seen, own = [], ref.moe
-
-    def moe_(layer: int, x: torch.Tensor) -> torch.Tensor:
-        seen.append((layer, x, own(layer, x)))
-        return seen[-1][2]
-
-    ref.moe = moe_
-    return seen
-
-
 def _dspark(stream: Stream, rw: Ref) -> list[dict]:
-    """Each stage's MoE (TF's Experts4, router and shared expert) on the reference's own stage input, DSpark run in
-    mirror mode from TF's taps at each p of DSPARK_AT: TF and the fp32 reference against the mirror reference."""
+    """Each DSpark stage of TF's block at each p of DSPARK_AT, the rings absorbed from TF's taps of the last
+    min(p + 1, window) rows: the reference's stage on TF's stage input in each of MODES, and TF's routed sets."""
 
-    cfg, runs = stream.cfg, []
+    cfg, st, b, B = stream.cfg, stream.st, stream.dbuf, stream.cfg.dspark_block_size
+    w, n_layers = stream.w, cfg.num_hidden_layers
+    stages = [stream.build.stage(s) for s in range(cfg.num_nextn_predict_layers)]
+    w.layers, w.engram = [], {}
+    w.dspark = SimpleNamespace(main_proj=stream.build.mx8("mtp.0.main_proj"),
+                               main_norm=stream.build.t("mtp.0.main_norm.weight"), stages=stages)
+    e = SimpleNamespace(w=w, st=st, dwork=dspark.Work(cfg, 1, stream.dev))
+    k, out = e.dwork, []
     for p in DSPARK_AT:
         n = min(p + 1, cfg.sliding_window)
-        taps = stream.taps[p + 1 - n:p + 1].flatten(1).float().cpu()
-        ref = rw.reference(MIRROR, State(pos=p + 1))
-        seen = _record_moe(ref)
-        ref.absorb(taps, p + 1 - n)
-        ref.propose(stream.tokens[p + 1])
-        runs.append((p, seen))
-    out = []
-    for s in range(cfg.num_nextn_predict_layers):
-        stage, L = stream.build.stage(s), cfg.num_hidden_layers + s
-        fp32 = rw.reference(FP32)
-        for p, seen in runs:
-            (x, want), = [(x, y) for layer, x, y in seen if layer == L]
-            got = moe.dspark_moe(cfg, stage.moe, x.to(torch.bfloat16).to(stream.dev), stream.dbuf).cpu()
-            out.append({"stage": s, "p": p, "tf": _close(got, want), "fp32": _close(fp32.moe(L, x), want)})
-        del stage
+        taps = stream.taps[p + 1 - n:p + 1]
+        st.set_pos(p + 1)
+        stream.pbuf.taps[:n].copy_(taps)
+        dspark.absorb(e, stream.pbuf, n, prompt=True)
+        k.bids.copy_(torch.tensor([stream.tokens[p + 1]] + [cfg.dspark_noise_token_id] * (B - 1)))
+        glue.embed(k.bids, w.embed, cfg.hidden_size, cfg.hc_mult, b.xd)
+        b.pre_in[:B].zero_()
+        b.pre_in[:B, 0].fill_(1.0)
+        torch.sub(st.pos_dev.expand(B), 1, out=k.anchors)
+        refs, held = {name: rw.reference(MODES[name], State(pos=p + 1)) for name in MODES}, {}
+        mref = _quantize_as_mirror(rw, refs["fp32_qdq"], held)
+        for name, ref in refs.items():
+            (mref if name == "fp32_qdq" else ref).absorb(taps.flatten(1).float().cpu(), p + 1 - n)
+        for sw in stages:
+            X, pre = b.xd.float().cpu(), b.pre_in[:B].cpu()
+            held["xa"] = rms_norm(hc_pre(X, pre, MIRROR), mref.W(f"{mref._prefix(sw.index)}.attn_norm.weight"),
+                                  cfg.rms_norm_eps, MIRROR)
+            dspark._stage(sw, w, st, b, k)
+            got = b.xd.cpu()
+            top = cfg.dspark_num_experts_per_tok            # the shared expert's slot follows the routed ones
+            d = {"stage": sw.index - n_layers, "p": p, "routing": _routing(
+                cfg, b.xn[:B].cpu(), sw.moe.gate.cpu(), sw.moe.bias.cpu(), b.dpick[:B, :top].cpu(), top)}
+            for name, ref in refs.items():
+                d[name] = _close(got, ref.block(sw.index, X, pre, p + 1)[0])
+            out.append(d)
     return out
 
 
 def _figures(cfg: Config, L: int, stream: Stream, want: dict, seen: dict) -> dict:
-    """Block L's figures per compared group: TF against each mode and the rows each mode routes to other experts
-    than TF. Against fp32 mode ``rel`` covers the rows it routes as TF does (its FFN input moves further than T1, so
-    a near-tie it crosses is no discrete-rule failure); ``all_rows`` and the mirror reference's distance are
-    reported."""
+    """Block L's figures per compared group: TF against each mode over all its rows, the rows each mode routes to
+    other experts than TF and TF's distance over the rest (``same_route``), and the mirror reference's distance."""
 
     groups, at = [], 0
     tf_sets = seen["pick"].long().sort(-1).values
     for lo, hi, kind in _groups():
         got, g = stream.Y[lo:hi].cpu(), {"rows": [lo, hi], "kind": kind}
-        for name, mode in (("mirror", MIRROR), ("fp32", FP32)):
-            out, routed = (t[at:at + hi - lo] for t in want[mode])
+        for name in MODES:
+            out, routed = (t[at:at + hi - lo] for t in want[name])
             same = (routed.sort(-1).values == tf_sets[at:at + hi - lo]).all(-1)
-            g[name] = {**_close(got, out), "rerouted": int((~same).sum())}
-        g["fp32"] = {**g["fp32"], "all_rows": g["fp32"]["rel"], **_close(got[same], out[same])}
-        g["fp32"]["mirror_ref"] = _close(want[MIRROR][0][at:at + hi - lo], want[FP32][0][at:at + hi - lo])["rel"]
+            g[name] = {**_close(got, out), "rerouted": int((~same).sum()),
+                       "same_route": _close(got[same], out[same])["rel"],
+                       "mirror_ref": _close(want["mirror"][0][at:at + hi - lo], out)["rel"]}
         groups.append(g)
         at += hi - lo
         print(f"layer {L} ({cfg.roles[L].mode}) {kind} rows {lo}-{hi - 1}: rel-L2 {g['mirror']['rel']:.3g} mirror "
-              f"(cosine {g['mirror']['cos']:.6f}), {g['fp32']['rel']:.3g} fp32 where it routes as TF ("
-              f"{g['fp32']['rerouted']} rows rerouted; all rows {g['fp32']['all_rows']:.3g}, the mirror reference "
-              f"{g['fp32']['mirror_ref']:.3g})")
+              f"(cosine {g['mirror']['cos']:.6f}), " + ", ".join(
+                  f"{g[n]['rel']:.3g} {n} ({g[n]['rerouted']} rows rerouted, {g[n]['same_route']:.3g} on the rest; "
+                  f"the mirror reference {g[n]['mirror_ref']:.3g})" for n in ("fp32", "fp32_qdq")))
     print(f"layer {L}: TF routing against fp64 {seen['routing']}; TF index selection against fp64 {seen['index']}")
     return {"role": cfg.roles[L].mode, "groups": groups, "routing": seen["routing"], "index": seen["index"]}
 
@@ -438,20 +461,21 @@ def layers(report):
     tokens = corpus(cfg, ROWS + 1)      # one more: the token after the last row, DSpark's y there
     eng_ids = rw.hasher.ids([], tokens[:ROWS])
     stream = Stream(cfg, tokens, rw.hasher, rw.reader)
-    states = {MIRROR: State(), FP32: State()}
+    states = {name: State() for name in MODES}
     try:
         for L in range(cfg.num_hidden_layers):
             seen = stream.layer(L)
             if L in LAYERS:
-                want = {mode: ref_block(rw, L, mode, states[mode], stream, eng_ids) for mode in (MIRROR, FP32)}
+                want = {name: ref_block(rw, L, name, states[name], stream, eng_ids) for name in MODES}
                 rw.forget()
                 report["layers"][L] = _figures(cfg, L, stream, want, seen)
             stream.advance()
-        stream.X = stream.Y = stream.pre = stream.pre_out = stream.pbuf = None
+        stream.X = stream.Y = stream.pre = stream.pre_out = None
         report["dspark"] = _dspark(stream, rw)
         for d in report["dspark"]:
-            print(f"DSpark stage {d['stage']} MoE at p={d['p']}: TF rel-L2 {d['tf']['rel']:.3g} (cosine "
-                  f"{d['tf']['cos']:.6f}), fp32 reference {d['fp32']['rel']:.3g}")
+            print(f"DSpark stage {d['stage']} at p={d['p']}: rel-L2 {d['mirror']['rel']:.3g} mirror (cosine "
+                  f"{d['mirror']['cos']:.6f}), {d['fp32']['rel']:.3g} fp32, {d['fp32_qdq']['rel']:.3g} fp32_qdq; TF "
+                  f"routing against fp64 {d['routing']}")
     finally:
         stream.close()
     return report
@@ -469,11 +493,12 @@ def test_block_follows_the_reference(layers, L):
         assert d["not_ties"] == 0, f"layer {L}: index {kind} differ away from near-ties {d}"
 
 
-def test_dspark_stage_moe_follows_the_reference(layers):
+def test_dspark_stages_follow_the_reference(layers):
     assert len(layers["dspark"]) == 3 * len(DSPARK_AT)
     for d in layers["dspark"]:
-        assert d["tf"]["rel"] <= REL_MIRROR and d["tf"]["cos"] >= COS, f"DSpark {d}"
+        assert d["mirror"]["rel"] <= REL_MIRROR and d["mirror"]["cos"] >= COS, f"DSpark {d}"
         assert d["fp32"]["rel"] <= REL_FP32, f"DSpark {d}"
+        assert d["routing"]["not_ties"] == 0, f"DSpark {d}"
 
 
 def _logits(got: torch.Tensor, want: torch.Tensor) -> dict:
@@ -495,10 +520,12 @@ def test_reduced_model_follows_the_reference(report):
     got = score.prompt_logits(e, ids).double()
     del e, w
     torch.cuda.empty_cache()
-    mirror, fp32 = (rw.model(ids, mode, all_logits=True)[0].double() for mode in (MIRROR, FP32))
-    out = {"layers": REDUCED, "positions": REDUCED_ROWS, "tf": _logits(got, mirror), "fp32": _logits(fp32, mirror)}
+    mirror, fp32, split = (rw.model(ids, mode, all_logits=True)[0].double()
+                           for mode in (MIRROR, FP32, Mode("mirror", world=2)))
+    out = {"layers": REDUCED, "positions": REDUCED_ROWS, "tf": _logits(got, mirror), "fp32": _logits(fp32, mirror),
+           "mirror_world2": _logits(split, mirror)}
     report["reduced"] = out
     print(f"reduced model, {REDUCED} layers over {REDUCED_ROWS} positions, against the mirror reference: TF {out['tf']}"
-          f", the fp32 reference {out['fp32']}")
+          f", the fp32 reference {out['fp32']}, the mirror reference over two ranks {out['mirror_world2']}")
     tf = out["tf"]
     assert tf["top1"] >= TOP1 and tf["kl"] <= KL and tf["rel"] <= REL_LOGITS, out
