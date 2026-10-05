@@ -1,4 +1,5 @@
-"""A prompt on one rank in chunks cut at the keep point, ending in the bits of the whole prompt at once."""
+"""A prompt on one rank in chunks cut at the keep point, the decoder on the rows that matter, ending in the bits of
+the whole prompt at once."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
+from ..config import Config
 from ..engram_hash import rank_columns
 from . import dspark, sample, snapshot
 from . import forward as F
@@ -22,6 +24,32 @@ def chunks(begin: int, n: int, keep_at: int | None, rows: int) -> list[tuple[int
 
     k = n if keep_at is None else keep_at
     return [(a, min(a + rows, end)) for lo, end in ((begin, k), (k, n)) for a in range(lo, end, rows)]
+
+
+def decoder_rows(cfg: Config, layers: Sequence[int], begin: int, anchor: int, n: int, a: int,
+                 z: int) -> tuple[dict[int, tuple[int, int]], int]:
+    """Chunk [a, z) of an ``n``-token prompt from ``begin``: each decoder layer's (first block row, first window KV
+    row) and the first DSpark tap row, relative to a, that leave the head row and the state at ``anchor`` and n exact.
+
+    Past the last KV source (CED) older rows reach a row only through its window: the last layer runs the head row,
+    each layer before it the rows the next one's window KV needs, and every layer keeps the ring rows before anchor.
+    """
+
+    src = max(cfg.kv_source_layer_ids, default=-1)
+    dec = [L for L in layers if L >= src]
+    if src not in layers or any(cfg.roles[L].engram for L in dec):
+        return {}, 0
+    win = cfg.sliding_window
+
+    def rel(p: int) -> int:
+        return min(max(p, begin, a), z) - a
+
+    rows, full = {}, n - 1
+    for L in reversed(dec):
+        kv = min(full - (win - 1), anchor - win)
+        rows[L] = (rel(full), rel(kv))
+        full = kv
+    return rows, rel(anchor - win)
 
 
 def _stage_ids(b: Buffers, tokens: Sequence[int]) -> None:
@@ -105,6 +133,8 @@ def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapsho
     else:
         snapshot.restore(e, resume)
     spans = chunks(begin, n, keep_at, b.rows)
+    anchor = min(keep_at, n - 1) if keep_at is not None and keep_at > begin else n - 1
+    layers = [lw.index for lw in w.layers]
     kept = resume if keep_at == begin else None
     rows = _Rows(e, prompt, begin, spans) if w.engram else None
     logits = None
@@ -120,10 +150,12 @@ def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapsho
                 rows.advise(i + 3)
                 if i + 1 < len(spans):
                     rows.read(i + 1)
-            logits = F.compute(w, st, b, R, prompt=True, head_rows=1 if i == len(spans) - 1 else 0)
+            plan, taps = decoder_rows(w.cfg, layers, begin, anchor, n, a, z)
+            logits = F.compute(w, st, b, R, prompt=True, head_rows=1 if i == len(spans) - 1 else 0, rows=plan,
+                               taps_from=taps)
             F.commit(w, st, b, R, R)
-            if w.dspark is not None:
-                dspark.absorb(e, b, min(R, b.taps.shape[0]), prompt=True)
+            if w.dspark is not None and taps < R:
+                dspark.absorb(e, b, min(R - taps, b.taps.shape[0]), prompt=True)
             if z == keep_at:
                 kept = snapshot.take(e, prompt[:keep_at], space)
     finally:

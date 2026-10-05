@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -33,50 +33,57 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int], hasher=None,
     return R
 
 
-def _gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
-    """Every rank's fp32 share ``b.part[:R]`` -> [world, R, D] in rank order (one rank: the share itself)."""
+def _gather(w: Weights, b: Buffers, R: int, start: int = 0) -> torch.Tensor:
+    """Every rank's fp32 share ``b.part[start:R]`` -> [world, R - start, D] in rank order (one rank: the share)."""
 
-    part = b.part[:R]
+    part = b.part[start:R]
     if w.world == 1:
         return part[None]
-    recv = b.gath.view(-1)[:w.world * part.numel()].view(w.world, R, -1)
+    recv = b.gath.view(-1)[:w.world * part.numel()].view(w.world, R - start, -1)
     fast_gather(w.comm, part, recv)
     return recv
 
 
-def _tap(b: Buffers, R: int, slot: int) -> None:
-    """bf16(mean of the 4 copies) of the forward's last min(R, taps) rows into DSpark input slot ``slot``."""
+def _tap(b: Buffers, R: int, slot: int, first: int = 0) -> None:
+    """bf16(mean of the 4 copies) of the forward's last min(R - first, taps) rows into DSpark input slot ``slot``."""
 
-    n = min(R, b.taps.shape[0])
+    n = min(R - first, b.taps.shape[0])
+    if n <= 0:
+        return
     glue.stream_mean(b.X[R - n:R].view(n, -1), b.hidden[:n])
     b.taps[:n, slot].copy_(b.hidden[:n])
 
 
-def layer(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tensor | None, prompt: bool) -> None:
-    """One block (M:968-994) on ``b.X[:R]`` in place: Engram, tap, attention, MoE; ``b.pre_in`` is its FFN pre."""
+def layer(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tensor | None, prompt: bool,
+          start: int = 0, kv_from: int = 0, taps_from: int = 0) -> None:
+    """One block (M:968-994) on rows start.. of ``b.X[:R]`` in place (window KV from kv_from); ``b.pre_in``: FFN pre."""
 
     cfg, L = w.cfg, lw.index
     eps = cfg.rms_norm_eps
-    X = b.X[:R]
-    flat = X.view(R, -1)
     if L in w.engram:
         eg = w.engram[L]
         kv = engram.kv(e[:, cfg.engram_layer_ids.index(L)], eg.wkv, w.comm, b.ekv, b.ekv_gat, prompt=prompt)
-        engram.inject(X, kv, eg.wqk, eps)
+        engram.inject(b.X[:R], kv, eg.wqk, eps)
     if lw.role.tap is not None:
-        _tap(b, R, lw.role.tap)
+        _tap(b, R, lw.role.tap, taps_from)
+    if start == R:                              # window KV and pooling only, or nothing
+        if kv_from < R or (lw.role.ratio and lw.role.kv_src == L):
+            attention(lw, w, st, b, R, prompt, start, kv_from)
+        return
+    n = R - start
+    flat = b.X[start:R].view(n, -1)
     h = lw.hc_attn
-    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:R], b.pre_a[:R], b.post_a[:R], b.comb_a[:R], eps,
-                 cfg.hc_eps, cfg.hc_sinkhorn_iters)
-    attention(lw, w, st, b, R, prompt)
-    glue.hc_post(flat, flat, _gather(w, b, R), b.post_a[:R], b.comb_a[:R])
+    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[start:R], b.pre_a[start:R], b.post_a[start:R],
+                 b.comb_a[start:R], eps, cfg.hc_eps, cfg.hc_sinkhorn_iters)
+    attention(lw, w, st, b, R, prompt, start, kv_from)
+    glue.hc_post(flat, flat, _gather(w, b, R, start), b.post_a[start:R], b.comb_a[start:R])
     h = lw.hc_ffn
-    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:R], b.pre_f[:R], b.post_f[:R], b.comb_f[:R], eps,
-                 cfg.hc_eps, cfg.hc_sinkhorn_iters)
-    xf = norms.collapse_norm(flat, b.pre_a[:R], lw.ffn_norm, b.xn[:R], eps)    # delayed mHC: the attention's pre
-    moe.backbone(cfg, lw.moe, xf, b, prompt=prompt, comm=w.comm)
-    glue.hc_post(flat, flat, _gather(w, b, R), b.post_f[:R], b.comb_f[:R])
-    b.pre_in[:R].copy_(b.pre_f[:R])
+    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[start:R], b.pre_f[start:R], b.post_f[start:R],
+                 b.comb_f[start:R], eps, cfg.hc_eps, cfg.hc_sinkhorn_iters)
+    xf = norms.collapse_norm(flat, b.pre_a[start:R], lw.ffn_norm, b.xn[start:R], eps)  # delayed mHC: attention's pre
+    moe.backbone(cfg, lw.moe, xf, b, prompt=prompt, comm=w.comm)    # its share in b.part[:n]
+    glue.hc_post(flat, flat, _gather(w, b, n), b.post_f[start:R], b.comb_f[start:R])
+    b.pre_in[start:R].copy_(b.pre_f[start:R])
 
 
 def head(w: Weights, b: Buffers, a: int, n: int, out: torch.Tensor, *, prompt: bool) -> torch.Tensor:
@@ -86,8 +93,12 @@ def head(w: Weights, b: Buffers, a: int, n: int, out: torch.Tensor, *, prompt: b
     return mx8.mm(w.head, b.fnormed[:n], out, f32=True, prompt=prompt)
 
 
-def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_rows: int) -> torch.Tensor | None:
-    """Staged rows through every loaded layer -> the last ``head_rows`` rows' fp32 logits; commits nothing."""
+def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_rows: int,
+            rows: Mapping[int, tuple[int, int]] | None = None, taps_from: int = 0) -> torch.Tensor | None:
+    """Staged rows through every loaded layer -> the last ``head_rows`` rows' fp32 logits; commits nothing.
+
+    ``rows``: a layer's (first row of its block, first row writing window KV), the rows before left as they are.
+    """
 
     if not 0 < R <= b.rows or not 0 <= head_rows <= min(R, b.logits.shape[0]):
         raise ValueError(f"compute: {R} rows, head on {head_rows}, for {b.rows}-row buffers and "
@@ -100,7 +111,7 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_row
     if w.engram:
         e = engram.exchange(engram.dequant_rows(b.eraw[:R], b.eloc[:R]), w.comm, b.egat, b.eng)
     for lw in w.layers:
-        layer(lw, w, st, b, R, e, prompt)
+        layer(lw, w, st, b, R, e, prompt, *(rows or {}).get(lw.index, (0, 0)), taps_from)
     if not head_rows:
         return None
     return head(w, b, R - head_rows, head_rows, b.logits[:head_rows], prompt=prompt)
