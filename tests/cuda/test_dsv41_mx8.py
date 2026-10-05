@@ -120,6 +120,52 @@ def test_grouped_projects_each_group_from_its_heads(prompt):
         assert torch.equal(out, torch.cat(want, dim=1)), m
 
 
+def _groups(seed: int = 50) -> tuple[mx8.Groups, list[Mx8Linear]]:
+    """wo_a's groups built from one stacked checkpoint tensor, and each group built from its own rows."""
+
+    n, k, _ = SHAPES["wo_a"]
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    w = torch.randint(0, 256, (GROUPS * n, k), generator=g, dtype=torch.uint8, device="cuda")
+    w[(w & 0x7F) >= 0x70] = 0x30
+    s = torch.randint(118, 131, (GROUPS * n, k // 32), generator=g, dtype=torch.uint8, device="cuda")
+    w = w.view(torch.float8_e4m3fn)
+    alone = [Mx8Linear.from_checkpoint(w[i * n:(i + 1) * n], s[i * n:(i + 1) * n]) for i in range(GROUPS)]
+    return mx8.Groups.from_checkpoint(w, s, n), alone
+
+
+def test_groups_are_views_of_the_stack_with_each_groups_bytes():
+    groups, alone = _groups()
+    base = groups.whole.w8.untyped_storage().data_ptr()
+    for view, own in zip(groups, alone):
+        assert torch.equal(view.w8, own.w8) and torch.equal(view.bs, own.bs)
+        assert (view.n, view.k, view.npad) == (own.n, own.k, own.npad)
+        assert view.w8.untyped_storage().data_ptr() == base
+    with pytest.raises(ValueError):
+        mx8.Groups(groups.whole, 1000)
+
+
+def test_decode_groups_run_in_one_launch_with_each_groups_bits(monkeypatch):
+    groups, alone = _groups()
+    k, n = groups[0].k, groups[0].n
+    calls = []
+    ext = mx8._ext()
+
+    class Counting:
+        def qmmf(self, *a):
+            calls.append(a[7])
+            return ext.qmmf(*a)
+
+    monkeypatch.setattr(mx8, "_ext", lambda: Counting())
+    for m in (*ROWS, 2048):
+        o = _x(m, GROUPS * k, 12)
+        want = mx8.grouped(alone, o, torch.empty((m, GROUPS * n), dtype=torch.bfloat16, device="cuda"),
+                           prompt=m > 6)
+        calls.clear()
+        got = mx8.grouped(groups, o, torch.empty_like(want), prompt=m > 6)
+        assert torch.equal(got, want), m
+        assert calls == ([] if m > 6 else [GROUPS * n]), m
+
+
 def test_an_output_buffer_takes_no_allocation():
     lin = _linear("wo_b")
     for m, prompt in ((6, False), (2048, True)):
@@ -143,8 +189,9 @@ def _capture(step) -> torch.cuda.CUDAGraph:
     return graph
 
 
-def test_graph_replays_equal_eager():
-    wo_b, wq_b, lins = _linear("wo_b"), _linear("wq_b"), _wo_a()
+@pytest.mark.parametrize("stacked", [False, True])
+def test_graph_replays_equal_eager(stacked):
+    wo_b, wq_b, lins = _linear("wo_b"), _linear("wq_b"), _groups()[0] if stacked else _wo_a()
     k = lins[0].k
     for r in ROWS:
         xb, xq, o = _x(r, wo_b.k, 8), _x(r, wq_b.k, 9), _x(r, GROUPS * k, 10)
