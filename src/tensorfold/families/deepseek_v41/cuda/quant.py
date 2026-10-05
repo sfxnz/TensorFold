@@ -7,6 +7,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from .norms import _rinv, _warps
+
 GROUPS = 16                     # groups per program
 INV448 = tl.constexpr(1 / 448)          # rounded to fp32 where it multiplies, as the reference's f32(1/448)
 INV6 = tl.constexpr(1 / 6)
@@ -38,12 +40,9 @@ def _e2m1(v):
 
 
 @triton.jit
-def _qdq(X, Y, n, per_row, sx, sy, G: tl.constexpr, KIND: tl.constexpr, B: tl.constexpr):
-    g = tl.program_id(0) * B + tl.arange(0, B)
-    ok = (g < n)[:, None]
-    row, col = (g // per_row).to(tl.int64), (g % per_row) * G
-    j = tl.arange(0, G)[None, :]
-    x = tl.load(X + row[:, None] * sx + col[:, None] + j, mask=ok, other=0.0).to(tl.float32)
+def _dequantized(x, KIND: tl.constexpr):
+    """Each row of fp32 x [groups, G] quantized and dequantized by the kind's rule, fp32."""
+
     amax = tl.max(tl.abs(x), axis=1)
     if KIND == 0:                                   # K:70-86: FP8 e4m3, scale 2^ceil(log2(amax / 448))
         s = _pow2_ceil(tl.maximum(amax, FLOOR8) * INV448)[:, None]
@@ -55,7 +54,55 @@ def _qdq(X, Y, n, per_row, sx, sy, G: tl.constexpr, KIND: tl.constexpr, B: tl.co
         else:                                       # K:162-163: FP4 e2m1, scale e4m3(amax / 6)
             s = tl.math.div_rn(tl.maximum(amax, FLOOR4_E4M3), 6.0).to(tl.float8e4nv).to(tl.float32)[:, None]
         q = _e2m1(tl.minimum(tl.maximum(tl.math.div_rn(x, s), -6.0), 6.0))
-    tl.store(Y + row[:, None] * sy + col[:, None] + j, (q * s).to(tl.bfloat16), mask=ok)
+    return q * s
+
+
+@triton.jit
+def _qdq(X, Y, n, per_row, sx, sy, G: tl.constexpr, KIND: tl.constexpr, B: tl.constexpr):
+    g = tl.program_id(0) * B + tl.arange(0, B)
+    ok = (g < n)[:, None]
+    row, col = (g // per_row).to(tl.int64), (g % per_row) * G
+    j = tl.arange(0, G)[None, :]
+    x = tl.load(X + row[:, None] * sx + col[:, None] + j, mask=ok, other=0.0).to(tl.float32)
+    tl.store(Y + row[:, None] * sy + col[:, None] + j, _dequantized(x, KIND).to(tl.bfloat16), mask=ok)
+
+
+@triton.jit
+def _neg(v):
+    """-v by its sign bit (Triton's unary minus is 0 - v, which keeps +0 for +0)."""
+
+    return (v.to(tl.int32, bitcast=True) ^ -2147483648).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _norm_rope_fp8(X, sx, W, OUT, so, P, T, eps, D: tl.constexpr, HALF: tl.constexpr, PER_ROW: tl.constexpr):
+    """One row: rmsnorm's, rope.apply's and fp8_qdq_1x32's arithmetic and bf16 roundings in one program."""
+
+    row = tl.program_id(0)
+    r = row.to(tl.int64)
+    d = tl.arange(0, D)
+    ok = d < D
+    rinv = _rinv(tl.load(X + r * sx + d, mask=ok, other=0.0).to(tl.float32), eps, D)
+    e = tl.arange(0, D // 32)[:, None] * 32 + tl.arange(0, 32)[None, :]      # QDQ groups of 32, as rows
+    pe = e ^ 1                                                                  # each element's RoPE partner
+    y = (tl.load(W + e).to(tl.float32) * (tl.load(X + r * sx + e).to(tl.float32) * rinv)).to(tl.bfloat16)
+    yp = (tl.load(W + pe).to(tl.float32) * (tl.load(X + r * sx + pe).to(tl.float32) * rinv)).to(tl.bfloat16)
+    y, yp = y.to(tl.float32), yp.to(tl.float32)
+    if PER_ROW:
+        p = tl.load(P + row).to(tl.int64)
+    else:
+        p = tl.load(P).to(tl.int64) + row
+    rot = e >= D - 2 * HALF                                                     # the last 2 * HALF dims
+    i = tl.maximum(e - (D - 2 * HALF), 0) // 2
+    c = tl.load(T + p * (2 * HALF) + 2 * i, mask=rot, other=0.0)
+    s = tl.load(T + p * (2 * HALF) + 2 * i + 1, mask=rot, other=0.0)
+    even = (e & 1) == 0
+    a = tl.where(even, y, yp)
+    b = tl.where(even, yp, y)
+    # the pair (a, b) -> (a c - b s, a s + b c) with the products b s and b c rounded, as rope._rope compiles
+    v = tl.where(even, tl.fma(a, c, _neg(b * s)), tl.fma(a, s, b * c))
+    v = tl.where(rot, v.to(tl.bfloat16).to(tl.float32), y)
+    tl.store(OUT + r * so + e, _dequantized(v, 0).to(tl.bfloat16))
 
 
 def _run(x: torch.Tensor, out: torch.Tensor | None, group: int, kind: int) -> torch.Tensor:
@@ -91,3 +138,24 @@ def fp4_qdq_1x16_e4m3(x: torch.Tensor, out: torch.Tensor | None = None) -> torch
     """FP4 e2m1 per 16 with an e4m3 scale (compressed KV entries); in place unless ``out`` is given."""
 
     return _run(x, out, 16, FP4_E4M3)
+
+
+def norm_rope_fp8(x: torch.Tensor, w: torch.Tensor, eps: float, positions: torch.Tensor, table: torch.Tensor,
+                  out: torch.Tensor) -> torch.Tensor:
+    """The window KV write in one launch: x [R, D] -> out [R, D] bf16, bit for bit ``fp8_qdq_1x32(rope.apply(
+    norms.rmsnorm(x, w, eps, out), positions, table))``."""
+
+    rows, d = x.shape
+    half = table.shape[1]
+    if x.dtype != torch.bfloat16 or out.dtype != torch.bfloat16 or out.shape != x.shape or d & (d - 1) or d < 32:
+        raise ValueError(f"norm_rope_fp8: bf16 x and out of one shape [R, D], D a power of two >= 32, not "
+                         f"{tuple(x.shape)} -> {tuple(out.shape)}")
+    if x.stride(-1) != 1 or out.stride(-1) != 1 or table.dtype != torch.float32 or not table.is_contiguous() \
+            or 2 * half > d:
+        raise ValueError("norm_rope_fp8: unit-stride rows and a contiguous fp32 [capacity, rope/2, 2] table")
+    if positions.dim() != 1 or positions.numel() not in (1, rows) or positions.is_floating_point():
+        raise ValueError(f"norm_rope_fp8: integer positions [1] or [{rows}], got {tuple(positions.shape)}")
+    if rows:
+        _norm_rope_fp8[(rows,)](x, x.stride(0), w, out, out.stride(0), positions, table, eps, D=d, HALF=half,
+                                PER_ROW=positions.numel() == rows, num_warps=_warps(d), enable_fp_fusion=False)
+    return out

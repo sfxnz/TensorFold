@@ -18,11 +18,18 @@ def _warps(block: int) -> int:
 
 
 @triton.jit
+def _rinv(c, eps, D: tl.constexpr):
+    """rsqrt(mean(c^2) + eps) of one fp32 row with IEEE divides and root."""
+
+    ss = tl.sum(c * c, axis=0)
+    return tl.math.div_rn(1.0, tl.sqrt_rn(tl.math.div_rn(ss, D * 1.0) + eps))
+
+
+@triton.jit
 def _normed(c, W, d, ok, eps, D: tl.constexpr):
     """bf16(w * (c * rsqrt(mean(c^2) + eps))) for one fp32 row, rounded once."""
 
-    ss = tl.sum(c * c, axis=0)
-    rinv = tl.math.div_rn(1.0, tl.sqrt_rn(tl.math.div_rn(ss, D * 1.0) + eps))
+    rinv = _rinv(c, eps, D)
     w = tl.load(W + d, mask=ok, other=0.0).to(tl.float32)
     return (w * (c * rinv)).to(tl.bfloat16)
 

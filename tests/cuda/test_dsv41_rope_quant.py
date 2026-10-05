@@ -14,7 +14,7 @@ if not torch.cuda.is_available():
 import dsv41_reference as ref
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, quant, rope
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, norms, quant, rope
 
 DEV = "cuda"
 CFG = Config.read(Path(__file__).parents[1] / "fixtures" / "deepseek_v41")
@@ -268,6 +268,61 @@ def test_qdq_refuses_bad_arguments():
         quant.fp4_qdq_1x16_e4m3(x[:, :32].float())
     with pytest.raises(ValueError):
         quant.fp4_qdq_1x16_e4m3(x[:, :32], torch.empty((2, 16), device=DEV, dtype=torch.bfloat16))
+
+
+# -- the window KV write ---------------------------------------------------------------------------------------
+
+def _kv_rows(n: int, seed: int) -> torch.Tensor:
+    """Rows of qakv's KV part [n, 512] at its stride: random scales, zero and -0 entries, zero rope halves."""
+
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    qakv = torch.randn((n, 1792), generator=g, device=DEV)
+    qakv *= 10.0 ** torch.randint(-30, 31, (n, 1), generator=g, device=DEV)
+    qakv[torch.rand(qakv.shape, generator=g, device=DEV) < 0.05] = 0.0
+    qakv[torch.rand(qakv.shape, generator=g, device=DEV) < 0.05] = -0.0
+    qakv[::7, -64:] = 0.0
+    qakv[3::7, -64:] = -0.0
+    return qakv.to(torch.bfloat16)[:, 1280:]
+
+
+def test_norm_rope_fp8_is_the_three_kernels_bit_for_bit(table):
+    """The fused window KV write equals rmsnorm, then RoPE, then FP8 QDQ, by base position and by row list."""
+
+    _, t = table
+    g = torch.Generator(device=DEV).manual_seed(8)
+    w = torch.randn(512, generator=g, device=DEV).to(torch.bfloat16)
+    w[::9] = 0.0
+    p = _positions(4096 - len(EDGES), seed=9).to(DEV)
+    x = _kv_rows(len(p), 10)
+    for positions in (p, torch.tensor([CAPACITY - len(p)], device=DEV, dtype=torch.int32)):
+        want = quant.fp8_qdq_1x32(rope.apply(norms.rmsnorm(x, w, CFG.rms_norm_eps, torch.empty_like(x)), positions,
+                                             t))
+        got = quant.norm_rope_fp8(x, w, CFG.rms_norm_eps, positions, t, torch.empty_like(x))
+        assert torch.equal(_bits(got), _bits(want))
+
+
+def test_norm_rope_fp8_rows_do_not_depend_on_the_window(table):
+    _, t = table
+    w = torch.randn(512, device=DEV).to(torch.bfloat16)
+    x = _kv_rows(MAX_ROWS, 11)
+    base = torch.tensor([125], device=DEV, dtype=torch.int32)
+    alone = [quant.norm_rope_fp8(x[r:r + 1], w, 1e-20, base + r, t, torch.empty_like(x[:1])) for r in range(MAX_ROWS)]
+    for rows in range(2, MAX_ROWS + 1):
+        y = quant.norm_rope_fp8(x[:rows], w, 1e-20, base, t, torch.empty_like(x[:rows]))
+        assert all(torch.equal(_bits(y[r:r + 1]), _bits(alone[r])) for r in range(rows))
+
+
+def test_norm_rope_fp8_refuses_bad_arguments(table):
+    _, t = table
+    x = torch.zeros((3, 512), device=DEV, dtype=torch.bfloat16)
+    w = torch.ones(512, device=DEV, dtype=torch.bfloat16)
+    pos = torch.zeros(1, device=DEV, dtype=torch.int32)
+    with pytest.raises(ValueError):
+        quant.norm_rope_fp8(x[:, :384], w, 1e-20, pos, t, torch.empty_like(x[:, :384]))
+    with pytest.raises(ValueError):
+        quant.norm_rope_fp8(x, w, 1e-20, pos, t, torch.empty((3, 512), device=DEV))
+    with pytest.raises(ValueError):
+        quant.norm_rope_fp8(x, w, 1e-20, torch.zeros(2, device=DEV, dtype=torch.int32), t, torch.empty_like(x))
 
 
 # -- graphs --------------------------------------------------------------------------------------------------
