@@ -1,10 +1,12 @@
 """Prompt prefill and kept snapshots: any chunking, and a resume from a snapshot, ends in the whole prompt's bits
 (rings with the DSpark stages, compressed and index-K caches, compressor tails, first-token logits, the next block's
 drafts); a request's state does not depend on the one before it; saved rows round-trip; Engram reads that lag the
-device change nothing, and a pinned half is refilled only after the device has copied it.
+device change nothing, and a pinned half is refilled only after the device has copied it. The decoder past the last
+KV source runs only the rows the head row and the kept state read, in the bits of the whole decoder.
 
 State is compared where it is defined: ring slots of the last ``window`` committed positions, cache entries of
-completed groups, tails while valid. The pack's check needs ``TF_DSV41_MODEL`` (layers 0-7 and the DSpark stages).
+completed groups, tails while valid. The pack's checks need ``TF_DSV41_MODEL`` (layers 0-7 and the DSpark stages;
+eight decoder layers after layers 0-2 and 20 at 8k tokens).
 """
 
 from __future__ import annotations
@@ -346,3 +348,131 @@ def test_pack_reduced_model_chunked_and_resumed_equal_whole():
         snap.rows = None
         _equal(_run(e, prompt, resume=snap), want, f"resumed at {K}")
         print(f"pack, {REDUCED} layers, {REDUCED_TOKENS} tokens: resumed at {K} equals the whole prompt")
+
+
+# -- the decoder skip: past the last KV source a layer runs only the rows the head row and the kept state read ----
+
+RF = 128 + 3 * 127                      # the tiny decoder's receptive field: layers 4-7 from its last KV source
+PACK_LAYERS = [0, 1, 2, 20, *range(32, 40)]     # the CED source, the last decoder layers and the DSpark taps
+PACK_TOKENS = 8192
+
+
+def _full(*_args):
+    """``decoder_rows`` with every row computed: the whole decoder."""
+
+    return {}, 0
+
+
+def _poison(e: Eng) -> None:
+    """NaN (or 127) in the chunk scratch, rings and caches, so a row the skip reads but never wrote shows."""
+
+    st = e.st
+    for t in [*vars(e.pbuf).values(), st.rings, *st.comp.values(), *st.index_k.values()]:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            t.fill_(float("nan") if t.is_floating_point() else 127)
+
+
+def _both(e_skip: Eng, e_full: Eng, prompt, monkeypatch, **kw) -> tuple[tuple, tuple]:
+    """(result, kept snapshot) of ``prompt`` with the skip and with the whole decoder, each on poisoned scratch."""
+
+    out = []
+    for e, plan in ((e_skip, P.decoder_rows), (e_full, _full)):
+        _poison(e)
+        kept: list[snapshot.Snapshot] = []
+        with monkeypatch.context() as m:
+            m.setattr(P, "decoder_rows", plan)
+            got = _run(e, prompt, keep=kept.append, **kw)
+        out.append((got, _snap(kept[0]) if kept else None, kept))
+    return out[0], out[1]
+
+
+def test_decoder_rows_follow_the_window_back_from_the_head_row():
+    cfg = Config.read(Path(__file__).parents[1] / "fixtures" / "deepseek_v41")
+    n = PACK_TOKENS
+    A = n - 1
+    rows, taps = P.decoder_rows(cfg, range(40), 0, A, n, 0, n)
+    assert sorted(rows) == list(range(20, 40)) and taps == A - 128
+    for k in range(19):
+        assert rows[20 + k] == (A - 128 - (18 - k) * 127, A - 128 - (19 - k) * 127)
+    assert rows[20] == (A - 2414, A - 2541) and rows[38] == (A - 128, A - 255) and rows[39] == (n - 1, A - 128)
+    rows, taps = P.decoder_rows(cfg, range(40), 6000, 7000, n, 6144, 7000)     # resumed at 6000, kept at 7000
+    assert rows[20] == (0, 0) and rows[38] == (6872 - 6144, 6745 - 6144) and rows[39] == (856, 6872 - 6144)
+    assert taps == 6872 - 6144
+    rows, taps = P.decoder_rows(cfg, range(40), 0, A, n, 0, 2048)
+    assert set(rows.values()) == {(2048, 2048)} and taps == 2048, "a chunk before every window runs no decoder row"
+    assert P.decoder_rows(cfg, [0, 1, 2, 21, 39], 0, A, n, 0, n) == ({}, 0), "no skip without the last KV source"
+
+
+@pytest.mark.parametrize("rows", [129, PREFILL_ROWS])
+@pytest.mark.parametrize("n", [RF - 1, 2 * RF, 3 * RF + 1, LONG])
+def test_decoder_skip_equals_the_whole_decoder(tiny, ref, monkeypatch, n, rows):
+    prompt = _ids(n, n, tiny.cfg.vocab_size)
+    plan, _ = P.decoder_rows(tiny.cfg, [lw.index for lw in tiny.layers], 0, n - 1, n, 0, min(rows, n - 1))
+    assert sorted(plan) == [4, 5, 6, 7] and plan[7][0] == min(rows, n - 1), "the last layer runs the head row alone"
+    (got, got_kept, _), (want, want_kept, _) = _both(Eng(tiny, ref.hasher, ref.reader, rows=rows),
+                                                     Eng(tiny, ref.hasher, ref.reader, rows=rows), prompt,
+                                                     monkeypatch, keep_at=n - 1)
+    _equal(got, want, f"{n} tokens in {rows}-row chunks")
+    _equal(got_kept, want_kept, f"the snapshot at {n - 1} of {n} tokens in {rows}-row chunks")
+
+
+@pytest.mark.parametrize("K", [300, RF + 64, 2 * RF + 1])
+def test_decoder_skip_with_an_earlier_keep_point_and_a_resume(tiny, ref, monkeypatch, K):
+    vocab = tiny.cfg.vocab_size
+    prompt = _ids(K, 3 * RF, vocab)
+    skip, full = Eng(tiny, ref.hasher, ref.reader, rows=129), Eng(tiny, ref.hasher, ref.reader, rows=129)
+    (got, got_kept, kept), (want, want_kept, _) = _both(skip, full, prompt, monkeypatch, keep_at=K)
+    _equal(got, want, f"kept at {K}")
+    _equal(got_kept, want_kept, f"the snapshot at {K}")
+    more = prompt + _ids(K + 1, 200, vocab)
+    resumed = _run(skip, more, resume=kept[0])
+    with monkeypatch.context() as m:
+        m.setattr(P, "decoder_rows", _full)
+        _poison(full)
+        _equal(resumed, _run(full, more), f"resumed at {K} with the skip, fresh with the whole decoder")
+
+
+def test_a_window_row_short_changes_the_kept_state(tiny, ref, monkeypatch):
+    n, rule = 2 * RF, P.decoder_rows
+
+    def short(*args):
+        plan, taps = rule(*args)
+        start, kv = plan[7]
+        return {**plan, 7: (start, kv + 1 if 0 < kv < start else kv)}, taps
+
+    e = Eng(tiny, ref.hasher, ref.reader)
+    _, (_, want, _) = _both(e, e, _ids(n, n, tiny.cfg.vocab_size), monkeypatch, keep_at=n - 1)
+    with monkeypatch.context() as m:
+        m.setattr(P, "decoder_rows", short)
+        _poison(e)
+        kept: list[snapshot.Snapshot] = []
+        _run(e, _ids(n, n, tiny.cfg.vocab_size), keep_at=n - 1, keep=kept.append)
+    assert not torch.equal(_snap(kept[0])["rings"], want["rings"]), "a ring row the skip left out went unseen"
+
+
+@needs_model
+def test_pack_decoder_skip_equals_the_whole_decoder_at_8k(monkeypatch):
+    from tokenizers import Tokenizer
+
+    cfg = Config.read(MODEL)
+    rw = RefWeights(MODEL)
+    text = (Path(MODEL) / "inference" / "model.py").read_text()
+    tok = Tokenizer.from_file(str(Path(MODEL) / "tokenizer.json"))
+    prompt = [cfg.bos_token_id] + tok.encode(text, add_special_tokens=False).ids[:PACK_TOKENS - 1]
+    assert len(prompt) == PACK_TOKENS
+    cap = PACK_TOKENS + MAX_ROWS
+    w = loader.load(MODEL, cfg, 0, 1, None, layers=PACK_LAYERS, capacity=cap)
+    plan, _ = P.decoder_rows(cfg, PACK_LAYERS, 0, PACK_TOKENS - 1, PACK_TOKENS, 0, PREFILL_ROWS)
+    assert set(plan.values()) == {(PREFILL_ROWS, PREFILL_ROWS)}, "the first chunk runs no decoder row"
+    runs = []
+    for rule in (P.decoder_rows, _full):
+        e = Eng(w, rw.hasher, rw.reader, capacity=cap)
+        _poison(e)
+        kept: list[snapshot.Snapshot] = []
+        with monkeypatch.context() as m:
+            m.setattr(P, "decoder_rows", rule)
+            runs.append((_run(e, prompt, keep_at=PACK_TOKENS - 1, keep=kept.append), _snap(kept[0])))
+        del e, kept
+        torch.cuda.empty_cache()
+    _equal(runs[0][0], runs[1][0], f"the pack, layers {PACK_LAYERS}, {PACK_TOKENS} tokens")
+    _equal(runs[0][1], runs[1][1], f"the pack's snapshot at {PACK_TOKENS - 1}")
