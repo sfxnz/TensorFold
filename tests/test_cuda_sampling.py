@@ -231,6 +231,62 @@ def test_the_ranks_masses_add_exactly_past_2_53(monkeypatch, device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_one_ranks_own_bucket_adds_exactly_past_2_53(monkeypatch, device):
+    vocab = 129280 if device == "cuda" else 40000
+    group = 20000                                                       # ~0.6 * 2**40 each, in one radix bucket
+    g = torch.Generator().manual_seed(6)
+    logits = torch.full((1, vocab), -5.0)                                # the tail, below the cut
+    logits[0, 0] = 0.0
+    logits[0, 1:1 + group] = -0.5 - 0.03 * torch.rand(group, generator=g)
+    logits = logits.to(device)
+    while True:                                                         # each mass 1 mod 4: a float64 sum past
+        mass = torch.floor(torch.exp(logits.double()) * cs.MASS).to(torch.int64)[0]   # 2**53 rounds each one down
+        off = torch.nonzero(mass[1:1 + group] % 4 != 1)[:, 0] + 1
+        if not len(off):
+            break
+        logits[0, off] = torch.nextafter(logits[0, off], torch.tensor(-1.0, device=device))
+    while True:                                                         # the cut ends exactly at the group's end
+        mass = torch.floor(torch.exp(logits.double()) * cs.MASS).to(torch.int64)[0].cpu()
+        total, group_mass = int(mass.sum()), int(mass[1:1 + group].sum())
+        need = int(cs.MASS) + group_mass
+        top_p = float(Fraction(need, total))
+        hits = [p for p in (top_p, np.nextafter(top_p, 0.0), np.nextafter(top_p, 1.0))
+                if math.ceil(Fraction(float(p)) * total) == need]
+        if hits:
+            break
+        logits[0, -1] = torch.nextafter(logits[0, -1], torch.tensor(-6.0, device=device))
+    top_p = float(hits[0])
+    assert group_mass > 2 ** 53 + 2 ** 51                                # thousands of masses past 2**53
+    s = Sampling(8, 1.0, 0, top_p, 0.0)
+    for split in (1, 1 + group):                                        # the whole group on rank 1, then on rank 0
+        got, want = cuts(logits, 1.0, top_p, split)
+        assert got == [w[:2] for w in want] and want[0][2] == 1 + group
+        assert on_the_device(monkeypatch, logits, [9], s, split) == host_rule(monkeypatch, logits, [9], s, split)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_the_need_is_exact_where_a_float_product_rounds(monkeypatch, device):
+    vocab = 129280 if device == "cuda" else 20000
+    logits = _logits(2, device, rows=1, vocab=vocab)
+    scaled = logits.float().double()
+    mass = torch.floor(torch.exp(scaled - scaled.amax(dim=1, keepdim=True)) * cs.MASS).to(torch.int64)[0].cpu()
+    total = int(mass.sum())
+    order = np.lexsort((np.arange(vocab), -scaled[0].cpu().numpy()))
+    for end in np.cumsum(mass.numpy()[order])[1:-1].tolist():          # each token's mass and all before it
+        top_p = float(Fraction(end, total))
+        if Fraction(top_p) * total <= end:
+            top_p = float(np.nextafter(top_p, 1.0))                     # the least top_p whose need passes the token
+        if math.ceil(top_p * total) == end:                             # its float product rounds back onto it
+            break
+    assert math.ceil(top_p * total) == end and math.ceil(Fraction(top_p) * total) == end + 1
+    s = Sampling(6, 1.0, 0, top_p, 0.0)
+    for split in SPLITS:
+        got, want = cuts(logits, 1.0, top_p, split)
+        assert got == [w[:2] for w in want]
+        assert on_the_device(monkeypatch, logits, [5], s, split) == host_rule(monkeypatch, logits, [5], s, split)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_nuclei_of_one_token_and_of_more_than_the_candidates(monkeypatch, device):
     vocab = 129280 if device == "cuda" else 20000
     for seed, sizes in ((1, lambda k: k > cs.NUCLEUS), (2, lambda k: k == 1)):
