@@ -17,11 +17,14 @@ from tensorfold.families.glm5_next.cuda.qmm import make_b16
 from tensorfold.families.glm5_next.cuda.split import GAP, READERS, RUN
 
 from ..config import Config
+from ..engram_hash import buckets
+from ..engram_table import rank_rows
 from . import MAX_ROWS, mx8, rope, split
 from .convert import fp8_block_rows, make_experts4
-from .weights import HCW, AttnW, CompW, DSparkW, EngramW, IdxW, LayerW, MoEW, StageW, Weights
+from .weights import HCW, AttnW, CompW, DSparkW, EngramScales, EngramW, IdxW, LayerW, MoEW, StageW, Weights
 
 SLOT = 256                                    # alignment of each expert trellis inside its layer's buffer
+PIECE = 64 << 20                              # most bytes of one read of a run of rows (Engram scales)
 _DTYPES = {**DTYPES, "F8_E8M0": torch.uint8}  # E8M0 stays raw bytes, never read through a float type
 _GROUP = re.compile(r"^(layers|mtp)\.(\d+)\.")
 
@@ -40,6 +43,7 @@ class _Pack:
         self.where = json.loads((self.dir / "model.safetensors.index.json").read_text())["weight_map"]
         self.files: dict[str, tuple[Path, int, dict]] = {}
         self.reads = ReadAhead(Reader(), READERS, RUN, GAP)
+        self.pieces: dict[str, tuple] = {}            # runs of rows by key (``rows``)
         self.groups: dict[str, list[str]] = {}
         for name in self.where:
             m = _GROUP.match(name)
@@ -56,9 +60,30 @@ class _Pack:
             self.files[file] = (path, *read_header(path))
         return self.files[file]
 
+    def rows(self, name: str, lo: int, hi: int) -> list[str]:
+        """Keys of rows [lo, hi) of 2-D tensor ``name``, read in pieces of at most ``PIECE`` bytes."""
+
+        path, base, header = self._file(self.where[name])
+        info = header[name]
+        (n, width), (a, b) = info["shape"], info["data_offsets"]
+        if not 0 <= lo <= hi <= n:
+            raise ValueError(f"{name}: rows {lo}..{hi} of {n}")
+        per = (b - a) // n
+        step = max(1, PIECE // per)
+        keys = []
+        for r in range(lo, hi, step):
+            e = min(hi, r + step)
+            key = f"{name}[{r}:{e}]"
+            shape = [e - r, width]
+            self.pieces[key] = (key, path, base + a + r * per, base + a + e * per, (info["dtype"], shape, None, shape))
+            keys.append(key)
+        return keys
+
     def item(self, name: str) -> tuple:
         """(name, file, first byte, end byte, (dtype, shape read, cut or None, part shape)) of the rank's bytes."""
 
+        if name in self.pieces:
+            return self.pieces[name]
         path, base, header = self._file(self.where[name])
         info = header[name]
         if info["dtype"] not in _DTYPES:
@@ -188,6 +213,21 @@ class _Build:
             engram = EngramW(self.mx8(e + "wkv"), self.t(e + "q_weight").float() * self.t(e + "k_weight").float())
         return self.block(LayerW, i, p, i, self.exl3(p + "ffn.")), engram
 
+    def engram_scales(self, parts: list[tuple[int, int, list[str]]]) -> EngramScales:
+        """Each Engram layer's (first row, end row, piece keys) of the rank's scale rows, in one tensor in turn."""
+
+        out, at, shift = None, 0, []
+        for lo, hi, keys in parts:
+            shift.append(at - lo)
+            for key in keys:
+                piece = self.t(key)
+                if out is None:
+                    out = torch.empty((sum(hi - lo for lo, hi, _ in parts), piece.shape[1]), dtype=piece.dtype,
+                                      device=piece.device)
+                out[at:at + piece.shape[0]].copy_(piece)
+                at += piece.shape[0]
+        return EngramScales(out, tuple(shift))
+
     def stage(self, s: int) -> StageW:
         p = f"mtp.{s}."
         return self.block(StageW, self.cfg.num_hidden_layers + s, p, None, self.experts4(p + "ffn."))
@@ -222,6 +262,12 @@ def load(model_dir: str | Path, cfg: Config, rank: int, world: int, comm, layers
     plan += [(["norm.weight", "lm_head.weight", "lm_head.weight_scale"],
               lambda: (b.t("norm.weight"), Mx8Linear.from_checkpoint(b.t("lm_head.weight"),
                                                                      b.t("lm_head.weight_scale"))))]
+    scales = []
+    if any(cfg.roles[i].engram for i in ids):       # every table's rows are staged, whichever layers are loaded
+        for layer, sizes in zip(cfg.engram_layer_ids, buckets(cfg).tolist()):
+            lo, hi = rank_rows(sizes, rank, world)
+            scales.append((lo, hi, pack.rows(f"layers.{layer}.engram.embed.scale", lo, hi)))
+        plan += [([k for *_, keys in scales for k in keys], lambda: b.engram_scales(scales))]
     plan += [(pack.names(f"mtp.{s}."), lambda s=s: b.stage(s)) for s in stages]
     built = []
     try:
@@ -242,4 +288,5 @@ def load(model_dir: str | Path, cfg: Config, rank: int, world: int, comm, layers
     print(f"[tensorfold] rank {rank} of {world}: {len(ids)} layers{' and DSpark' if dspark else ''}, "
           f"{resident / 2**30:.2f} GiB of weights in {time.perf_counter() - start:.1f} s", flush=True)
     return Weights(cfg, rank, world, comm, dev, rank * cfg.vocab_size // world, embed, [lw for lw, _ in loaded], norm,
-                   head, drafter, {lw.index: e for lw, e in loaded if e is not None}, tables)
+                   head, drafter, {lw.index: e for lw, e in loaded if e is not None}, tables,
+                   built[2 + len(ids)] if scales else None)

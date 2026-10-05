@@ -1,4 +1,5 @@
-"""DeepSeek-V4.1's Engram rows read by pread equal the file's bytes, and each rank's columns are one byte range."""
+"""DeepSeek-V4.1's Engram rows read by pread equal the file's bytes (the Python thread pool and the native pool alike),
+each rank's columns are one byte range, and admission counts the rank's resident scale rows."""
 
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ import numpy as np
 import pytest
 
 from tensorfold.families.deepseek_v41 import engram_table
-from tensorfold.families.deepseek_v41.engram_table import Layout, Reader, Table
+from tensorfold.families.deepseek_v41.cuda import split
+from tensorfold.families.deepseek_v41.engram_table import Layout, Reader, Table, rank_rows
 
 
 class Range(NamedTuple):
@@ -283,3 +285,118 @@ def test_real_rows_equal_the_memory_map(capsys):
     with capsys.disabled():
         print(f"\nEngram rows/s ({ids.size} rows, {engram_table.WORKERS} workers): "
               f"first {rates[0]:,.0f}, repeat {rates[1]:,.0f}")
+
+
+def test_rank_rows_are_each_ranks_hash_columns():
+    primes = _primes(16_000_000, 8, 4, 2)
+    assert [rank_rows(p, r, 2) for p in primes for r in (0, 1)] == [
+        (0, 192_001_740), (192_001_740, 384_006_168), (0, 192_007_016), (192_007_016, 384_016_682)]
+    assert rank_rows(primes[0], 0, 1) == (0, 384_006_168)
+    for sizes in BUCKETS:
+        bounds = np.cumsum([0, *sizes])
+        assert [rank_rows(sizes, r, 2) for r in (0, 1)] == [(0, bounds[4]), (bounds[4], bounds[8])]
+    with pytest.raises(ValueError, match="even share"):
+        rank_rows(BUCKETS[0][:7], 0, 2)
+    with pytest.raises(ValueError, match="even share"):
+        rank_rows(BUCKETS[0], 2, 2)
+
+
+def test_resident_scale_rows_are_counted_for_admission():
+    """2.86 GiB of scale rows per rank; the weight bytes and, without the rows, the tables count nothing."""
+
+    rows = {r: {layer: hi - lo for layer, (lo, hi) in zip((1, 14), (rank_rows(p, r, 2) for p in
+                                                                         _primes(16_000_000, 8, 4, 2)))}
+            for r in (0, 1)}
+    infos = {f"layers.{layer}.engram.embed.{part}": {"dtype": dtype, "shape": [n, width]}
+             for layer, n in ((1, 384_006_168), (14, 384_016_682))
+             for part, dtype, width in (("weight", "F8_E4M3", 256), ("scale", "F8_E8M0", 8))}
+    for r, want in ((0, 3_072_070_048), (1, 3_072_112_752)):
+        sizes = [split.weights_estimate(name, info, engram_rows=rows[r]) for name, info in infos.items()]
+        assert sum(size for size, _ in sizes) == want and all(mapped == 0 for _, mapped in sizes)
+        assert 2.86 < want / 2**30 < 2.87
+    assert all(split.weights_estimate(name, info) == (0, 0) for name, info in infos.items())
+
+
+def test_weight_bytes_alone_skip_the_scale_reads(pack, monkeypatch):
+    model, weights, _ = pack
+    reader = _reader(model)
+    calls, real = [], os.pread
+
+    def pread(fd: int, size: int, offset: int) -> bytes:
+        calls.append(size)
+        return real(fd, size, offset)
+
+    monkeypatch.setattr(os, "pread", pread)
+    ids = np.array([5, 400, 5, 151, 557], dtype=np.int64)
+    w = np.full((5, 256), 9, np.uint8)
+    reader.gather(ids, w)
+    reader.close()
+    assert w.tobytes() == weights[ids].tobytes() and calls == [256] * 4
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="needs posix_fadvise")
+def test_advise_without_scales_asks_for_the_weight_pages_only(pack, monkeypatch):
+    model = pack[0]
+    reader = _reader(model)
+    spans = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda fd, offset, size, advice: spans.append((fd, offset, size)))
+    ids = np.array([0, 1, 2, 557, 300, 151], dtype=np.int64)
+    reader.advise(ids, scales=False)
+    monkeypatch.undo()
+    fds = {fd: t.path for fd, t in zip(reader._fds, reader.layout.tables)}
+    reader.close()
+    pages = set()
+    for i in ids.tolist():
+        t = reader.layout.tables[i >= 150]
+        at = t.weight_abs + 256 * (i - reader.layout.starts[i >= 150])
+        pages |= {(t.path, p) for p in range(at // 4096, (at + 255) // 4096 + 1)}
+    got = {(fds[fd], p) for fd, offset, size in spans for p in range(offset // 4096, (offset + size) // 4096)}
+    assert got == pages
+
+
+def _native(workers: int):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("the native pool builds through tensorfold.cuda.build, which needs a GPU")
+    from tensorfold.families.deepseek_v41.cuda import engram
+
+    return engram.read_pool(workers)
+
+
+@pytest.mark.parametrize("workers", [1, 3, 32])
+def test_native_pool_reads_the_python_pools_bytes(pack, workers):
+    model, weights, scales = pack
+    layout = Layout.read(model, (1, 14), BUCKETS)
+    native, python = Reader(layout, pool=_native(workers)), Reader(layout, workers=4)
+    rng = np.random.default_rng(workers)
+    for n, cold in ((0, False), (1, True), (7, False), (5000, True), (5000, False)):
+        ids = rng.integers(0, 558, n)
+        if cold and hasattr(os, "posix_fadvise"):          # out of the page cache: the pool's disk reads
+            for t in layout.tables:
+                fd = os.open(t.path, os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+        got = [np.full((n, 256), 1, np.uint8), np.full((n, 8), 2, np.uint8)]
+        want = [np.full((n, 256), 3, np.uint8), np.full((n, 8), 4, np.uint8)]
+        native.gather(ids, *got)
+        python.gather(ids, *want)
+        assert got[0].tobytes() == want[0].tobytes() == weights[ids].tobytes()
+        assert got[1].tobytes() == want[1].tobytes() == scales[ids].tobytes()
+        alone = np.empty((n, 256), np.uint8)
+        native.gather_async(ids, alone).result()
+        assert alone.tobytes() == weights[ids].tobytes()
+    native.close()
+    python.close()
+
+
+def test_native_pool_fails_a_file_cut_short(pack):
+    model = pack[0]
+    reader = Reader(Layout.read(model, (1, 14), BUCKETS), pool=_native(4))
+    os.truncate((model / "model-00001-of-00002.safetensors").resolve(), 664 + 256 * 100 + 17)
+    w = np.empty((3, 256), np.uint8)
+    with pytest.raises(OSError, match="byte 26281: the checkpoint changed"):     # 17 bytes into row 100
+        reader.gather(np.array([3, 100, 99]), w)
+    reader.gather(np.array([3, 99]), w[:2])
+    with pytest.raises(OSError, match="the checkpoint changed"):               # the scale rows are past the end
+        reader.gather(np.array([3]), w[:1], np.empty((1, 8), np.uint8))
+    reader.close()

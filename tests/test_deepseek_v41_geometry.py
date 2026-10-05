@@ -46,7 +46,7 @@ def allocated(monkeypatch):
             return recorded[-1]
 
         fake = SimpleNamespace(bfloat16=torch.bfloat16, float16=torch.float16, float32=torch.float32,
-                               int32=torch.int32, uint8=torch.uint8,
+                               int32=torch.int32, int64=torch.int64, uint8=torch.uint8,
                                device=lambda d: SimpleNamespace(type=str(d)), zeros=allocate, empty=allocate,
                                full=lambda shape, fill, **kw: allocate(shape, **kw),
                                cuda=SimpleNamespace(Event=object))

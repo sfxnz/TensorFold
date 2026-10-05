@@ -30,6 +30,8 @@ class DeepSeekV41Engine:
         from tensorfold.cuda.comm import open_comm
 
         from ..config import Config
+        from ..engram_hash import buckets
+        from ..engram_table import rank_rows
         from . import MAX_ROWS, PREFILL_ROWS, RING, loader, split
         from .cache import Kept, entries_wanted
         from .decode import Engine
@@ -46,6 +48,8 @@ class DeepSeekV41Engine:
         self.bell = protocol.Bell(getattr(self.comm, "store", None))
         cfg = Config.read(model_dir, layers)
         dspark = self.policy[0] > 0 and not self.serial_only
+        engram_rows = {layer: hi - lo for layer, (lo, hi) in
+                       zip(cfg.engram_layer_ids, (rank_rows(b, rank, 2) for b in buckets(cfg).tolist()))}
 
         def transform(name: str, info: dict) -> tuple[int, int]:
             """The split's per-rank bytes, without DSpark when it stays unloaded and the layers past ``layers``."""
@@ -53,7 +57,7 @@ class DeepSeekV41Engine:
             parts = name.split(".")
             if (parts[0] == "mtp" and not dspark) or (parts[0] == "layers" and int(parts[1]) >= cfg.num_hidden_layers):
                 return 0, 0
-            return split.weights_estimate(name, info)
+            return split.weights_estimate(name, info, engram_rows=engram_rows)
 
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         plan = admit(model_dir, context, explicit, torch, lambda text: dsv41_geometry(cfg, 2), transform,
@@ -124,12 +128,13 @@ class DeepSeekV41Engine:
             return None, None
         from ..engram_hash import TOKEN_MAP_SHA256, TOKEN_MAP_SIZE, Hasher, TokenMap
         from ..engram_table import Layout, Reader
+        from .engram import read_pool
 
         size = cfg.engram_compressed_vocab_size
         token_map = TokenMap.build(model_dir / "tokenizer.json", size, TOKEN_MAP_SHA256 if size == TOKEN_MAP_SIZE
                                    else None)
         hasher = Hasher(cfg, token_map)
-        return hasher, Reader(Layout.read(model_dir, cfg.engram_layer_ids, hasher.primes.tolist()))
+        return hasher, Reader(Layout.read(model_dir, cfg.engram_layer_ids, hasher.primes.tolist()), pool=read_pool())
 
     def _gather_ints(self, values: list[int]) -> list[list[int]]:
         return protocol.gather_ints(self.comm, values)

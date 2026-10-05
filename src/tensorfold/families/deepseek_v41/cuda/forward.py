@@ -17,8 +17,10 @@ from .buffers import Buffers, State
 from .weights import LayerW, Weights
 
 
-def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int], hasher=None, reader=None, half: int = 0) -> int:
-    """Host work before a forward of ``tokens``: ids and this rank's Engram rows through pinned halves -> R."""
+def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int], hasher=None, reader=None, half: int = 0,
+          ready: int = 0) -> int:
+    """Host work before a forward of ``tokens``: ids and this rank's Engram rows through pinned halves -> R; the first
+    ``ready`` rows' Engram records are in the half already (``engram.fill_rows``)."""
 
     R = len(tokens)
     if not 0 < R <= b.rows or st.pos + R > st.capacity:
@@ -28,8 +30,14 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int], hasher=None,
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
     b.staged.record()
     if w.engram:
-        ids = hasher.ids(np.asarray(st.history, dtype=np.int64), np.asarray(tokens, dtype=np.int64))
-        engram.stage_rows(rank_columns(ids, w.rank, w.world), reader, b.eraw_host[half], b.eraw_done[half], b.eraw)
+        ids = np.empty((0, *b.eraw.shape[1:3]), dtype=np.int64)
+        if ready < R:
+            back = w.cfg.engram_max_ngram_size - 1
+            before = (list(st.history) + list(tokens[:ready]))[-back:] if back > 0 else []
+            ids = hasher.ids(np.asarray(before, dtype=np.int64), np.asarray(tokens[ready:], dtype=np.int64))
+            ids = rank_columns(ids, w.rank, w.world)
+        engram.stage_rows(ids, reader, b.eraw_host[half], b.eraw_done[half], b.eraw, scales=w.engram_scales,
+                          idx_host=b.eidx_host[half] if b.eidx_host else None, idx=b.eidx, first=ready)
     return R
 
 
@@ -109,7 +117,8 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_row
     b.pre_in[:R, 0].fill_(1.0)                  # the first block collapses to copy 0, the embedding itself
     e = None
     if w.engram:
-        e = engram.exchange(engram.dequant_rows(b.eraw[:R], b.eloc[:R]), w.comm, b.egat, b.eng)
+        e = engram.exchange(engram.dequant_rows(b.eraw[:R], b.eloc[:R], w.engram_scales, b.eidx[:R]), w.comm, b.egat,
+                            b.eng)
     for lw in w.layers:
         layer(lw, w, st, b, R, e, prompt, *(rows or {}).get(lw.index, (0, 0)), taps_from)
     if not head_rows:

@@ -281,10 +281,10 @@ class _Slow:
         self.layout, self.wrow = reader.layout, reader.wrow
         self.pool = ThreadPoolExecutor(1)
 
-    def advise(self, ids) -> None:
-        self.reader.advise(ids)
+    def advise(self, ids, scales: bool = True) -> None:
+        self.reader.advise(ids, scales)
 
-    def gather_async(self, ids, out_w, out_s):
+    def gather_async(self, ids, out_w, out_s=None):
         def late():
             time.sleep(self.delay)
             self.reader.gather(ids, out_w, out_s)
@@ -305,15 +305,18 @@ def test_a_pinned_half_is_refilled_only_after_its_copy(tiny, ref):
     prompt = _ids(12, 3 * 129, tiny.cfg.vocab_size)
     e.st.reset()
     rows = P._Rows(e, prompt, 0, P.chunks(0, len(prompt), None, 129))
-    want = np.empty((rows._ids(0).size, b.eraw.shape[-1]), dtype=np.uint8)
-    reader.gather(rows._ids(0), want[:, :reader.wrow], want[:, reader.wrow:])
+    assert rows.scales is not None, "the loader keeps the rank's scale rows resident"
+    want = np.empty((rows._ids(0).size, reader.wrow), dtype=np.uint8)
+    reader.gather(rows._ids(0), want)
     rows.read(0)
     torch.cuda._sleep(2_000_000_000)                    # the device ~1 s behind: chunk 0's copy waits
     rows.land(0)
     rows.read(2)                                        # the same pinned half, for chunk 2
     rows.drain()
     torch.cuda.synchronize()
-    assert np.array_equal(b.eraw[:129].cpu().numpy().reshape(want.shape), want), "chunk 0 got another chunk's rows"
+    got = b.eraw[:129].cpu().numpy().reshape(-1, b.eraw.shape[-1])[:, :reader.wrow]
+    assert np.array_equal(got, want), "chunk 0 got another chunk's rows"
+    assert np.array_equal(b.eidx[:129].cpu().numpy().reshape(-1), rows._ids(0, rows.idx)), "chunk 0's scale rows"
 
 
 # -- the pack -----------------------------------------------------------------------------------------------------

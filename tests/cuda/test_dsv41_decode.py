@@ -192,6 +192,30 @@ def test_drafted_equals_serial(geng, seed, temperature, top_k, top_p):
         _counts(got, policy)
 
 
+def test_drafted_windows_take_rows_read_ahead(geng, monkeypatch):
+    """Each DSpark window's Engram rows were read while its drafts were made (every row but the last draft's, which the
+    forward reads itself; the ids each was read for), and a read ahead for other ids is read again: the reply stays
+    serial's."""
+
+    sampling = Sampling(seed=4, temperature=1.0, top_k=20, top_p=0.95)
+    prompt = _ids(4, PROMPTS[1], geng.w.cfg.vocab_size)
+    want = _request(geng, prompt, REPLY, sampling).tokens
+    seen, stage = [], F.stage
+
+    def spy(w, st, b, tokens, *args, ready=0, **kw):
+        seen.append((len(tokens), ready))
+        return stage(w, st, b, tokens, *args, ready=ready, **kw)
+
+    monkeypatch.setattr(D.F, "stage", spy)
+    assert _request(geng, prompt, REPLY, sampling, (3, None)).tokens == want
+    assert seen and all(ready == R - (R > 1) for R, ready in seen), seen
+    seen.clear()
+    fetch, vocab = geng.fetch, geng.w.cfg.vocab_size
+    monkeypatch.setattr(geng, "fetch", lambda row, context, token: fetch(row, context, (token + (row == 2)) % vocab))
+    assert _request(geng, prompt, REPLY, sampling, (3, None)).tokens == want
+    assert any(R > 3 for R, _ in seen) and all(ready == min(R - (R > 1), 2) for R, ready in seen), seen
+
+
 @pytest.mark.parametrize("seed", SEEDS)
 def test_serial_replies_repeat(geng, seed):
     prompt = _ids(seed, PROMPTS[seed], geng.w.cfg.vocab_size)

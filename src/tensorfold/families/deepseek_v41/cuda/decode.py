@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -12,7 +13,7 @@ import torch
 from tensorfold.engine.exact_sampling import Sampling
 
 from ..engram_hash import rank_columns
-from . import BLOCK, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, sample
+from . import BLOCK, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, engram, sample
 from . import forward as F
 from .buffers import Buffers, State
 from .graphs import Graphs
@@ -43,6 +44,8 @@ class Engine:
         self.eos: tuple[int, ...] = (cfg.eos_token_id,)
         self.clock = _clock()                       # the current round's
         self.replays = {"graph": 0, "eager": 0}     # verify forwards by path
+        self.fetched: dict[int, tuple[tuple, Future]] = {}     # the next window's rows read ahead, by row
+        self._fetch = ThreadPoolExecutor(1, thread_name_prefix="engram-fetch") if w.engram else None
         self.graphs = None
         if graphs:
             self.graphs = Graphs(self)
@@ -62,7 +65,7 @@ class Engine:
 
         w, st, b = self.w, self.st, self.dbuf
         t = time.perf_counter()
-        R = F.stage(w, st, b, tokens, self.hasher, self.reader)
+        R = F.stage(w, st, b, tokens, self.hasher, self.reader, ready=self._ready(tokens))
         t = self._timed("engram", t)
         g = self.graphs.verify.get(R) if self.graphs is not None else None
         if g is not None:
@@ -80,18 +83,49 @@ class Engine:
         self.clock["sampling"] += seconds
         return tokens
 
-    def advise(self, context: Sequence[int], token: int) -> None:
-        """Start reading the rank's Engram rows of ``token`` placed after ``context`` (the ids before it)."""
+    def _key(self, context: Sequence[int], token: int) -> tuple:
+        back = self.w.cfg.engram_max_ngram_size - 1
+        return tuple(context[-back:] if back > 0 else ()), int(token)
+
+    def fetch(self, row: int, context: Sequence[int], token: int) -> None:
+        """Start reading window row ``row``'s Engram rows (``token`` after the ids ``context``) into the pinned half,
+        on the fetch thread; row 0 starts a window, after the last one's copy to the device."""
 
         if not self.w.engram:
             return
         t = time.perf_counter()
-        back = self.w.cfg.engram_max_ngram_size - 1
-        before = np.asarray(list(context)[-back:] if back else [], dtype=np.int64)
-        ids = rank_columns(self.hasher.ids(before, np.asarray([token], dtype=np.int64)), self.w.rank, self.w.world)
-        starts = np.asarray(self.reader.layout.starts[:ids.shape[1]], dtype=np.int64)
-        self.reader.advise((ids + starts[None, :, None]).reshape(-1))
+        if row == 0:
+            self._settle()
+            self.dbuf.eraw_done[0].synchronize()
+        key = self._key(context, token)
+        self.fetched[row] = (key, self._fetch.submit(self._read_row, row, key))
         self._timed("engram", t)
+
+    def _read_row(self, row: int, key: tuple) -> None:
+        w, b = self.w, self.dbuf
+        ids = self.hasher.ids(np.asarray(key[0], dtype=np.int64), np.asarray([key[1]], dtype=np.int64))
+        idx = b.eidx_host[0][row].numpy().reshape(-1) if w.engram_scales is not None else None
+        engram.fill_rows(rank_columns(ids, w.rank, w.world), self.reader, b.eraw_host[0][row].numpy().reshape(
+            -1, b.eraw_host[0].shape[-1]), w.engram_scales, idx)
+
+    def _settle(self) -> list[tuple]:
+        """Wait for every read ahead (raising its error) and forget them -> their (row, key)s."""
+
+        done, self.fetched = self.fetched, {}
+        for _, future in done.values():
+            future.result()
+        return [(row, key) for row, (key, _) in done.items()]
+
+    def _ready(self, tokens: Sequence[int]) -> int:
+        """How many leading rows of the window ``tokens`` were read ahead for exactly these ids."""
+
+        fetched, context, ready = dict(self._settle()), list(self.st.history), 0
+        for r, token in enumerate(tokens):
+            if fetched.get(r) != self._key(context, token):
+                break
+            context.append(token)
+            ready += 1
+        return ready
 
     def absorb(self, n: int) -> None:
         """The last forward's first ``n`` rows, just committed, into the DSpark stage rings."""
@@ -135,7 +169,8 @@ class Engine:
         context = [*self.st.history, y]
 
         def landed(i: int, token: int) -> None:
-            self.advise(context, token)
+            if i + 1 < d:                       # the last draft's rows: read by the forward, no thread hand-off
+                self.fetch(i + 1, context, token)
             context.append(token)
 
         out = dspark.propose(self, y, p, sampling, d, threshold,
@@ -199,7 +234,7 @@ def _rounds(e: Engine, pending: int, count: int, sampling: Sampling | None, stop
     _emit(on_tokens, [pending])
     e.clock = _clock()
     if drafter is not None and len(out) < count and pending not in ends:
-        e.advise(st.history, pending)
+        e.fetch(0, st.history, pending)
     keep = 0
     while len(out) < count and out[-1] not in ends:
         if drafter is not None and keep:
@@ -213,7 +248,7 @@ def _rounds(e: Engine, pending: int, count: int, sampling: Sampling | None, stop
         F.commit(w, st, e.dbuf, R, keep)
         out.extend(sampled[:keep])
         if drafter is not None and len(out) < count and out[-1] not in ends:
-            e.advise(st.history, out[-1])
+            e.fetch(0, st.history, out[-1])
         _emit(on_tokens, sampled[:keep][:max(0, count - (len(out) - keep))])
         res.rounds += 1
         res.drafted += len(guess)

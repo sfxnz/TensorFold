@@ -1,6 +1,7 @@
-"""Engram on the device: file rows dequantize bit-exactly, two ranks' exchange and ``wkv`` gather equal one rank's
-concatenation, the gate tracks the fp32 reference port in mirror mode (the op-level bound), staging never races its
-copy, rows do not depend on the window and graph replays equal eager runs."""
+"""Engram on the device: file rows dequantize bit-exactly (scale bytes from the record or from the resident rows alike),
+two ranks' exchange and ``wkv`` gather equal one rank's concatenation, the gate tracks the fp32 reference port in mirror
+mode (the op-level bound), staging never races its copy, rows do not depend on the window, graph replays equal eager
+runs, and the pack's rows through the native pool and resident scales give the file path's exchange and gate bits."""
 
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from dsv41_pair import run_pair
 
 from tensorfold.cuda.nvfp4.linear import Mx8Linear
 from tensorfold.families.deepseek_v41.cuda import engram as E
+from tensorfold.families.deepseek_v41.cuda.weights import EngramScales
 
 MODEL = os.environ.get("TF_DSV41_MODEL")
 needs_model = pytest.mark.skipif(not MODEL, reason="set TF_DSV41_MODEL to the checkpoint")
@@ -146,6 +148,42 @@ def test_dequant_is_exact_for_every_byte_and_exponent():
     nan = want.isnan()
     assert torch.equal(got.isnan(), nan)
     assert torch.equal(got[~nan].view(torch.int16), want[~nan].view(torch.int16))
+
+
+def test_resident_scales_dequantize_like_the_records_scale_bytes():
+    """Every E8M0 byte from a resident table at random rows, equal to the same bytes inside the records, eager and
+    replayed in a graph."""
+
+    g = torch.Generator().manual_seed(16)
+    raw = _raw(ROWS, COLS, 17)
+    table = torch.randint(0, 256, (1000, HEAD // 32), generator=g, dtype=torch.uint8)
+    table[:256, 0] = torch.arange(256, dtype=torch.uint8)
+    scales = EngramScales(table.cuda(), (0, 0))
+    idx = torch.randint(0, 1000, (ROWS, LAYERS, COLS), generator=g)
+    idx.view(-1)[:256] = torch.arange(256)
+    records = raw.clone()
+    records[..., HEAD:] = table[idx]
+    want = E.dequant_rows(records.cuda(), torch.empty((ROWS, LAYERS, COLS * HEAD), dtype=torch.bfloat16, device="cuda"))
+    junk = raw.clone()
+    junk[..., HEAD:] = 0xFF                             # a record's own scale bytes are not read
+    eraw, out = junk.cuda(), torch.empty_like(want)
+    dev = idx.cuda()
+    got = E.dequant_rows(eraw, out, scales, dev)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    for R in (1, 4):
+        assert torch.equal(E.dequant_rows(eraw[:R], out[:R], scales, dev[:R]).view(torch.int16),
+                           want[:R].view(torch.int16))
+    out.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        E.dequant_rows(eraw, out, scales, dev)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), want.view(torch.int16))
+    with pytest.raises(ValueError, match="resident scales"):
+        E.dequant_rows(eraw, out, scales, dev.int())
+    with pytest.raises(ValueError, match="resident"):
+        E.resident(np.array([[[1000]], [[0]]]).reshape(1, 2, 1), scales)
 
 
 def test_gate_takes_copysign_at_a_zero_dot():
@@ -395,3 +433,46 @@ def test_real_layers_track_the_reference_in_mirror_mode(world, monkeypatch):
         del lins
         torch.cuda.empty_cache()
     reader.close()
+
+
+@needs_model
+def test_real_rows_through_the_native_pool_and_resident_scales_equal_the_file_path():
+    """Both ranks stage the same window both ways: the Python pool with the scale bytes from the file, and the native
+    pool with the loader's resident scale rows; the dequantized rows, their exchange, layer 1's kv and gate are equal."""
+
+    from tensorfold.families.deepseek_v41.cuda import loader
+    from tensorfold.families.deepseek_v41.engram_table import Reader
+
+    cfg, layout, files = _real()
+    native = Reader(layout, pool=E.read_pool())
+    ids, X = _ids(layout, cfg, 18), _streams(ROWS, 19)
+    ws = [loader.load(MODEL, cfg, r, 2, None, layers=[1], dspark=False, capacity=64) for r in range(2)]
+
+    def rank(r, resident):
+        def go(comm):
+            w, b = ws[r], _bufs(2)
+            cut = slice(12 * r, 12 * (r + 1))
+            host = torch.zeros(b.eraw.shape, dtype=torch.uint8, pin_memory=True)
+            if resident:
+                idx_host = torch.zeros(b.eraw.shape[:3], dtype=torch.int64, pin_memory=True)
+                idx = torch.empty(b.eraw.shape[:3], dtype=torch.int64, device="cuda")
+                E.stage_rows(ids[:, :, cut], native, host, torch.cuda.Event(), b.eraw, scales=w.engram_scales,
+                             idx_host=idx_host, idx=idx)
+                eloc = E.dequant_rows(b.eraw, b.eloc, w.engram_scales, idx)
+            else:
+                E.stage_rows(ids[:, :, cut], files, host, torch.cuda.Event(), b.eraw)
+                eloc = E.dequant_rows(b.eraw, b.eloc)
+            eloc = eloc.clone()
+            e = E.exchange(eloc, comm, b.egat, b.eng)
+            kv = E.kv(e[:, 0], w.engram[1].wkv, comm, b.ekv, b.ekv_gat)
+            return eloc, e.clone(), kv.clone(), E.inject(X.clone(), kv, w.engram[1].wqk)
+        return go
+
+    before = run_pair(rank(0, False), rank(1, False))
+    after = run_pair(rank(0, True), rank(1, True))
+    for r in range(2):
+        for name, a, b in zip(("rows", "exchange", "kv", "gate"), before[r], after[r]):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), (r, name)
+    assert torch.equal(before[0][3], before[1][3])
+    native.close()
+    files.close()

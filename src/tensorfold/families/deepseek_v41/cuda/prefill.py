@@ -13,7 +13,7 @@ from tensorfold.engine.exact_sampling import Sampling
 
 from ..config import Config
 from ..engram_hash import rank_columns
-from . import dspark, sample, snapshot
+from . import dspark, engram, sample, snapshot
 from . import forward as F
 from .buffers import Buffers
 from .snapshot import Snapshot
@@ -71,18 +71,20 @@ class _Rows:
         ids = rank_columns(ids, w.rank, w.world)
         starts = np.asarray(e.reader.layout.starts[:ids.shape[1]], dtype=np.int64)
         self.flat = (ids + starts[None, :, None]).reshape(len(ids), -1)     # [n, layers * columns]
+        self.scales = w.engram_scales               # resident: only the weight bytes are read
+        self.idx = engram.resident(ids, self.scales).reshape(len(ids), -1) if self.scales is not None else None
         self.reader, self.b, self.begin, self.spans = e.reader, b, begin, spans
         self.advised, self.pending = 0, None
 
-    def _ids(self, i: int) -> np.ndarray:
+    def _ids(self, i: int, of: np.ndarray | None = None) -> np.ndarray:
         a, z = self.spans[i]
-        return self.flat[a - self.begin:z - self.begin].reshape(-1)
+        return (self.flat if of is None else of)[a - self.begin:z - self.begin].reshape(-1)
 
     def advise(self, upto: int) -> None:
         """WILLNEED on the pages of chunks up to ``upto`` (exclusive) not advised yet."""
 
         for i in range(self.advised, min(upto, len(self.spans))):
-            self.reader.advise(self._ids(i))
+            self.reader.advise(self._ids(i), scales=self.scales is None)
         self.advised = max(self.advised, upto)
 
     def read(self, i: int) -> None:
@@ -92,7 +94,11 @@ class _Rows:
         b.eraw_done[half].synchronize()
         ids = self._ids(i)
         rec = b.eraw_host[half].numpy().reshape(-1, b.eraw_host[half].shape[-1])[:ids.size]
-        self.pending = self.reader.gather_async(ids, rec[:, :self.reader.wrow], rec[:, self.reader.wrow:])
+        if self.scales is not None:
+            b.eidx_host[half].numpy().reshape(-1)[:ids.size] = self._ids(i, self.idx)
+            self.pending = self.reader.gather_async(ids, rec[:, :self.reader.wrow])
+        else:
+            self.pending = self.reader.gather_async(ids, rec[:, :self.reader.wrow], rec[:, self.reader.wrow:])
 
     def land(self, i: int) -> None:
         """Chunk i's rows, once read, into ``eraw`` on the compute stream (after the chunk before it computes)."""
@@ -102,6 +108,8 @@ class _Rows:
         fut, self.pending = self.pending, None
         fut.result()
         b.eraw[:R].copy_(b.eraw_host[half][:R], non_blocking=True)
+        if self.scales is not None:
+            b.eidx[:R].copy_(b.eidx_host[half][:R], non_blocking=True)
         b.eraw_done[half].record()
 
     def drain(self) -> None:

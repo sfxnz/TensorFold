@@ -91,6 +91,14 @@ class EngramW:
 
 
 @dataclass
+class EngramScales:
+    """The scale bytes of the rank's hash columns of every Engram table, resident; the weight bytes stay in the file."""
+
+    rows: torch.Tensor        # u8 [n, head_dim / 32]: each table's rows of the rank's columns, layer after layer
+    shift: tuple[int, ...]    # per Engram layer: a table row's index in ``rows`` minus the row itself
+
+
+@dataclass
 class DSparkW:
     main_proj: Mx8Linear      # the rank's rows
     main_norm: torch.Tensor
@@ -116,3 +124,4 @@ class Weights:
     dspark: DSparkW | None
     engram: dict[int, EngramW]  # by layer id
     rope: Any                 # rope.py's cos/sin tables, one pair per kind
+    engram_scales: EngramScales | None = None

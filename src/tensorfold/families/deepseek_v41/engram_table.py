@@ -64,6 +64,17 @@ class Table:
         return cls(layer, path, size, weight_abs, scale_abs, rows, wrow, srow, bounds)
 
 
+def rank_rows(buckets: Sequence[int], rank: int, world: int) -> tuple[int, int]:
+    """Rows [lo, hi) of a table that rank ``rank``'s contiguous 1/world of its hash columns (``buckets`` rows each)
+    hold, as ``engram_hash.rank_columns`` splits them."""
+
+    per = len(buckets) // world
+    if per * world != len(buckets) or not 0 <= rank < world:
+        raise ValueError(f"rank {rank} of {world} cannot take an even share of {len(buckets)} hash columns")
+    lo = int(sum(buckets[:rank * per]))
+    return lo, lo + int(sum(buckets[rank * per:(rank + 1) * per]))
+
+
 def _header(path: Path) -> tuple[bytes, int, int]:
     """(header bytes, absolute data start, file size) of one safetensors file."""
 
@@ -122,21 +133,27 @@ class Layout:
         raise ValueError(f"layer {layer} has no Engram table here")
 
 
-def _release(fds: list[int], pools: tuple[ThreadPoolExecutor, ...]) -> None:
+def _release(fds: list[int], pools: tuple[ThreadPoolExecutor | None, ...]) -> None:
     for pool in pools:
-        pool.shutdown(wait=True)
+        if pool is not None:
+            pool.shutdown(wait=True)
     while fds:
         os.close(fds.pop())
 
 
 class Reader:
-    """Rows by global id into caller buffers: deduplicated, batched per worker, read through the page cache."""
+    """Rows by global id into caller buffers: deduplicated, batched per worker, read through the page cache.
 
-    def __init__(self, layout: Layout, workers: int = WORKERS) -> None:
+    ``pool``: a native pool whose ``read(int64 [n, 4] of (fd, offset, size, address))`` returns "" or why it failed
+    (``cuda.engram.read_pool``); without one, a thread pool of ``os.pread`` reads the same bytes.
+    """
+
+    def __init__(self, layout: Layout, workers: int = WORKERS, pool=None) -> None:
         self.layout = layout
         self.workers = workers
         self._fds: list[int] = []
-        self._pool = ThreadPoolExecutor(workers, thread_name_prefix="engram-read")
+        self._native = pool
+        self._pool = ThreadPoolExecutor(workers, thread_name_prefix="engram-read") if pool is None else None
         self._async = ThreadPoolExecutor(1, thread_name_prefix="engram-gather")   # gathers wait on _pool
         self._closer = weakref.finalize(self, _release, self._fds, (self._async, self._pool))
         if len({(t.wrow, t.srow) for t in layout.tables}) != 1:
@@ -179,20 +196,33 @@ class Reader:
         base = self._base[table]
         return self._file[table], base[:, 0] + local * self.wrow, base[:, 1] + local * self.srow, inverse
 
-    def gather(self, ids: np.ndarray, out_w: np.ndarray, out_s: np.ndarray) -> None:
-        """Rows ``ids`` (int [n], global) into ``out_w`` (u8 [n, wrow]) and ``out_s`` (u8 [n, srow]); views allowed."""
+    def gather(self, ids: np.ndarray, out_w: np.ndarray, out_s: np.ndarray | None = None) -> None:
+        """Rows ``ids`` (int [n], global) into ``out_w`` (u8 [n, wrow]) and ``out_s`` (u8 [n, srow]; None: weight
+        bytes only); views allowed. The native pool reads each id straight into its row (a repeat hits the page
+        cache), the thread pool reads each distinct id once."""
 
-        files, woff, soff, inverse = self._locate(ids, unique=True)
-        for out, width in ((out_w, self.wrow), (out_s, self.srow)):
-            if out.dtype != np.uint8 or out.shape != (inverse.size, width):
-                raise ValueError(f"{inverse.size} Engram rows go into a uint8 [n, {width}] buffer, not "
-                                 f"{out.dtype} {out.shape}")
+        native = self._native is not None
+        files, woff, soff, inverse = self._locate(ids, unique=not native)
+        n = files.size if native else inverse.size
+        parts = [(out_w, woff, self.wrow)] + ([(out_s, soff, self.srow)] if out_s is not None else [])
+        for out, _, width in parts:
+            if out.dtype != np.uint8 or out.shape != (n, width) or (native and n and out.strides[1] != 1):
+                raise ValueError(f"{n} Engram rows go into a uint8 [n, {width}] buffer (each row contiguous for the "
+                                 f"native pool), not {out.dtype} {out.shape}")
         fds = self._fd_of[files]
-        rows_w = np.empty((fds.size, self.wrow), dtype=np.uint8)
-        rows_s = np.empty((fds.size, self.srow), dtype=np.uint8)
+        if native:
+            reads = np.empty((len(parts), n, 4), dtype=np.int64)
+            for (out, offsets, width), into in zip(parts, reads):
+                into[:, 0], into[:, 1], into[:, 2] = fds, offsets, width
+                into[:, 3] = out.ctypes.data + out.strides[0] * np.arange(n, dtype=np.int64)
+            failed = self._native.read(reads.reshape(-1, 4))
+            if failed:
+                raise OSError(failed)
+            return
+        rows = [np.empty((fds.size, width), dtype=np.uint8) for _, _, width in parts]
         reads = []
-        for offsets, width, rows in ((woff, self.wrow, rows_w), (soff, self.srow, rows_s)):
-            view = memoryview(rows.reshape(-1))
+        for (_, offsets, width), got in zip(parts, rows):
+            view = memoryview(got.reshape(-1))
             reads += zip(fds.tolist(), offsets.tolist(), [width] * fds.size, [view] * fds.size,
                          range(0, fds.size * width, width))
         batches = min(self.workers, len(reads))
@@ -200,28 +230,30 @@ class Reader:
             list(self._pool.map(_fill, [reads[i::batches] for i in range(batches)]))
         else:
             _fill(reads)
-        np.take(rows_w, inverse, axis=0, out=out_w)
-        np.take(rows_s, inverse, axis=0, out=out_s)
+        for (out, _, _), got in zip(parts, rows):
+            np.take(got, inverse, axis=0, out=out)
 
-    def gather_async(self, ids: np.ndarray, out_w: np.ndarray, out_s: np.ndarray) -> Future:
+    def gather_async(self, ids: np.ndarray, out_w: np.ndarray, out_s: np.ndarray | None = None) -> Future:
         """``gather`` on a background thread; the caller keeps the buffers untouched until the Future is done."""
 
         if not self._closer.alive:
             raise ValueError("the Engram reader is closed")
         return self._async.submit(self.gather, ids, out_w, out_s)
 
-    def advise(self, ids: np.ndarray) -> None:
-        """Ask the kernel to start reading the 4 KiB pages of rows ``ids`` (POSIX_FADV_WILLNEED, merged spans)."""
+    def advise(self, ids: np.ndarray, scales: bool = True) -> None:
+        """Ask the kernel to start reading the 4 KiB pages of rows ``ids`` (POSIX_FADV_WILLNEED, merged spans); the
+        weight bytes only when ``scales`` is False."""
 
         if not hasattr(os, "posix_fadvise"):
             return
         files, woff, soff, _ = self._locate(ids, unique=False)
         for f, fd in enumerate(self._fds):
             mine = files == f
-            begin = np.concatenate([woff[mine], soff[mine]])
+            begin = np.concatenate([woff[mine], soff[mine]] if scales else [woff[mine]])
             if not begin.size:
                 continue
-            end = np.concatenate([woff[mine] + self.wrow, soff[mine] + self.srow])
+            end = np.concatenate([woff[mine] + self.wrow, soff[mine] + self.srow] if scales else
+                                 [woff[mine] + self.wrow])
             order = np.argsort(begin)
             begin = begin[order] // PAGE * PAGE
             end = -(-np.maximum.accumulate(end[order]) // PAGE) * PAGE

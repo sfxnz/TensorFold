@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 
 from tensorfold.cuda.capacity import itemsize
 
@@ -12,7 +13,7 @@ _EXL3 = r"^layers\.\d+\.ffn\.experts\.\d+\."        # the backbone's routed expe
 _MXFP4 = r"^mtp\.\d+\.ffn\.experts\.\d+\."          # the DSpark stages' routed experts (MXFP4)
 
 # rep: every rank holds it whole; row/heads/groups/vocab/nsplit: halves of axis 0; col/dim1: halves of axis 1;
-# engram: hash tables read by row id from the file, never loaded; drop: the vision tower, unused
+# engram: hash tables read by row id from the file (the rank's scale rows resident); drop: the vision tower, unused
 RULES = {
     "rep": (
         r"^embed\.weight$", r"^norm\.weight$", _BLOCK + r"(attn|ffn)_norm\.weight$",
@@ -77,10 +78,16 @@ def _rows128(n: int) -> int:
     return -(-n // 128) * 128                        # Mx8Linear pads its output rows to 128
 
 
-def weights_estimate(name: str, info: dict, world: int = 2) -> tuple[int, int]:
-    """capacity.admit's transform: (device bytes, mapped bytes) of one tensor on one rank, laid out as loaded."""
+def weights_estimate(name: str, info: dict, world: int = 2,
+                     engram_rows: Mapping[int, int] | None = None) -> tuple[int, int]:
+    """capacity.admit's transform: (device bytes, mapped bytes) of one tensor on one rank, laid out as loaded.
+
+    ``engram_rows``: by Engram layer, the rows of the rank's hash columns, whose scale bytes stay resident.
+    """
 
     kind = rule(name)
+    if kind == "engram" and name.endswith(".scale") and engram_rows:
+        return int(engram_rows.get(int(name.split(".")[1]), 0)) * int(info["shape"][1]), 0
     if kind in ("engram", "drop"):
         return 0, 0
     shape = [s.stop - s.start for s in _slices(kind, 0, world, name, info["shape"])]
