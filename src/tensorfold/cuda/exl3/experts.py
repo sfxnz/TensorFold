@@ -18,6 +18,7 @@ K2_SUPPORTED = tuple(range(2, 17))
 # (n tiles a block, warps, K splits, tiles in flight): GLM's settings, whose arithmetic order this keeps bit for bit
 GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
+WINDOW_ROWS = 32                  # members a prompt-window program takes (experts_grouped.cuh)
 
 
 @lru_cache(maxsize=1)
@@ -161,7 +162,16 @@ class Scratch:
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
+        self.work_buf = torch.zeros((2 * self.items(rows, slots, ex.count),), dtype=torch.int32, device=device)
+        self.nwork = torch.zeros((2,), dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+
+    @staticmethod
+    def items(R: int, slots: int, count: int) -> int:
+        """Prompt-window work slots for R rows: a tail an expert, then one an expert plus one a further WINDOW_ROWS."""
+
+        maxu = min(R * slots, count)
+        return maxu + min(maxu * -(-R // WINDOW_ROWS), maxu + R * slots // WINDOW_ROWS)
 
     def window(self, R: int):
         """(ids, members) sized for R rows: the grids only span what R rows can use."""
@@ -169,11 +179,19 @@ class Scratch:
         maxu = min(R * self.slots, self.count_experts)
         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
 
+    def work(self, R: int) -> torch.Tensor:
+        """The (u, first member) items of R rows' prompt-window grid."""
+
+        return self.work_buf[:2 * self.items(R, self.slots, self.count_experts)]
+
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True) -> torch.Tensor:
-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
+           group: bool = True, prompt: bool = False) -> torch.Tensor:
+    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
+
+    ``prompt`` runs the prompt-window kernel (a decoded tile serves 32 members), whose bits equal the other's.
+    """
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -182,16 +200,26 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
+    work = s.work(R)
     if group:
         ext.group(pick, ids, s.count, members, R, slots, E)
+    if prompt:
+        ext.work(s.count, members, work, s.nwork, P)
+
+    def project(x0, x1, tp0, tp1, k2a, k2b, mats, K, N, cfg, k2r):
+        nt, w, sk, pf = cfg
+        if prompt:
+            ext.window(x0, x1, tp0, tp1, k2a, k2b, ids, work, s.nwork, members, s.z, mats, K, N, P, sk, slots, ex.cb,
+                       w, k2r[0], k2r[1])
+        else:
+            ext.grouped(x0, x1, tp0, tp1, k2a, k2b, ids, s.count, members, s.z, mats, K, N, P, sk, slots, ex.cb, nt,
+                        w, pf, k2r[0], k2r[1])
+        return sk
+
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
-    nt, w, sk, pf = s.cfg_gu
-    ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
+    sk = project(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, 2, D, I, s.cfg_gu, ex.k2_gu)
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
-    nt, w, sk, pf = s.cfg_d
-    ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+    sk = project(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, 1, I, D, s.cfg_d, ex.k2_d)
     if wts is None:
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
         return s.y[:P]

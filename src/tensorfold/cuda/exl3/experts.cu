@@ -71,6 +71,75 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     }
 }
 
+// Exclusive prefix of v over the block's threads in thread order; *total gets the sum (one call at a time).
+__device__ __forceinline__ int block_scan(int v, int* warp_tot, int* total) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int inc = v;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        int x = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += x;
+    }
+    if (lane == 31) warp_tot[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        const int w = warp_tot[lane];
+        int s = w;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            int x = __shfl_up_sync(0xffffffffu, s, o);
+            if (lane >= o) s += x;
+        }
+        warp_tot[lane] = s - w;
+        if (lane == 31) *total = s;
+    }
+    __syncthreads();
+    const int got = warp_tot[warp] + inc - v;
+    __syncthreads();
+    return got;
+}
+
+// Prompt windows' work lists from the grouping, experts in u order: (u, first member) of each expert's full
+// WINDOW_ROWS items (after the `tails` slots), and of its last item when it holds at most 16 members (from slot 0).
+__global__ void __launch_bounds__(GROUP_THREADS) work_kernel(const int* __restrict__ ucount,
+                                                             const int* __restrict__ members, int* __restrict__ work,
+                                                             int* __restrict__ nwork, int maxm, int tails) {
+    __shared__ int warp_tot[GROUP_THREADS / 32];
+    const int nu = ucount[0];
+    int count[GROUP_PER_THREAD];
+    int full = 0, tail = 0;
+#pragma unroll
+    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+        const int u = threadIdx.x * GROUP_PER_THREAD + q;
+        int lo = 0;
+        if (u < nu) {                                             // members come first: the first -1 is the count
+            const int* row = members + (size_t)u * maxm;
+            int hi = maxm;
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                if (row[mid] >= 0) lo = mid + 1;
+                else hi = mid;
+            }
+        }
+        count[q] = lo;
+        const int rest = lo % tf_exl3x::WINDOW_ROWS;
+        full += lo / tf_exl3x::WINDOW_ROWS + (rest > 16);
+        tail += rest > 0 && rest <= 16;
+    }
+    int at_full = block_scan(full, warp_tot, nwork + 1);
+    int at_tail = block_scan(tail, warp_tot, nwork);
+#pragma unroll
+    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+        const int u = threadIdx.x * GROUP_PER_THREAD + q;
+        for (int m = 0; m < count[q]; m += tf_exl3x::WINDOW_ROWS) {
+            const bool small = count[q] - m <= 16;
+            int* slot = work + 2 * (small ? at_tail++ : tails + at_full++);
+            slot[0] = u;
+            slot[1] = m;
+        }
+    }
+}
+
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
@@ -244,16 +313,20 @@ namespace tf_exl3x {
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
+extern template void window_launch<0>(const GroupedArgs&, const int*, const int*, int, int, cudaStream_t);
+extern template void window_launch<1>(const GroupedArgs&, const int*, const int*, int, int, cudaStream_t);
+extern template void window_launch<2>(const GroupedArgs&, const int*, const int*, int, int, cudaStream_t);
 extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
 extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
 extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
 }  // namespace tf_exl3x
 
-void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
-                        const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
-                        const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
-                        int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi) {
+static tf_exl3x::GroupedArgs grouped_args(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+                                          const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                                          const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
+                                          at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
+                                          int64_t slots, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
+                                          int64_t hi) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -269,10 +342,38 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
+    return a;
+}
+
+void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                        const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                        const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+                        int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
+                        int64_t hi) {
+    const auto a = grouped_args(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, nt,
+                                warps, pf, lo, hi);
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
     else if (cb == 2) tf_exl3x::grouped_launch<2>(a, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_window_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                       const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& work,
+                       const at::Tensor& nwork, const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K,
+                       int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t cb, int64_t warps, int64_t lo,
+                       int64_t hi) {
+    const auto a = grouped_args(X0, X1, TP0, TP1, B0, B1, uids, nwork, members, Z, mats, K, N, P, SK, slots, 1,
+                                warps, 1, lo, hi);
+    const int* w = work.data_ptr<int>();
+    const int* n = nwork.data_ptr<int>();
+    const int tails = (int)members.size(0), fulls = (int)(work.numel() / 2) - tails;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (cb == 0) tf_exl3x::window_launch<0>(a, w, n, tails, fulls, stream);
+    else if (cb == 1) tf_exl3x::window_launch<1>(a, w, n, tails, fulls, stream);
+    else if (cb == 2) tf_exl3x::window_launch<2>(a, w, n, tails, fulls, stream);
     else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -306,6 +407,15 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
     group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
         (int)slots, (int)E, (int)members.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+int exl3x_window_rows() { return tf_exl3x::WINDOW_ROWS; }
+
+void exl3x_work_cuda(const at::Tensor& ucount, const at::Tensor& members, at::Tensor& work, at::Tensor& nwork) {
+    work_kernel<<<1, GROUP_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        ucount.data_ptr<int>(), members.data_ptr<int>(), work.data_ptr<int>(), nwork.data_ptr<int>(),
+        (int)members.size(1), (int)members.size(0));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
