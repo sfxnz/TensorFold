@@ -46,6 +46,9 @@ two are within 2%: this work does not beat `exl3_moe_coop` on uniform layers, it
   `k2` range compiled (`k2=8` only for GLM; `4..8` for a 2..4-bit pack, and so on).
 * Weights are read in place: an expert matrix is the checkpoint's trellis tensor
   (`int16 [K/16, N/16, 16 * K]`) reached through a pointer table; only `suh`/`svh` are stacked.
+* `routed(..., prompt=True)` (prompt chunks) replaces the member-tile grid with a device work list of (expert,
+  32 members) items and feeds each decoded tile to two m16 fragments, with the same per-warp k ranges, K split and
+  warp sum, so every row's bits equal the decode grid's.
 * Nothing accumulates with atomics: the K split partials and the warps' sums go through shared memory in
   a fixed order, so a row's bits do not depend on the window it arrived in, only on its own row.
 

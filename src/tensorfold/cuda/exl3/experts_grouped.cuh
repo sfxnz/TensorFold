@@ -283,7 +283,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 }
 
-// Most members a prompt-window program takes: m16 fragments sharing each decoded tile.
+// Most members a prompt-window program takes: m16 fragments sharing each decoded tile (four double the accumulators).
 constexpr int WINDOW_MF = 2;
 constexpr int WINDOW_ROWS = 16 * WINDOW_MF;
 

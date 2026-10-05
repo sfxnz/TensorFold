@@ -181,8 +181,9 @@ on the same engine and box, the [public benchmark command](README.md#measurement
 | Chat, greedy | 69.2 tok/s | 72.4 tok/s | 37.6 tok/s |
 
 Drafted replies equal `"draft": false` ones (9 of 9), resumed prompts equal fresh ones, and four concurrent
-streams equal their solo runs. Cold prefill runs 930-970 tok/s from 2k to 64k, about 0.4x the MLX checkpoint's
-2,300-2,500: the routed experts decode their tiles again for every 16 rows. The pack's weights take 52 GB of GPU
+streams equal their solo runs. Cold prefill runs 925-955 tok/s from 2k to 64k (`tools/prefill_cold.py`, median of 6
+over two boots), about 0.4x the MLX checkpoint's 2,300-2,500; prompt windows decode each EXL3 expert tile once for up
+to 32 of the expert's rows. The pack's weights take 52 GB of GPU
 memory against the MLX checkpoint's 81 GB, so on a Spark the default window is the full 262,144 tokens (57.6 GiB
 allocated after loading) where the MLX checkpoint's is about 74,000; the 32.6 GB n-gram table stays in the page
 cache.

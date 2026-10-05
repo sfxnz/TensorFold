@@ -168,14 +168,15 @@ prose_long. The gap is the round: about 61 ms against vLLM's 48, of which the ho
 target sampling 2 ms (both on the critical path), and a serial token 35 ms of device time. The prose cell stops
 naturally at 74 tokens, so most of its 200 measured tokens come after the end token.
 
-Cold prompts, `tools/prefill_cold.py` (median of 3; vLLM ran the same messages):
+Cold prompts, `tools/prefill_cold.py` (TensorFold: median of 6, three in each of two fresh boots; vLLM: median of 3
+on the same messages):
 
 | Prompt | 2k | 8k | 16k | 32k | 64k |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| TensorFold, tok/s | 524 | 546 | 562 | 561 | 563 |
+| TensorFold, tok/s | 793 | 1,195 | 1,342 | 1,424 | 1,463 |
 | vLLM, tok/s | 778 | 769 | 772 | 777 | 774 |
 
-In a prompt chunk the routed experts decode each EXL3 tile again for every 16 rows.
+In a prompt chunk the routed experts decode each EXL3 tile once for up to 32 of an expert's rows.
 
 ## Not yet
 
