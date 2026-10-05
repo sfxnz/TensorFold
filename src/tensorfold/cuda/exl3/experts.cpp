@@ -5,6 +5,12 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                         int64_t, int64_t);
+void exl3x_window_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                       int64_t);
+void exl3x_work_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&);
+int exl3x_window_rows();
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -42,6 +48,44 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
                        pf, lo, hi);
+}
+
+void window(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+            const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& work,
+            const at::Tensor& nwork, const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N,
+            int64_t P, int64_t SK, int64_t slots, int64_t cb, int64_t warps, int64_t lo, int64_t hi) {
+    check(X0, at::kHalf, "X0");
+    check(X1, at::kHalf, "X1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(work, at::kInt, "work");
+    check(nwork, at::kInt, "nwork");
+    check(members, at::kInt, "members");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(Z.numel() >= mats * SK * P * N, "Z too small");
+    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+    TORCH_CHECK(work.numel() >= 2 * members.size(0), "work holds a tail slot an expert, then the full items");
+    c10::cuda::CUDAGuard guard(X0.device());
+    exl3x_window_cuda(X0, X1, TP0, TP1, B0, B1, uids, work, nwork, members, Z, mats, K, N, P, SK, slots, cb, warps, lo,
+                      hi);
+}
+
+void work(const at::Tensor& ucount, const at::Tensor& members, at::Tensor work, at::Tensor nwork, int64_t P) {
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(work, at::kInt, "work");
+    check(nwork, at::kInt, "nwork");
+    TORCH_CHECK(members.dim() == 2 && members.size(0) <= 4096, "members: [distinct experts <= 4096, members]");
+    // P picks hold every member once: a tail slot an expert, then at most an item an expert and one a further WR
+    const int64_t WR = exl3x_window_rows(), U = members.size(0);
+    const int64_t fulls = std::min<int64_t>(U * ((members.size(1) + WR - 1) / WR), U + P / WR);
+    TORCH_CHECK(nwork.numel() >= 2, "nwork holds the tail and full item counts");
+    TORCH_CHECK(work.numel() >= 2 * (U + fulls), "work too small for the grouping's items");
+    c10::cuda::CUDAGuard guard(members.device());
+    exl3x_work_cuda(ucount, members, work, nwork);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
@@ -131,6 +175,8 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
+    m.def("window", &window);
+    m.def("work", &work);
     m.def("dequant", &dequant);
     m.def("group", &group);
     m.def("rot_in", &rot_in);

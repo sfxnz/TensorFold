@@ -7,13 +7,18 @@
 - Mixed-K layers (a bit width per expert matrix, codebooks 3inst / mcg / mul1): each row gives identical bits alone
   and inside windows of 1, 2, 3, 16, 17, 64 and 128 rows, and agrees with a float64 reference.
 - A layer captured in CUDA graphs at 1, 2, 4 and 8 rows replays to exactly the eager call's output.
+- The prompt-window kernel (``prompt=True``) gives the decode kernel's bits for every row at windows of 16 to 2,048
+  rows, on random mixed-K layers with even and skewed routing, and on a real layer of the pack ``TF_DSV41_MODEL``
+  names.
 """
 
 from __future__ import annotations
 
+import json
 import math
-
+import os
 import random
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -385,3 +390,128 @@ def test_lane_map_extracts_every_window():
                         off = end(p_last, k2) - end(p, k2)
                         assert off + 16 <= 64, (k2, lane, g, j, off)
                         assert (mm >> off) & 0xFFFF == state(p), (k2, lane, g, j)
+
+
+# ------------------------------------------------------------------------------------------------- prompt windows
+
+WINDOWS = (16, 17, 33, 64, 65, 128, 1024, 2048)
+
+
+def _skewed_picks(E, R, k, gen):
+    """k distinct experts a row, drawn toward low ids: a few experts take hundreds of rows, most take a handful."""
+
+    weight = 1.0 / (torch.arange(E, dtype=torch.float64) + 1.0) ** 1.2
+    sel = torch.stack([torch.multinomial(weight, k, generator=gen) for _ in range(R)]).to(torch.int32)
+    w = torch.rand((R, k), generator=gen) * 0.2 + 0.05
+    return sel.cuda().contiguous(), w.float().cuda().contiguous()
+
+
+def _windows_match(ex, D, slots, picks, gen, windows=WINDOWS):
+    """Per-slot outputs and combined rows of the prompt-window kernel equal the decode kernel's, bit for bit."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    rows = max(windows)
+    x = torch.randn((rows, D), generator=gen).to(torch.bfloat16).cuda()
+    sel, w = picks(rows, gen)
+    shared = torch.randn((rows * slots, D), generator=gen).float().cuda()
+    scratch = experts.Scratch(ex, rows, slots)
+    first = None
+    for R in windows:
+        got = []
+        for prompt in (False, True):
+            scratch.y[:R * slots].copy_(shared[:R * slots])
+            scratch.z.fill_(float("nan"))               # a row the kernel skipped would read NaN partials
+            out = experts.routed(x[:R], sel[:R], w[:R], ex, scratch, None, R, prompt=prompt)
+            got.append((out.clone(), scratch.y[:R * slots].clone()))
+        (out0, y0), (out1, y1) = got
+        assert torch.isfinite(out1).all(), R
+        assert torch.equal(out1.view(torch.int32), out0.view(torch.int32)), R
+        assert torch.equal(y1.view(torch.int32), y0.view(torch.int32)), R
+        first = first if first is not None else out1[:16]
+        assert torch.equal(out1[:16].view(torch.int32), first.view(torch.int32)), R
+
+
+@pytest.mark.parametrize("name,cb,kfun", MIXED, ids=[m[0] + str(i) for i, m in enumerate(MIXED)])
+@pytest.mark.parametrize("E,skew", [(24, False), (384, True)])
+def test_prompt_windows_equal_the_decode_kernel(name, cb, kfun, E, skew):
+    """Mixed-K layers with a shared-expert slot whose output the caller keeps in y."""
+
+    D, I, TOPK = 512, 256, 6
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=41 + cb + E)
+    g = torch.Generator().manual_seed(E + cb)
+
+    def picks(R, gen):
+        if not skew:
+            return _picks(E, R, TOPK, gen, shared=True)
+        sel, w = _skewed_picks(E, R, TOPK, gen)
+        sel = torch.cat([sel, torch.full((R, 1), E, dtype=torch.int32, device=sel.device)], 1).contiguous()
+        return sel, torch.cat([w, torch.ones((R, 1), device=w.device)], 1).contiguous()
+
+    _windows_match(ex, D, TOPK + 1, picks, g)
+
+
+def test_prompt_window_graph_replays_the_eager_call():
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, R = 32, 512, 256, 6, 128
+    _, cb, kfun = MIXED[1]
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=51)
+    g = torch.Generator().manual_seed(9)
+    x = torch.randn((R, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _skewed_picks(E, R, TOPK, g)
+    scratch = experts.Scratch(ex, R, TOPK)
+    out = torch.empty((R, D), dtype=torch.float32, device="cuda")
+    experts.routed(x, sel, w, ex, scratch, out, R, prompt=True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        experts.routed(x, sel, w, ex, scratch, out, R, prompt=True)
+    nsel, nw = _skewed_picks(E, R, TOPK, g)
+    sel.copy_(nsel)
+    w.copy_(nw)
+    eager = experts.routed(x, sel, w, ex, scratch, None, R).clone()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int32), eager.view(torch.int32))
+
+
+def _pack_layer(model_dir: Path, layer: int):
+    """A pack layer's routed experts (w1 gate, w3 up, w2 down) as stored, each shard opened once."""
+
+    safetensors = pytest.importorskip("safetensors")
+    where = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    cfg = json.loads((model_dir / "config.json").read_text())
+    text = cfg.get("text_config", cfg)
+    E = int(text["n_routed_experts"])
+    prefix = f"layers.{layer}.ffn.experts."
+    names = [n for n in where if n.startswith(prefix)]
+    got = {}
+    for shard in sorted({where[n] for n in names}):
+        with safetensors.safe_open(str((model_dir / shard).resolve()), framework="pt", device="cpu") as f:
+            for n in names:
+                if where[n] == shard and n.rsplit(".", 1)[1] in ("trellis", "suh", "svh"):
+                    got[n] = f.get_tensor(n).cuda()
+
+    def mats(proj):
+        return [tuple(got[f"{prefix}{e}.{proj}.{p}"] for p in ("trellis", "suh", "svh")) for e in range(E)]
+
+    return mats("w1"), mats("w3"), mats("w2"), cfg["quantization_config"]["codebook"], int(text["num_experts_per_tok"])
+
+
+@pytest.mark.parametrize("skew", [False, True])
+def test_prompt_windows_equal_the_decode_kernel_on_a_pack_layer(skew):
+    model = os.environ.get("TF_DSV41_MODEL", "")
+    if not model or not Path(model).is_dir():
+        pytest.skip("set TF_DSV41_MODEL to an EXL3 checkpoint")
+    from tensorfold.cuda.exl3 import experts
+
+    gate, up, down, codebook, topk = _pack_layer(Path(model), 3)
+    ex = experts.prepare(gate, up, down, codebook)
+    g = torch.Generator().manual_seed(17 + skew)
+
+    def picks(R, gen):
+        return _skewed_picks(ex.count, R, topk, gen) if skew else _picks(ex.count, R, topk, gen)
+
+    _windows_match(ex, ex.dims, topk, picks, g)

@@ -126,7 +126,7 @@ def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) ->
     for r0 in range(0, R, s.rows):
         n = min(s.rows, R - r0)
         exl3.routed(xf[r0:r0 + n], b.pick[r0:r0 + n], b.wts[r0:r0 + n], m.experts, s, b.part[r0:r0 + n], n,
-                    cfg.swiglu_limit, exl3.ACT_F32)
+                    cfg.swiglu_limit, exl3.ACT_F32, prompt=prompt)
         _guard(s, n * s.slots, comm)
     shared(cfg, m, xf, b, prompt=prompt)
     return b.part[:R].add_(b.sd[:R])
