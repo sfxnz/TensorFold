@@ -116,6 +116,13 @@ class Engine:
             future.result()
         return [(row, key) for row, (key, _) in done.items()]
 
+    def drop_reads(self) -> None:
+        """Wait out the reads ahead an ended request left behind; their errors were that request's."""
+
+        done, self.fetched = self.fetched, {}
+        for _, future in done.values():
+            future.exception()
+
     def _ready(self, tokens: Sequence[int]) -> int:
         """How many leading rows of the window ``tokens`` were read ahead for exactly these ids."""
 
@@ -163,7 +170,8 @@ class Engine:
 
     def propose(self, y: int, p: int, sampling: Sampling | None, d: int,
                 threshold: float | None = None) -> tuple[list[int], list[float]]:
-        """``dspark.propose`` through the graphs, advising each draft's Engram rows -> (drafts, logits)."""
+        """``dspark.propose`` through the graphs, reading each draft's Engram rows ahead (all but the last) -> (drafts,
+        logits)."""
 
         start, other = time.perf_counter(), sum(self.clock.values())
         context = [*self.st.history, y]
@@ -229,6 +237,7 @@ def _rounds(e: Engine, pending: int, count: int, sampling: Sampling | None, stop
     w, st = e.w, e.st
     ends = e.eos if stop_eos else ()
     out, res = [pending], DecodeResult([], 0.0, 0)
+    e.drop_reads()
     torch.cuda.synchronize()
     start = time.perf_counter()
     _emit(on_tokens, [pending])

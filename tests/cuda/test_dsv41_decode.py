@@ -216,6 +216,35 @@ def test_drafted_windows_take_rows_read_ahead(geng, monkeypatch):
     assert any(R > 3 for R, _ in seen) and all(ready == min(R - (R > 1), 2) for R, ready in seen), seen
 
 
+@pytest.mark.parametrize("policy", [None, (3, None)])
+def test_a_read_ahead_failing_after_its_request_ended_stays_with_it(geng, monkeypatch, policy):
+    """A request its consumer ends while its next window's read ahead fails leaves no error for the next request."""
+
+    prompt = _ids(5, PROMPTS[1], geng.w.cfg.vocab_size)
+    want = _request(geng, prompt, REPLY, KEYED, policy).tokens
+    reads, emits, read_row = [], [], geng._read_row
+
+    def failing(row, key):
+        reads.append(row)
+        if len(reads) > 1:
+            raise OSError("read failed")
+        read_row(row, key)
+
+    def leave(tokens):
+        emits.append(tokens)
+        if len(emits) == 2:                     # the first round's tokens, after its next window's read started
+            raise ConnectionError("the client left")
+
+    first = P.prefill(geng, prompt, KEYED)
+    with monkeypatch.context() as m:
+        m.setattr(geng, "_read_row", failing)
+        with pytest.raises(ConnectionError):
+            D.dspark_decode(geng, first, REPLY, KEYED, drafts=1, stop_eos=False, on_tokens=leave)
+        left = [type(future.exception()) for _, future in geng.fetched.values()]
+        assert left == [OSError], f"the ended request left a failing read ahead, not {left}"
+    assert _request(geng, prompt, REPLY, KEYED, policy).tokens == want
+
+
 @pytest.mark.parametrize("seed", SEEDS)
 def test_serial_replies_repeat(geng, seed):
     prompt = _ids(seed, PROMPTS[seed], geng.w.cfg.vocab_size)
