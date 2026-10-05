@@ -17,7 +17,7 @@ from tensorfold.families.glm5_next.cuda.qmm import make_b16
 from tensorfold.families.glm5_next.cuda.split import GAP, READERS, RUN
 
 from ..config import Config
-from . import MAX_ROWS, rope, split
+from . import MAX_ROWS, mx8, rope, split
 from .convert import fp8_block_rows, make_experts4
 from .weights import HCW, AttnW, CompW, DSparkW, EngramW, IdxW, LayerW, MoEW, StageW, Weights
 
@@ -112,13 +112,12 @@ class _Build:
         return Mx8Linear.from_checkpoint(ws[0] if len(ws) == 1 else torch.cat(ws),
                                          ss[0] if len(ss) == 1 else torch.cat(ss))
 
-    def groups(self, name: str) -> list[Mx8Linear]:
-        """``wo_a``: one ``Mx8Linear`` for each of the rank's output groups."""
+    def groups(self, name: str) -> mx8.Groups:
+        """``wo_a``: one ``Mx8Linear`` for each of the rank's output groups, views of their stack."""
 
         w = self.t(name + ".weight")
-        s = fp8_block_rows(self.t(name + ".scale"), int(w.shape[0]))
-        n = self.cfg.o_lora_rank
-        return [Mx8Linear.from_checkpoint(w[g:g + n], s[g:g + n]) for g in range(0, w.shape[0], n)]
+        return mx8.Groups.from_checkpoint(w, fp8_block_rows(self.t(name + ".scale"), int(w.shape[0])),
+                                          self.cfg.o_lora_rank)
 
     def hc(self, p: str, site: str) -> HCW:
         return HCW(*(self.t(f"{p}hc_{site}_{x}") for x in ("fn", "base", "scale")))

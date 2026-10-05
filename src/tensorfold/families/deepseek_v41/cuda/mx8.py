@@ -49,12 +49,51 @@ def mm(lin: Mx8Linear, x: torch.Tensor, out: torch.Tensor | None = None, *, f32:
     return lin.prefill(x, out) if prompt else lin(x, out)
 
 
+class Groups(list):
+    """``wo_a``'s group projections as views of ``whole``, their outputs stacked, which decode runs in one launch."""
+
+    def __init__(self, whole: Mx8Linear, n: int) -> None:
+        if whole.n % n or n % 128 or whole.npad != whole.n:
+            raise ValueError(f"groups of {n} outputs do not split a [{whole.n}, {whole.k}] projection into 128s")
+        tiles, per = n // 64, n * whole.k
+        super().__init__(Mx8Linear(whole.w8[g * per:(g + 1) * per], whole.bs[g * tiles:(g + 1) * tiles], n, whole.k,
+                                   n) for g in range(whole.n // n))
+        self.whole = whole
+
+    @classmethod
+    def from_checkpoint(cls, weight: torch.Tensor, scale: torch.Tensor, n: int) -> Groups:
+        """Groups of ``n`` rows of e4m3 ``weight`` [G n, K] with e8m0 ``scale`` bytes [G n, K/32]."""
+
+        return cls(Mx8Linear.from_checkpoint(weight, scale), n)
+
+
+def _stacked(groups: Groups, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """All groups in one decode launch: x's row r, group block g as row G r + g against every group's columns, each
+    tile split over K as its group alone is, so the (r, g, g) blocks, copied to out, have each group's own bits."""
+
+    G, k, n, whole = len(groups), groups[0].k, groups[0].n, groups.whole
+    m = x.shape[0] * G
+    if x.dtype != torch.bfloat16 or not x.is_contiguous():
+        x = x.to(torch.bfloat16).contiguous()
+    y = torch.empty((m, G * n), dtype=torch.bfloat16, device=x.device)
+    sk = qmm.split_k(n, k)
+    part = torch.empty((sk, m, G * n), dtype=torch.float32, device=x.device) if sk > 8 else None
+    bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
+    _ext().qmmf(x.view(m, k), whole.w8, whole.bs, 1.0, y, part if bm else None, MXFP8, G * n, sk, whole.npad, bm,
+                False)
+    rows = x.shape[0]
+    out.view(rows, G, n).copy_(y.as_strided((rows, G, n), (G * G * n, (G + 1) * n, 1)))
+    return out
+
+
 def grouped(lins: Sequence[Mx8Linear], x: torch.Tensor, out: torch.Tensor, *, prompt: bool = False) -> torch.Tensor:
     """``wo_a``: group g's projection of x's g-th block of columns into out's g-th block of columns, bf16."""
 
     k, n = lins[0].k, lins[0].n
     if x.shape[-1] != len(lins) * k or out.shape[-1] != len(lins) * n:
         raise ValueError(f"{len(lins)} groups of [{n}, {k}] do not tile x {tuple(x.shape)} -> out {tuple(out.shape)}")
+    if isinstance(lins, Groups) and not prompt and out.is_contiguous():
+        return _stacked(lins, x, out)
     for g, lin in enumerate(lins):
         mm(lin, x[:, g * k:(g + 1) * k], out[:, g * n:(g + 1) * n], prompt=prompt)
     return out

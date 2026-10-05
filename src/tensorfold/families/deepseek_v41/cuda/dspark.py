@@ -60,8 +60,8 @@ def absorb(e, b: Buffers, n: int, *, prompt: bool) -> None:
     slots = at.remainder(st.rings.shape[1])
     for sw in ds.stages:
         qakv = mx8.mm(sw.attn.wqa_kv, main_x, b.qakv[:n], prompt=prompt)
-        kv = norms.rmsnorm(qakv[:, cfg.q_lora_rank:], sw.attn.kv_norm, eps, b.kvw[sw.index, :n])
-        quant.fp8_qdq_1x32(rope.apply(kv, at, w.rope[sw.role.rope]))
+        kv = quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], sw.attn.kv_norm, eps, at, w.rope[sw.role.rope],
+                                 b.kvw[sw.index, :n])
         st.rings[sw.index].index_copy_(0, slots, kv)
 
 
@@ -77,11 +77,10 @@ def _stage(sw: StageW, w: Weights, st: State, b: Buffers, k: Work) -> None:
     xa = norms.collapse_norm(flat, b.pre_in[:B], sw.attn_norm, b.xn[:B], eps)
     qakv = mx8.mm(a.wqa_kv, xa, b.qakv[:B])
     qr = norms.rmsnorm(qakv[:, :cfg.q_lora_rank], a.q_norm, eps, b.qr[:B])
-    kv = norms.rmsnorm(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, b.bkv)
+    kv = quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, pos, table, b.bkv)
     q = b.q[:B]
     mx8.mm(a.wq_b, qr, q.view(B, -1))
     rope.apply(q, pos, table)
-    quant.fp8_qdq_1x32(rope.apply(kv, pos, table))
     o = attn_kernel.attention(q, st.rings[L], None, pos, k.anchors, kv, k.lists, k.counts, a.sink, b.o[:B],
                               prompt=False, part=b.attn_part)
     rope.apply(o, pos, table, inverse=True)

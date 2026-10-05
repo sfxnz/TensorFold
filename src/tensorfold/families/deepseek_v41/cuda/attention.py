@@ -51,8 +51,8 @@ def attention(lw: LayerW, w: Weights, state: State, buf: Buffers, rows: int, pro
     if kv_from < rows:
         qakv = buf.qakv[kv_from:rows]
         mx8.mm(a.wqa_kv, buf.xn[kv_from:rows], qakv, prompt=prompt)
-        kv = norms.rmsnorm(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, buf.kvw[L, kv_from:rows])
-        quant.fp8_qdq_1x32(rope.apply(kv, pos if kv_from == 0 else anchors[kv_from:], table))
+        quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, pos if kv_from == 0 else anchors[kv_from:],
+                            table, buf.kvw[L, kv_from:rows])
     if source:
         compressor.compress(lw, buf.xn[:rows], state, buf, table, eps)
     if start == rows:

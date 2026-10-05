@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import torch
 import triton
 import triton.language as tl
@@ -116,10 +118,29 @@ def _guard(s: exl3.Scratch, pairs: int, comm=None) -> None:
         raise FloatingPointError("EXL3 expert activations overflow fp16")
 
 
+_LOCAL = threading.local()
+
+
+def _side(device: torch.device) -> torch.cuda.Stream:
+    """This thread's second stream on ``device`` (two thread ranks on one GPU must not share it)."""
+
+    streams = vars(_LOCAL).setdefault("streams", {})
+    if device not in streams:
+        streams[device] = torch.cuda.Stream(device)
+    return streams[device]
+
+
 def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) -> torch.Tensor:
-    """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share b.part [R, D]."""
+    """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share b.part [R, D]; decode runs the shared
+    expert on a side stream beside the routed ones (they share only xf until the add)."""
 
     R = xf.shape[0]
+    main = torch.cuda.current_stream(xf.device)
+    side = None if prompt else _side(xf.device)
+    if side is not None:
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            shared(cfg, m, xf, b, prompt=prompt)
     route(xf, m.gate, m.bias, b.mlog[:R], b.pick[:R], b.wts[:R], cfg.num_experts_per_tok,
           cfg.routed_scaling_factor, cfg.gate_temp)
     s = b.exl3
@@ -128,7 +149,10 @@ def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) ->
         exl3.routed(xf[r0:r0 + n], b.pick[r0:r0 + n], b.wts[r0:r0 + n], m.experts, s, b.part[r0:r0 + n], n,
                     cfg.swiglu_limit, exl3.ACT_F32, prompt=prompt)
         _guard(s, n * s.slots, comm)
-    shared(cfg, m, xf, b, prompt=prompt)
+    if side is None:
+        shared(cfg, m, xf, b, prompt=prompt)
+    else:
+        main.wait_stream(side)
     return b.part[:R].add_(b.sd[:R])
 
 
