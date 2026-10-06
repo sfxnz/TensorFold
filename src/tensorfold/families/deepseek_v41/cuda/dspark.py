@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Sequence
 
 import torch
@@ -19,22 +20,31 @@ from .buffers import Buffers, State
 from .forward import _gather
 from .weights import StageW, Weights
 
+SPARSE_MARKOV = False       # the Markov bias on each rank's top base candidates only, not every vocabulary row
+
 
 class Work:
-    """The drafter's own device scratch: block and Markov input ids, the block rows' anchors and lists, a bias row."""
+    """The drafter's own device scratch: block ids, the Markov chain's tokens, the block rows' anchors and lists, a
+    bias row, the draws' scratch and knobs, and the pinned rows the drafts and confidences come back in."""
 
-    def __init__(self, cfg: Config, world: int, device: torch.device | str = "cuda") -> None:
+    def __init__(self, cfg: Config, world: int, device: torch.device | str = "cuda",
+                 sparse: bool | None = None) -> None:
         dev, i32 = torch.device(device), torch.int32
         B, win = cfg.dspark_block_size, cfg.sliding_window
         self.bids = torch.full((B,), cfg.dspark_noise_token_id, dtype=i32, device=dev)    # [y, noise, ...]
-        self.mids = torch.zeros((B,), dtype=i32, device=dev)          # out_i: Markov step i's input token
+        self.chain = torch.zeros((B + 1,), dtype=i32, device=dev)    # out_0 = y, then out_{i+1} = draft i
+        self.mids = self.chain[:B]                                    # out_i: Markov step i's input token
         self.anchors = torch.zeros((B,), dtype=i32, device=dev)       # p for every block row (M:1021-1029)
         self.lists = torch.arange(B, dtype=i32, device=dev).repeat(B, 1)    # every row sees all block rows
         self.counts = torch.full((B,), B, dtype=i32, device=dev)
         self.bias = torch.empty((1, cfg.vocab_size // world), dtype=torch.float32, device=dev)
         self.rows = torch.arange(win, dtype=torch.int64, device=dev)
         self.at = torch.empty((win,), dtype=torch.int64, device=dev)   # absorbed positions
-        self.sampling = 0.0                                             # host seconds of the last propose's draws
+        self.sparse = SPARSE_MARKOV if sparse is None else sparse
+        self.draws = sample.Draws(cfg.vocab_size, world, dev)
+        self.host = torch.empty((2, B), dtype=i32, pin_memory=dev.type == "cuda")     # drafts, confidence bits
+        self.landed = [torch.cuda.Event(external=True) for _ in range(B)]   # step i's row reached the host
+        self.waited = 0.0                                                   # host seconds the last propose waited
 
 
 @torch.no_grad()
@@ -138,12 +148,33 @@ def markov_input(e, i: int) -> None:
                      BLOCK=triton.next_power_of_2(D + RK), num_warps=8)
 
 
-def markov_step(e, i: int) -> torch.Tensor:
-    """Markov step i's device part: ``dbuf.dlog[i] += markov_head(me_i)``, fp32 on the rank's vocabulary rows."""
+def markov_step(e, i: int, keyed: bool) -> None:
+    """Markov step i: draft i from ``dbuf.dlog[i]`` plus the ``markov_head(me_i)`` bias (fp32, every row of the rank's
+    vocabulary, or with ``sparse`` its candidates only), drawn on the device at position p + 2 + i into ``chain``."""
 
-    w, b, k = e.w, e.dbuf, e.dwork
+    w, st, b, k = e.w, e.st, e.dbuf, e.dwork
+    row, out = b.dlog[i], k.chain[i + 1:i + 2]
+    if k.sparse:
+        sample.draft(w, k.draws, row, st.pos_dev, 1 + i, keyed, out, (w.dspark.markov_head.weight, b.me[i]))
+        return
     qmm.matmul(b.me[i:i + 1], w.dspark.markov_head, out=k.bias, f32=True)
-    return b.dlog[i:i + 1].add_(k.bias)
+    row.add_(k.bias[0])
+    sample.draft(w, k.draws, row, st.pos_dev, 1 + i, keyed, out)
+
+
+@torch.no_grad()
+def chain(e, d: int, keyed: bool) -> None:
+    """The block, then ``d`` Markov steps, each draft and confidence copied to the pinned rows and its event recorded:
+    the device work of a proposal, one graph per (d, keyed)."""
+
+    b, k = e.dbuf, e.dwork
+    block(e)
+    for i in range(d):
+        markov_input(e, i)
+        markov_step(e, i, keyed)
+        k.host[0, i:i + 1].copy_(k.chain[i + 1:i + 2], non_blocking=True)
+        k.host[1, i:i + 1].copy_(b.conf[i:i + 1].view(torch.int32), non_blocking=True)
+        k.landed[i].record()
 
 
 def _sigmoid(c: float) -> float:
@@ -165,32 +196,29 @@ def policy(confidence: Sequence[float], d_fixed: int, conf_threshold: float | No
 
 @torch.no_grad()
 def propose(e, y: int, p: int, sampling: Sampling | None, d: int, conf_threshold: float | None = None, *,
-            steps=None, landed=None) -> tuple[list[int], list[float]]:
-    """The block for ``y`` after position ``p``, then Markov draws -> (drafts, confidence logits), alike on ranks."""
+            run=None, landed=None) -> tuple[list[int], list[float]]:
+    """The block for ``y`` after position ``p`` and ``d`` Markov draws (``run``: ``chain`` or its graph) -> the drafts
+    the policy keeps and their confidence logits, alike on every rank; ``landed(i, draft)`` as each one lands."""
 
-    w, st, b, k = e.w, e.st, e.dbuf, e.dwork
+    w, st, k = e.w, e.st, e.dwork
     B = w.cfg.dspark_block_size
     if p != st.pos - 1 or p < 0 or not 1 <= d <= B:
         raise ValueError(f"propose: p {p} with {st.pos} committed positions, {d} drafts of a {B}-row block")
-    run_block, run_input, run_step = steps or (block, markov_input, markov_step)
+    keyed = k.draws.set(sampling)
     k.bids[:1].fill_(y)
-    k.mids[:1].fill_(y)
-    run_block(e)
+    k.chain[:1].fill_(y)
+    (run or chain)(e, d, keyed)
     drafts: list[int] = []
     conf: list[float] = []
-    k.sampling = 0.0
+    k.waited = 0.0
     for i in range(d):
-        run_input(e, i)
-        if conf_threshold is not None:
-            conf.append(float(b.conf[i]))
-            if policy(conf, d, conf_threshold) <= i:
-                break
-        run_step(e, i)
-        (tok,), seconds = sample.draft_rows(w, b.dlog[i:i + 1], [p + 2 + i], sampling)
-        k.sampling += seconds
-        drafts.append(tok)
+        start = time.perf_counter()
+        k.landed[i].synchronize()
+        k.waited += time.perf_counter() - start
+        conf.append(float(k.host[1, i:i + 1].view(torch.float32)))
+        if policy(conf, d, conf_threshold) <= i:
+            break
+        drafts.append(int(k.host[0, i]))
         if landed is not None:
-            landed(i, tok)
-        if i + 1 < B:
-            k.mids[i + 1:i + 2].fill_(tok)
-    return drafts, (conf if conf_threshold is not None else b.conf[:d].tolist())[:len(drafts)]
+            landed(i, drafts[-1])
+    return drafts, conf[:len(drafts)]

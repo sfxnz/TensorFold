@@ -13,7 +13,7 @@ import torch
 from tensorfold.engine.exact_sampling import Sampling
 
 from ..engram_hash import rank_columns
-from . import BLOCK, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, engram, sample
+from . import BLOCK, DEFAULT_CONFIDENCE, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, engram, sample
 from . import forward as F
 from .buffers import Buffers, State
 from .graphs import Graphs
@@ -145,33 +145,19 @@ class Engine:
             dspark.absorb(self, self.dbuf, n, prompt=False)
         self._timed("launch", t)
 
-    def _block(self, e) -> None:
+    def _draft(self, e, d: int, keyed: bool) -> None:
         t = time.perf_counter()
-        g = self.graphs.block if self.graphs is not None else None
+        g = self.graphs.drafts.get((d, keyed)) if self.graphs is not None else None
         if g is not None:
             g.replay()
         else:
-            dspark.block(e)
-        t = self._timed("launch", t)
-        torch.cuda.current_stream().synchronize()
-        self._timed("device", t)
-
-    def _markov_input(self, e, i: int) -> None:
-        if self.graphs is not None and self.graphs.inputs:
-            self.graphs.inputs[i].replay()
-        else:
-            dspark.markov_input(e, i)
-
-    def _markov_step(self, e, i: int) -> None:
-        if self.graphs is not None and self.graphs.steps:
-            self.graphs.steps[i].replay()
-        else:
-            dspark.markov_step(e, i)
+            dspark.chain(e, d, keyed)
+        self._timed("launch", t)
 
     def propose(self, y: int, p: int, sampling: Sampling | None, d: int,
                 threshold: float | None = None) -> tuple[list[int], list[float]]:
-        """``dspark.propose`` through the graphs, reading each draft's Engram rows ahead (all but the last) -> (drafts,
-        logits)."""
+        """``dspark.propose`` through the graphs, reading each draft's Engram rows ahead as it lands (all but the
+        last) -> (drafts, logits)."""
 
         start, other = time.perf_counter(), sum(self.clock.values())
         context = [*self.st.history, y]
@@ -181,9 +167,8 @@ class Engine:
                 self.fetch(i + 1, context, token)
             context.append(token)
 
-        out = dspark.propose(self, y, p, sampling, d, threshold,
-                             steps=(self._block, self._markov_input, self._markov_step), landed=landed)
-        self.clock["sampling"] += self.dwork.sampling
+        out = dspark.propose(self, y, p, sampling, d, threshold, run=self._draft, landed=landed)
+        self.clock["device"] += self.dwork.waited
         self.clock["markov"] += time.perf_counter() - start - (sum(self.clock.values()) - other)
         return out
 
@@ -281,7 +266,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 
 @torch.no_grad()
 def dspark_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, drafts: int = DEFAULT_DRAFTS,
-                  confidence: float | None = None, stop_eos: bool = True, on_tokens=None) -> DecodeResult:
+                  confidence: float | None = DEFAULT_CONFIDENCE, stop_eos: bool = True, on_tokens=None) -> DecodeResult:
     """``serial_decode``'s tokens in windows of the pending token and up to ``drafts`` DSpark drafts."""
 
     if e.w.dspark is None:

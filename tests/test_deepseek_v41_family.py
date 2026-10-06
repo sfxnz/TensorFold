@@ -133,12 +133,13 @@ def test_cuda_engine_refuses_settings_before_building(tmp_path, engine, options,
 
 def test_cuda_engine_passes_its_policy_and_context(tmp_path, engine, capsys):
     built = deepseek_v41.cuda_engine(tmp_path, rank=1, master_port=29600, context=4096, context_explicit=True, **RANKS)
-    assert built.policy == (3, None) and built.serial_only is False                  # three drafts a round
+    assert built.policy == (5, 0.15) and built.serial_only is False          # up to five, by DSpark's confidence
     assert (built.rank, built.master, built.port, built.context, built.context_explicit) == \
         (1, "192.0.2.10", 29600, 4096, True)
     assert deepseek_v41.cuda_engine(tmp_path, mtp_drafts=0, **RANKS).policy == (0, None)   # serial, as GLM
-    assert deepseek_v41.cuda_engine(tmp_path, mtp_drafts=5, **RANKS).policy == (5, None)
-    assert deepseek_v41.cuda_engine(tmp_path, mtp_confidence=0.6, **RANKS).policy == (3, 0.6)
+    assert deepseek_v41.cuda_engine(tmp_path, mtp_drafts=3, **RANKS).policy == (3, None)    # a fixed count
+    assert deepseek_v41.cuda_engine(tmp_path, mtp_confidence=0.6, **RANKS).policy == (5, 0.6)
+    assert deepseek_v41.cuda_engine(tmp_path, mtp_drafts=4, mtp_confidence=0.6, **RANKS).policy == (4, 0.6)
     assert deepseek_v41.cuda_engine(tmp_path, no_drafts=True, **RANKS).serial_only is True
     deepseek_v41.cuda_engine(tmp_path, parallel=4, **RANKS)
     assert "--parallel 4 is ignored" in capsys.readouterr().out

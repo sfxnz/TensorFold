@@ -156,7 +156,7 @@ def tiny(tiny_dir):
 @pytest.fixture(scope="module")
 def geng(tiny, ref):
     e = _engine(tiny, ref, graphs=True)
-    assert e.st.pos == 0 and len(e.graphs.verify) == MAX_ROWS and len(e.graphs.steps) == BLOCK
+    assert e.st.pos == 0 and len(e.graphs.verify) == MAX_ROWS and len(e.graphs.drafts) == 2 * BLOCK
     return e
 
 
@@ -190,6 +190,22 @@ def test_drafted_equals_serial(geng, seed, temperature, top_k, top_p):
         assert got.tokens == want.tokens and _sha(got.tokens) == _sha(want.tokens), f"{policy}, {sampling}"
         assert rows == want_rows[:len(rows)], f"a kept row's logits differ from serial: {policy}, {sampling}"
         _counts(got, policy)
+
+
+def test_sparse_markov_drafts_the_serial_reply(tiny, ref, monkeypatch):
+    """Drafts with the Markov bias on the base candidates only keep the serial reply, through graphs and eagerly."""
+
+    monkeypatch.setattr(D.dspark, "SPARSE_MARKOV", True)
+    engines = [_engine(tiny, ref, graphs=True), _engine(tiny, ref)]
+    assert all(e.dwork.sparse for e in engines)
+    for seed in SEEDS:
+        prompt = _ids(seed, PROMPTS[seed], tiny.cfg.vocab_size)
+        for sampling in (None, KEYED, Sampling(seed=seed, temperature=1.0, top_k=0, top_p=0.95)):
+            want = _request(engines[0], prompt, REPLY, sampling)
+            got = [[_request(e, prompt, REPLY, sampling, policy) for policy in ((3, None), (BLOCK, CONF))]
+                   for e in engines]
+            assert all(r.tokens == want.tokens for runs in got for r in runs), f"sparse, {sampling}"
+            assert [(r.keeps, r.drafted) for r in got[0]] == [(r.keeps, r.drafted) for r in got[1]], "graph != eager"
 
 
 def test_drafted_windows_take_rows_read_ahead(geng, monkeypatch):

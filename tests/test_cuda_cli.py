@@ -292,9 +292,10 @@ def test_no_cuda_engine_serves_one_token_a_round_by_default(tmp_path, monkeypatc
     assert glm5_next.cuda_engine(tmp_path, drafter=str(tmp_path), **glm).policy == "auto"
     assert glm5_next.cuda_engine(tmp_path, mtp_drafts=2, **glm).policy == "2"
 
-    # DeepSeek-V4.1-Flash drafts with its DSpark stages: three a round by default; --mtp-drafts 0 is serial, as GLM's
+    # DeepSeek-V4.1-Flash drafts with its DSpark stages: up to five a round by their confidence by default;
+    # --mtp-drafts 0 is serial, as GLM's
     monkeypatch.setattr(ds_engine, "DeepSeekV41Engine", stub)
-    assert deepseek_v41.cuda_engine(tmp_path, **glm).policy == (3, None)
+    assert deepseek_v41.cuda_engine(tmp_path, **glm).policy == (5, 0.15)
     assert deepseek_v41.cuda_engine(tmp_path, mtp_drafts=0, **glm).policy == (0, None)
     assert deepseek_v41.cuda_engine(tmp_path, no_drafts=True, **glm).serial_only is True
 
