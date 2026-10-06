@@ -308,7 +308,8 @@ def _refine(KEYS, m, prefix, fixed, need, SHIFT: tl.constexpr, WIDTH: tl.constex
 @triton.jit
 def _split_refine(OUTN, HIST, BN, BKEY, BITEM, COUNTS, THR, K, sb, P, B: tl.constexpr, SPAN: tl.constexpr,
                   NB: tl.constexpr):
-    """Program r: the K-th best key from the first digit's bin, then each program's items above and at it."""
+    """Program r: the K-th best key from the first digit's bin, then each program's items above and at it; at worst
+    (the whole row in that bin) three passes over it, where ``_select`` makes five."""
 
     r = tl.program_id(0).to(tl.int64)
     bins = tl.arange(0, NB)
