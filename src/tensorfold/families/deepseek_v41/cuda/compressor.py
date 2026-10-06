@@ -1,4 +1,4 @@
-"""A KV source's compressor: pooled latents, their index keys and compressed entries, stored by position."""
+"""A KV source's compressor: pooled latents, their index keys and compressed entries, packed and stored by position."""
 
 from __future__ import annotations
 
@@ -46,7 +46,8 @@ def _pool(CMP, TAIL, W, LAT, EPOS, POS, eps, D: tl.constexpr, BLOCK: tl.constexp
 @triton.jit
 def _store(LAT, KI, COMP, INDEX_K, POS, RATIO: tl.constexpr, D: tl.constexpr, DK: tl.constexpr,
            BLOCK: tl.constexpr, BLOCK_K: tl.constexpr):
-    """Row r's entry and index key into slot (pos + r) // RATIO when its position completes a group."""
+    """Row r's packed entry (D bytes) and index key (DK bytes) into slot (pos + r) // RATIO when its position
+    completes a group."""
 
     r = tl.program_id(0)
     q = tl.load(POS) + r
@@ -81,11 +82,11 @@ def compress(lw: LayerW, xa: torch.Tensor, state: State, buf: Buffers, table: to
         positions = state.pos_dev                   # entry j = q, rotated at q
     qmm.matmul(lat, idx.wk, out=ki)                 # the index key reads the latent before RoPE (M:744, 749-750)
     norms.rmsnorm(ki, idx.k_norm, eps, ki)
-    quant.fp4_qdq_1x32_e8m0(rope.apply(ki, positions, table))
-    quant.fp4_qdq_1x16_e4m3(rope.apply(lat, positions, table))
-    dk = ki.shape[1]
-    _store[(rows,)](lat, ki, state.comp[layer], state.index_k[layer], state.pos_dev, RATIO=comp.ratio, D=hd, DK=dk,
-                    BLOCK=block, BLOCK_K=triton.next_power_of_2(dk), num_warps=4)
+    kp = quant.fp4_qdq_1x32_e8m0(rope.apply(ki, positions, table), buf.kIp[:rows])
+    lp = quant.fp4_qdq_1x16_e4m3(rope.apply(lat, positions, table), buf.latp[:rows])
+    d, dk = lp.shape[1], kp.shape[1]
+    _store[(rows,)](lp, kp, state.comp[layer], state.index_k[layer], state.pos_dev, RATIO=comp.ratio, D=d, DK=dk,
+                    BLOCK=triton.next_power_of_2(d), BLOCK_K=triton.next_power_of_2(dk), num_warps=4)
 
 
 def commit_tail(state: State, buf: Buffers, pos: int, keep: int) -> None:

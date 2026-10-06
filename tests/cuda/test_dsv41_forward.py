@@ -328,7 +328,7 @@ def test_graph_replays_equal_eager(tiny, ref, R):
         state = [b.kvw[:layers, :R].clone(), b.taps[:R].clone(), *(x.clone() for x in st.row_views(st.pos + R))]
         wrote = [c[layer][st.pos // r:(st.pos + R) // r] for layer, r in st.ratio.items() for c in (st.comp, st.index_k)]
         for x in [out, b.kvw[:layers, :R], b.taps[:R], *wrote]:
-            x.fill_(float("nan"))           # the replay must rewrite everything the eager forward did
+            x.fill_(float("nan") if x.is_floating_point() else 255)     # the replay must rewrite all the eager wrote
         graph.replay()
         assert torch.equal(out, eager), f"logits: {R} rows at {st.pos}"
         again = [b.kvw[:layers, :R], b.taps[:R], *st.row_views(st.pos + R)]

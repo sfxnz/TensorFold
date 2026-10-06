@@ -54,14 +54,15 @@ ranks the same values.
 
 A rank holds 73.2 GiB of weights: its half of the routed experts (TP over each expert's intermediate dim, 1,152 a
 rank), of the attention heads (32), of the shared expert, of the LM head's vocabulary and of DSpark; the embedding
-and the indexers are whole on both. The caches, the RoPE tables and a prompt chunk's and a decode window's scratch
-are sized at startup for the window and allocated once, as are the kept-prompt arena and every transient the
-kernels take (a warm-up prompt and decode rounds run before serving), so serving allocates no device memory.
+and the indexers are whole on both. The caches hold the model's FP8 and FP4 codes with their scales, 890 bytes a
+token. The caches, the RoPE tables and a prompt chunk's and a decode window's scratch are sized at startup for the
+window and allocated once, as are the kept-prompt arena and every transient the kernels take (a warm-up prompt and
+decode rounds run before serving), so serving allocates no device memory.
 
 | Window | Startup line, rank 0 (rank 1 alike) | `free -h` available after a request, rank 0 / rank 1 |
 | --- | --- | --- |
 | 65,538 | `startup estimate 78.46 GiB within 99.59 GiB; ... allocated prompt/reply window 65538` | 28 / 31 GiB |
-| default | `startup estimate 79.09 GiB within 99.58 GiB; native 1048576, allocated prompt/reply window 1048576` | 24 / 26 GiB |
+| default | `startup estimate 78.46 GiB within 100.11 GiB; native 1048576, allocated prompt/reply window 1048576` | 27 / 29 GiB |
 
 The Engram reads fill the page cache, which admission counts as available. Across a cold 64k prompt and three
 resumes of it, `torch.cuda.memory_reserved` stayed at 80.7 GiB on rank 0.
@@ -106,7 +107,7 @@ changes bits.
 | Routed experts | FP8 activations x FP4 weights; the routing weight applied before `w2`, rounded to bf16 | fp16 activations x the EXL3 weights; the routing weight applied after `w2` in the fp32 combine: a reorder at equal or higher precision |
 | Shared expert | Computed whole on every rank; its bf16 `w2` output added to the fp32 sum after the routed all-reduce | Inner dim split over the ranks; each rank's fp32 `w2` partial added into its fp32 MoE share, then the shares gathered and added in rank order: higher, and a reorder |
 | LM head | fp32 logits of bf16 activations | bf16 activations against the MXFP8 weights, fp32 logits: equal |
-| Window, compressed and index keys | FP8 / FP4 quantize-dequantize, trained with it | The same quantize-dequantize, stored as bf16 values (the same numbers packed storage would hold): equal |
+| Window, compressed and index keys | FP8 / FP4 quantize-dequantize, trained with it, stored as bf16 values | The same quantize-dequantize, stored as its codes and scales (FP8 with power-of-two scales per 32, FP4 with e4m3 scales per 16, FP4 with power-of-two scales per 32) and dequantized on load to the same values: equal |
 | Decode indexer at even positions | Layers 2, 8 and 14 (and the layers that reuse their lists) score against layer 20's index keys when their own compressor emitted no entry | Every layer scores its own source's index keys, as the reference's prompt path does |
 
 The last row is a defect of the reference's decode path that TensorFold does not reproduce: reproducing it would
@@ -168,15 +169,20 @@ prose_long. The gap is the round: about 61 ms against vLLM's 48, of which the ho
 target sampling 2 ms (both on the critical path), and a serial token 35 ms of device time. The prose cell stops
 naturally at 74 tokens, so most of its 200 measured tokens come after the end token.
 
-Cold prompts, `tools/prefill_cold.py` (TensorFold: median of 6, three in each of two fresh boots; vLLM: median of 3
-on the same messages):
+Cold prompts, `tools/prefill_cold.py` (TensorFold: the mean of two fresh boots' medians of 3; vLLM: median of 3 on
+the same messages):
 
 | Prompt | 2k | 8k | 16k | 32k | 64k |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| TensorFold, tok/s | 793 | 1,195 | 1,342 | 1,424 | 1,463 |
+| TensorFold, tok/s | 887 | 1,349 | 1,531 | 1,621 | 1,684 |
 | vLLM, tok/s | 778 | 769 | 772 | 777 | 774 |
 
 In a prompt chunk the routed experts decode each EXL3 tile once for up to 32 of an expert's rows.
+
+Long context: a 127,459-token needle document (the vLLM recipe's seeded filler, `--context 131074`) took 73.8 s cold,
+and 256 tokens decoded after it at 49.1 tok/s greedy and 50.7 tok/s at temperature 1 with `top_k` 20 (the prompt
+resumed from its kept state; median of 3). A decode window's index selection spreads each row over many programs,
+which keeps the per-round device time at 128k close to its time at short contexts.
 
 ## Not yet
 

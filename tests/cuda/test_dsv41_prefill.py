@@ -235,7 +235,7 @@ def test_saved_rows_round_trip(eng):
     snapshot.save_rows(eng, held, arena[state:state + need])
     assert held.nbytes == need and snapshot.snapshot_bytes(held) == state + need
     for v in st.row_views(301):
-        v.fill_(float("nan"))
+        v.fill_(255)                                    # packed rows: NaN codes
     snapshot.load_rows(eng, held)
     assert all(torch.equal(_bits(v), x) for v, x in zip(st.row_views(301), want))
     with pytest.raises(ValueError, match="300 ids at 301"):
