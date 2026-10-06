@@ -108,7 +108,8 @@ def _e2m1_value(c):
 @triton.jit
 def as_loaded(x):
     """bf16 x through an opaque move: a dot then lays it out as a bf16 load, never by the bytes it was unpacked from
-    (which reorders K within the MMA steps and so the fp32 sums)."""
+    (which reorders K within the MMA steps and so the fp32 sums); a compiler choice, so the packed == bf16 tests
+    guard it."""
 
     return tl.inline_asm_elementwise("mov.b16 $0, $1;", "=h,h", [x], dtype=tl.bfloat16, is_pure=False, pack=1)
 
