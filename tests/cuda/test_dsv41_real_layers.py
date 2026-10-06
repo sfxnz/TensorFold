@@ -54,7 +54,7 @@ from safetensors import safe_open
 from tokenizers import Tokenizer
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, dspark, engram, loader
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, dspark, engram, loader, quant
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import rope as tf_rope
 from tensorfold.families.deepseek_v41.cuda.weights import Weights
@@ -299,7 +299,8 @@ class Stream:
                     seen["xf"].append(b.xn[lo - a:hi - a].cpu())
                     seen["pick"].append(b.pick[lo - a:hi - a].cpu())
                     if own_lists:
-                        _index(cfg, role, b, st.index_k[role.kv_src], lo - a, hi - a, lo, index)
+                        keys = quant.unpack(st.index_k[role.kv_src], quant.FP4_E8M0, cfg.index_head_dim)
+                        _index(cfg, role, b, keys, lo - a, hi - a, lo, index)
                         counts = b.list_n[lo - a:hi - a].tolist()
                         rows = b.lists[lo - a:hi - a].cpu().long()
                         self.picked.setdefault(L, []).extend(rows[i, :c] for i, c in enumerate(counts))

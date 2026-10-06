@@ -40,18 +40,18 @@ def _walk(obj) -> int:
 @pytest.mark.parametrize("capacity", CAPACITIES)
 def test_state_shapes(capacity):
     st = buffers.State(CFG, capacity, "meta")
-    assert st.rings.shape == (43, 128, 512) and st.rings.dtype == BF
-    assert {k: tuple(v.shape) for k, v in st.comp.items()} == {
-        2: (capacity // 2 + 1, 512), 8: (capacity // 2 + 1, 512), 14: (capacity // 2 + 1, 512), 20: (capacity, 512)}
-    assert {k: tuple(v.shape) for k, v in st.index_k.items()} == {
-        2: (capacity // 2 + 1, 128), 8: (capacity // 2 + 1, 128), 14: (capacity // 2 + 1, 128), 20: (capacity, 128)}
-    assert all(v.dtype == BF for v in [*st.comp.values(), *st.index_k.values()])
+    assert st.rings.shape == (43, 128, 528) and st.rings.dtype == U8          # FP8 codes, an E8M0 byte a 32
+    assert {k: tuple(v.shape) for k, v in st.comp.items()} == {                # FP4 codes, an e4m3 byte a 16
+        2: (capacity // 2 + 1, 288), 8: (capacity // 2 + 1, 288), 14: (capacity // 2 + 1, 288), 20: (capacity, 288)}
+    assert {k: tuple(v.shape) for k, v in st.index_k.items()} == {             # FP4 codes, an E8M0 byte a 32
+        2: (capacity // 2 + 1, 68), 8: (capacity // 2 + 1, 68), 14: (capacity // 2 + 1, 68), 20: (capacity, 68)}
+    assert all(v.dtype == U8 for v in [*st.comp.values(), *st.index_k.values()])
     assert st.pooled == (2, 8, 14)
     assert st.tail.shape == (3, 2, 512) and st.tail.dtype == F32
     assert st.tail_valid.shape == (3,) and st.tail_valid.dtype == I32
     assert st.pos_dev.shape == (1,) and st.pos_dev.dtype == I32
-    fixed = 43 * 128 * 512 * 2 + 3 * 2 * 512 * 4 + 3 * 4 + 4 + 3 * 1280      # rings, tails, flags, pos, entry rounding
-    assert st.nbytes() == _walk(st) == 3200 * capacity + fixed
+    fixed = 43 * 128 * 528 + 3 * 2 * 512 * 4 + 3 * 4 + 4 + 3 * 356         # rings, tails, flags, pos, entry rounding
+    assert st.nbytes() == _walk(st) == 890 * capacity + fixed
 
 
 def test_state_position_and_reset():
@@ -68,11 +68,11 @@ def test_state_position_and_reset():
 def test_row_views(n):
     st = buffers.State(CFG, 4096, "meta")
     views = st.row_views(n)
-    assert [tuple(v.shape) for v in views] == [(n // 2 + 1, 512), (n // 2 + 1, 128)] * 3 + [(n + 1, 512),
-                                                                                         (n + 1, 128)]
+    assert [tuple(v.shape) for v in views] == [(n // 2 + 1, 288), (n // 2 + 1, 68)] * 3 + [(n + 1, 288),
+                                                                                       (n + 1, 68)]
     size = sum(v.numel() * v.element_size() for v in views)
-    assert size == 3 * (n // 2 + 1) * 1280 + (n + 1) * 1280
-    assert 0 < size - 3200 * n <= 5 * 1280                      # entry rounding: at most one entry a cache, plus one
+    assert size == 3 * (n // 2 + 1) * 356 + (n + 1) * 356
+    assert 0 < size - 890 * n <= 5 * 356                        # entry rounding: at most one entry a cache, plus one
     assert all(v._base is not None for v in views)              # views of the live caches, not copies
 
 
@@ -92,8 +92,9 @@ def _expected(rows: int, capacity: int, prefill: bool) -> dict:
         "comb_a": ((rows, 16), F32), "pre_f": ((rows, 4), F32), "post_f": ((rows, 4), F32),
         "comb_f": ((rows, 16), F32), "xn": ((rows, 5120), BF),
         "qakv": ((rows, 1792), BF), "qr": ((rows, 1280), BF), "q": ((rows, 32, 512), BF), "o": ((rows, 32, 512), BF),
-        "u": ((rows, 4096), BF), "kvw": ((43, rows, 512), BF),
-        "cmp": ((3, rows, 2, 512), F32), "lat": ((rows, 512), BF), "kI": ((rows, 128), BF),
+        "u": ((rows, 4096), BF), "kvw": ((43, rows, 528), U8),
+        "cmp": ((3, rows, 2, 512), F32), "lat": ((rows, 512), BF), "latp": ((rows, 288), U8),
+        "kI": ((rows, 128), BF), "kIp": ((rows, 68), U8),
         "epos": ((rows,), I32), "qI": ((rows, 32, 128), BF),
         "wI": ((rows, 32), F32), "scores": ((scored, capacity), F32), "cand": ((rows, 2048), I32),
         "cand_n": ((rows,), I32), "lists": ((rows, 512), I32), "list_n": ((rows,), I32),
@@ -126,10 +127,14 @@ def test_buffer_shapes(rows, prefill, capacity):
     assert b.exl3.rows == (1024 if prefill else rows) and b.exl3.slots == 6       # no shared-expert slot (D10)
     assert b.exl3.y.shape == (b.exl3.rows * 6, 5120)
     if prefill:
-        assert b.attn_part is None and not hasattr(b, "dplan")
+        assert b.attn_part is None and not hasattr(b, "dplan") and not hasattr(b, "split")
         assert b.scores.numel() * 4 == min(1 << 30, 2048 * capacity * 4)
     else:
         assert (b.dplan.rows, b.dplan.slots, b.dplan.experts) == (5, 4, 129)
+        assert {k: (tuple(v.shape), v.dtype) for k, v in b.split.items()} == {
+            "hist": ((rows, 2048), I32), "bn": ((rows,), I32), "bkey": ((rows, capacity), I32),
+            "bitem": ((rows, capacity), I32), "counts": ((rows, 3, -(-max(capacity, 16384) // 1024)), I32),
+            "thr": ((rows, 2), I32)}
     assert b.ids_host is None and b.staged is None and b.eraw_host == b.eraw_done == b.eidx_host == []  # no pinning
 
 
@@ -142,7 +147,7 @@ def test_bytes_is_the_allocation(rows, prefill, capacity):
 
 def test_prompt_byte_figures():
     b = buffers.Buffers(CFG, 2, 2048, 1 << 20, True, device="meta")
-    assert b.kvw.numel() * 2 == 43 * 2048 * 1024                     # 90 MB
+    assert b.kvw.numel() == 43 * 2048 * 528                          # 46 MB
     assert 490e6 < _walk(b.exl3) < 500e6                             # 1024 rows x 6 slots, no sentinel (D10)
     assert b.scores.numel() * 4 == 1 << 30
 
@@ -166,7 +171,7 @@ def test_reduced_layer_set():
     st = buffers.State(cfg, 4096, "meta")
     assert st.rings.shape[0] == 11 and list(st.comp) == [2] and st.pooled == (2,)
     b = buffers.Buffers(cfg, 2, 6, 4096, device="meta")
-    assert b.kvw.shape == (11, 6, 512) and b.cmp.shape == (1, 6, 2, 512) and b.scores.shape == (6, 2049)
+    assert b.kvw.shape == (11, 6, 528) and b.cmp.shape == (1, 6, 2, 512) and b.scores.shape == (6, 2049)
     assert b.eraw.shape == (6, 1, 12, 264)
 
 

@@ -71,21 +71,23 @@ def test_estimate_equals_the_allocations(allocated, slots):
         buffers.Buffers(CFG, 2, PREFILL_ROWS, slots, prefill=True, device="cuda")
 
     recorded = allocated(build)
-    assert any(t.shape == (slots, CFG.head_dim) for t in recorded)          # the ratio-1 cache: the constructors ran
+    assert any(t.shape == (slots, 288) for t in recorded)                   # the ratio-1 cache: the constructors ran
     assert any(t.device is None for t in recorded)                          # pinned staging, outside the estimate
     estimate = geometry.dsv41_geometry(CFG, 2).bytes_at(slots)
     assert _on_device(recorded) + 512 * slots == estimate                   # RoPE: fp32 cos and sin, two kinds x 32
 
 
 def test_bytes_grow_by_kv_rope_and_score_rows():
-    """Per slot: 3,200 B of caches, 512 B of RoPE tables, a decode window's and a prompt block's fp32 scores."""
+    """Per slot: 890 B of packed caches, 512 B of RoPE tables, a decode window's and a prompt block's fp32 scores,
+    and the decode selection's two int32 lists."""
 
     g = geometry.dsv41_geometry(CFG, 2)
     fixed = None
-    for slots in (4096, 8192, 131072, 131088, 262144, 1 << 19, NATIVE, NATIVE + 16, 3 << 20):
+    for slots in (16384, 32768, 131072, 131088, 262144, 1 << 19, NATIVE, NATIVE + 16, 3 << 20):
         rows = buffers.score_rows(slots)
         assert rows * slots * 4 <= GIB
-        rest = g.bytes_at(slots) - slots * (3200 + 512 + 4 * MAX_ROWS + 4 * rows)
+        programs = 3 * 4 * MAX_ROWS * -(-slots // buffers.SPLIT_SPAN)       # the selection's per-program counts
+        rest = g.bytes_at(slots) - slots * (890 + 512 + 4 * MAX_ROWS + 4 * rows + 8 * MAX_ROWS) - programs
         fixed = rest if fixed is None else fixed
         assert rest == fixed, slots
     assert buffers.score_rows(NATIVE) == 256 and buffers.score_rows(65544) == 2048
@@ -123,14 +125,18 @@ def test_default_context_is_the_native_window(weights):
 
 
 def test_explicit_context_past_the_fit_is_refused_with_the_fitting_size(weights):
+    """Wherever loading fits, the native window fits (packed caches), so the refusal shows past it: 16M tokens."""
+
     g = geometry.dsv41_geometry(CFG, 2)
-    budget = 79 * GIB
-    plan = capacity.make_plan(NATIVE, NATIVE, True, budget, weights, g)
-    assert 0 < plan.fitting < NATIVE
+    loading = weights.resident + weights.staging
+    assert capacity.make_plan(NATIVE, NATIVE, True, loading, weights, g).fitting == NATIVE
+    budget, wanted = 79 * GIB, 1 << 24
+    plan = capacity.make_plan(wanted, wanted, True, budget, weights, g)
+    assert NATIVE < plan.fitting < wanted
     assert weights.resident + g.needed(plan.fitting) <= budget
     with pytest.raises(ValueError, match=f"largest fitting prompt-plus-reply window: {plan.fitting} tokens"):
         capacity.choose(plan)
-    fits = capacity.make_plan(NATIVE, plan.fitting, True, budget, weights, g)
+    fits = capacity.make_plan(wanted, plan.fitting, True, budget, weights, g)
     assert capacity.choose(fits) == plan.fitting
     assert geometry.kept_bytes(fits.receipt(plan.fitting), 3 * GIB) < GIB     # what the tight budget leaves
 

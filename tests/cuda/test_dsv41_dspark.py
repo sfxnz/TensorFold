@@ -327,7 +327,7 @@ def test_graph_replays_equal_eager(eng):
             eager = st.rings.clone()
             st.rings.copy_(rings)
             for L in stages:
-                st.rings[L, [q % w.cfg.sliding_window for q in range(st.pos - n, st.pos)]] = float("nan")
+                st.rings[L, [q % w.cfg.sliding_window for q in range(st.pos - n, st.pos)]] = 255    # NaN codes
             graphs[n].replay()
             assert torch.equal(st.rings, eager), f"absorb {n} at {st.pos}"
         dspark.block(eng)

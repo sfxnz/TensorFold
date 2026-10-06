@@ -1,4 +1,8 @@
-"""Sparse attention, a row a program: its window, then its list, with a sink, as model.py's kernel (K:355-387)."""
+"""Sparse attention, a row a program: its window, then its list, with a sink, as model.py's kernel (K:355-387).
+
+The window (ring and this forward's rows) and the list's rows are bf16, or packed as ``quant`` stores them and
+dequantized on load to the same bf16 values.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,9 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+
+from . import quant
+from .quant import as_loaded, unpack_fp4, unpack_fp8
 
 SCALE = 512 ** -0.5     # softmax scale of the 512-wide head
 CHUNK = 128             # decode: list entries one partial covers, merged in chunk order
@@ -16,8 +23,33 @@ KT_PROMPT = 64          # prompt: entries a tile, in list order
 
 
 @triton.jit
+def _window(RING, KVW, fresh, win, slot, row, kv_stride, k, LW: tl.constexpr, PACKED: tl.constexpr):
+    """bf16 window rows: ring slots, or this forward's rows where ``fresh``; packed FP8 rows of LW + LW / 32 bytes."""
+
+    if PACKED:
+        v = unpack_fp8(tl.where(fresh, KVW + row * kv_stride, RING + slot * (LW + LW // 32)), win, slot.shape[0], LW)
+        v = v.to(tl.bfloat16)
+    else:
+        a = tl.load(RING + slot[:, None] * LW + k[None, :], mask=(win & ~fresh)[:, None], other=0.0)
+        b = tl.load(KVW + row[:, None] * kv_stride + k[None, :], mask=fresh[:, None], other=0.0)
+        v = tl.where(fresh[:, None], b, a)
+    return v
+
+
+@triton.jit
+def _extra(EXTRA, j, ext, e_stride, k, LW: tl.constexpr, PACKED: tl.constexpr):
+    """bf16 rows ``j`` of the extra source: bf16 rows, or packed FP4 rows with e4m3 scales per 16."""
+
+    if PACKED:
+        v = unpack_fp4(EXTRA + j * e_stride, ext, j.shape[0], LW, 16).to(tl.bfloat16)
+    else:
+        v = tl.load(EXTRA + j[:, None] * e_stride + k[None, :], mask=ext[:, None], other=0.0)
+    return v
+
+
+@triton.jit
 def _entries(RING, KVW, EXTRA, LISTS, r, n, total, nw, lo, pos, kv_stride, e_stride, l_stride, k,
-             WIN: tl.constexpr, LW: tl.constexpr):
+             WIN: tl.constexpr, LW: tl.constexpr, PACKED_WIN: tl.constexpr, PACKED_EXTRA: tl.constexpr):
     """bf16 [KT, LW] rows of list entries ``n``: window positions from the ring or kvw, then extra rows."""
 
     ok = n < total
@@ -29,10 +61,21 @@ def _entries(RING, KVW, EXTRA, LISTS, r, n, total, nw, lo, pos, kv_stride, e_str
     slot = (w % WIN).to(tl.int64)
     row = tl.where(fresh, w - pos, 0).to(tl.int64)
     j = tl.load(LISTS + r * l_stride + (n - nw), mask=ext, other=0).to(tl.int64)
-    a = tl.load(RING + slot[:, None] * LW + k[None, :], mask=old[:, None], other=0.0)
-    b = tl.load(KVW + row[:, None] * kv_stride + k[None, :], mask=fresh[:, None], other=0.0)
-    c = tl.load(EXTRA + j[:, None] * e_stride + k[None, :], mask=ext[:, None], other=0.0)
-    return tl.where(old[:, None], a, tl.where(fresh[:, None], b, c)), ok
+    if PACKED_WIN or PACKED_EXTRA:                  # a tile within one source decodes that source alone
+        if tl.max(n, 0) < nw:
+            kv = _window(RING, KVW, fresh, win, slot, row, kv_stride, k, LW, PACKED_WIN)
+        elif tl.min(n, 0) >= nw:
+            kv = _extra(EXTRA, j, ext, e_stride, k, LW, PACKED_EXTRA)
+        else:
+            kv = tl.where(win[:, None], _window(RING, KVW, fresh, win, slot, row, kv_stride, k, LW, PACKED_WIN),
+                          _extra(EXTRA, j, ext, e_stride, k, LW, PACKED_EXTRA))
+        kv = as_loaded(kv)
+    else:
+        a = tl.load(RING + slot[:, None] * LW + k[None, :], mask=old[:, None], other=0.0)
+        b = tl.load(KVW + row[:, None] * kv_stride + k[None, :], mask=fresh[:, None], other=0.0)
+        c = tl.load(EXTRA + j[:, None] * e_stride + k[None, :], mask=ext[:, None], other=0.0)
+        kv = tl.where(old[:, None], a, tl.where(fresh[:, None], b, c))
+    return kv, ok
 
 
 @triton.jit
@@ -72,7 +115,8 @@ def _bounds(POS, ANCH, CNT, r, WIN: tl.constexpr, HAS_EXTRA: tl.constexpr):
 @triton.jit
 def _chunks(Q, RING, KVW, EXTRA, LISTS, CNT, POS, ANCH, PART, q_row, q_head, kv_stride, e_stride, l_stride,
             p_row, p_head, p_chunk, H: tl.constexpr, LW: tl.constexpr, WIN: tl.constexpr, CH: tl.constexpr,
-            HBT: tl.constexpr, KTT: tl.constexpr, SCALE: tl.constexpr, HAS_EXTRA: tl.constexpr):
+            HBT: tl.constexpr, KTT: tl.constexpr, SCALE: tl.constexpr, HAS_EXTRA: tl.constexpr,
+            PACKED_WIN: tl.constexpr, PACKED_EXTRA: tl.constexpr):
     """Program (row, head block, chunk): partial (acc, max, sum) of HB heads over list entries [c CH, (c+1) CH)."""
 
     r = tl.program_id(0).to(tl.int64)
@@ -89,7 +133,7 @@ def _chunks(Q, RING, KVW, EXTRA, LISTS, CNT, POS, ANCH, PART, q_row, q_head, kv_
         q = tl.load(Q + r * q_row + hh[:, None] * q_head + k[None, :], mask=hok[:, None], other=0.0)
         for t in range(0, tl.minimum(CH, total - start), KTT):
             kv, ok = _entries(RING, KVW, EXTRA, LISTS, r, start + t + tl.arange(0, KTT), total, nw, lo, pos,
-                              kv_stride, e_stride, l_stride, k, WIN, LW)
+                              kv_stride, e_stride, l_stride, k, WIN, LW, PACKED_WIN, PACKED_EXTRA)
             m, l, o = _tile(q, kv, ok, m, l, o, SCALE)
     base = PART + r * p_row + hh * p_head + c * p_chunk
     tl.store(base[:, None] + k[None, :], o, mask=hok[:, None])
@@ -126,7 +170,8 @@ def _merge(PART, SINK, OUT, o_row, o_head, p_row, p_head, p_chunk, NCH, LW: tl.c
 @triton.jit
 def _prompt(Q, RING, KVW, EXTRA, LISTS, CNT, POS, ANCH, SINK, OUT, q_row, q_head, kv_stride, e_stride, l_stride,
             o_row, o_head, H: tl.constexpr, LW: tl.constexpr, WIN: tl.constexpr, HBT: tl.constexpr,
-            KTT: tl.constexpr, SCALE: tl.constexpr, HAS_EXTRA: tl.constexpr):
+            KTT: tl.constexpr, SCALE: tl.constexpr, HAS_EXTRA: tl.constexpr, PACKED_WIN: tl.constexpr,
+            PACKED_EXTRA: tl.constexpr):
     """Program (row, head block): HB_PROMPT heads over the whole list in KT_PROMPT-entry tiles, no partials."""
 
     r = tl.program_id(0).to(tl.int64)
@@ -144,20 +189,20 @@ def _prompt(Q, RING, KVW, EXTRA, LISTS, CNT, POS, ANCH, SINK, OUT, q_row, q_head
         n0 = t + tl.arange(0, HALF)
         n1 = n0 + HALF
         kv, ok0 = _entries(RING, KVW, EXTRA, LISTS, r, n0, total, nw, lo, pos, kv_stride, e_stride, l_stride, k,
-                           WIN, LW)
+                           WIN, LW, PACKED_WIN, PACKED_EXTRA)
         s0 = _scores(q, kv, ok0, SCALE)
         kv, ok1 = _entries(RING, KVW, EXTRA, LISTS, r, n1, total, nw, lo, pos, kv_stride, e_stride, l_stride, k,
-                           WIN, LW)
+                           WIN, LW, PACKED_WIN, PACKED_EXTRA)
         s1 = _scores(q, kv, ok1, SCALE)
         nm = tl.maximum(m, tl.maximum(tl.max(s0, 1), tl.max(s1, 1)))
         alpha = libdevice.exp(m - nm)
         p0 = libdevice.exp(s0 - nm[:, None])
         p1 = libdevice.exp(s1 - nm[:, None])
         kv, _ = _entries(RING, KVW, EXTRA, LISTS, r, n0, total, nw, lo, pos, kv_stride, e_stride, l_stride, k,
-                         WIN, LW)
+                         WIN, LW, PACKED_WIN, PACKED_EXTRA)
         o = tl.dot(p0.to(tl.bfloat16), kv, o * alpha[:, None])
         kv, _ = _entries(RING, KVW, EXTRA, LISTS, r, n1, total, nw, lo, pos, kv_stride, e_stride, l_stride, k,
-                         WIN, LW)
+                         WIN, LW, PACKED_WIN, PACKED_EXTRA)
         o = tl.dot(p1.to(tl.bfloat16), kv, o)
         l = l * alpha + (tl.sum(p0, 1) + tl.sum(p1, 1))
         m = nm
@@ -177,17 +222,25 @@ def attention(q: torch.Tensor, ring: torch.Tensor, kvw: torch.Tensor | None, pos
               anchors: torch.Tensor, extra: torch.Tensor | None, lists: torch.Tensor | None,
               counts: torch.Tensor | None, sink: torch.Tensor, out: torch.Tensor, *, prompt: bool,
               part: torch.Tensor | None = None) -> torch.Tensor:
-    """q [R, H, 512] bf16 -> out bf16 over each row's ring window, this forward's rows and its list."""
+    """q [R, H, 512] bf16 -> out bf16 over each row's ring window, this forward's rows and its list.
+
+    ``ring`` and ``kvw``: bf16 rows, or packed FP8 uint8 rows; ``extra``: bf16 rows, or packed FP4 rows per 16."""
 
     R, H, LW = q.shape
     WIN = ring.shape[0]
     has_extra = extra is not None
     W = lists.shape[1] if has_extra else 0
-    if out.shape != q.shape or ring.shape[1] != LW or sink.shape != (H,) or anchors.shape[0] < R:
-        raise ValueError(f"attention: q {tuple(q.shape)}, out {tuple(out.shape)}, ring {tuple(ring.shape)}, "
+    packed_win = ring.dtype == torch.uint8
+    packed_extra = extra.dtype == torch.uint8 if has_extra else packed_win     # no list: the ring stands in
+    win_width = quant.width(LW, quant.FP8) if packed_win else LW
+    if out.shape != q.shape or ring.shape[1] != win_width or sink.shape != (H,) or anchors.shape[0] < R or \
+            (kvw is not None and (kvw.dtype != ring.dtype or kvw.shape[-1] != win_width)):
+        raise ValueError(f"attention: q {tuple(q.shape)}, out {tuple(out.shape)}, ring {ring.dtype} "
+                         f"{tuple(ring.shape)}, kvw {None if kvw is None else (kvw.dtype, tuple(kvw.shape))}, "
                          f"sink {tuple(sink.shape)}, anchors {tuple(anchors.shape)}")
-    if has_extra and (extra.shape[1] != LW or lists.shape[0] < R or counts.shape[0] < R or lists.stride(1) != 1):
-        raise ValueError(f"attention: extra {tuple(extra.shape)}, lists {tuple(lists.shape)}, "
+    if has_extra and (extra.shape[1] != (quant.width(LW, quant.FP4_E4M3) if packed_extra else LW)
+                      or lists.shape[0] < R or counts.shape[0] < R or lists.stride(1) != 1):
+        raise ValueError(f"attention: extra {extra.dtype} {tuple(extra.shape)}, lists {tuple(lists.shape)}, "
                          f"counts {tuple(counts.shape)}")
     for name, t in (("q", q), ("out", out), ("ring", ring), ("kvw", kvw), ("extra", extra)):
         if t is not None and t.stride(-1) != 1:
@@ -197,7 +250,8 @@ def attention(q: torch.Tensor, ring: torch.Tensor, kvw: torch.Tensor | None, pos
     kvw_ = kvw if kvw is not None else ring
     extra_, lists_, counts_ = (extra, lists, counts) if has_extra else (ring, anchors, anchors)
     l_stride = lists.stride(0) if has_extra else 0
-    common = {"H": H, "LW": LW, "WIN": WIN, "SCALE": SCALE, "HAS_EXTRA": has_extra}
+    common = {"H": H, "LW": LW, "WIN": WIN, "SCALE": SCALE, "HAS_EXTRA": has_extra, "PACKED_WIN": packed_win,
+              "PACKED_EXTRA": packed_extra}
     if prompt:
         _prompt[(R, triton.cdiv(H, HB_PROMPT))](
             q, ring, kvw_, extra_, lists_, counts_, pos, anchors, sink, out, q.stride(0), q.stride(1),

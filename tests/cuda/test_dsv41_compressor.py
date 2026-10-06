@@ -20,7 +20,7 @@ import dsv41_reference as ref
 import dsv41_tiny
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import buffers, compressor, rope
+from tensorfold.families.deepseek_v41.cuda import buffers, compressor, quant, rope
 from tensorfold.families.deepseek_v41.cuda.weights import CompW, IdxW
 from tensorfold.families.glm5_next.cuda.qmm import make_b16
 
@@ -139,8 +139,10 @@ def _against_reference(cfg: Config, w: dict[str, torch.Tensor], xa: torch.Tensor
         ratio = cfg.roles[layer].ratio
         js = slice(start // ratio, (start + at) // ratio)
         assert len(r.state.comp[layer]) == js.stop
-        _t1_qdq(run.state.comp[layer][js], r.state.comp[layer][js], 16, f"layer {layer} entries")
-        _t1_qdq(run.state.index_k[layer][js], r.state.index_k[layer][js], 32, f"layer {layer} index-K")
+        entries = quant.unpack(run.state.comp[layer][js], quant.FP4_E4M3, cfg.head_dim)
+        keys = quant.unpack(run.state.index_k[layer][js], quant.FP4_E8M0, cfg.index_head_dim)
+        _t1_qdq(entries, r.state.comp[layer][js], 16, f"layer {layer} entries")
+        _t1_qdq(keys, r.state.index_k[layer][js], 32, f"layer {layer} index-K")
 
 
 def test_tiny_matches_the_reference_key_path():
@@ -239,6 +241,25 @@ def test_a_ratio_2_source_keeps_its_own_index_k_at_even_positions(tiny):
     keys = both.state.index_k[r2][:N // 2]
     assert torch.equal(keys, alone.state.index_k[r2][:N // 2])
     assert not (keys[:, None] == both.state.index_k[r1][None, :N]).all(-1).any()
+
+
+def test_stored_rows_are_the_rotated_latents_packed(tiny):
+    """A completed group's entry and index key are the packed QDQ of this forward's rotated latent and key."""
+
+    w, xa = tiny
+    run = Run(TINY, list(TINY.kv_source_layer_ids), w, rows=6)
+    run.state.set_pos(11)
+    for lw in run.layers:
+        compressor.compress(lw, xa[:6].cuda(), run.state, run.buf, run.table, TINY.rms_norm_eps)
+        st, ratio = run.state, run.state.ratio[lw.index]
+        for r in range(6):
+            q = 11 + r
+            if q % ratio == ratio - 1:
+                lat, ki = run.buf.lat[r:r + 1], run.buf.kI[r:r + 1]
+                assert torch.equal(st.comp[lw.index][q // ratio], quant.fp4_qdq_1x16_e4m3(lat, torch.empty_like(
+                    st.comp[lw.index][:1]))[0]), (lw.index, q)
+                assert torch.equal(st.index_k[lw.index][q // ratio], quant.fp4_qdq_1x32_e8m0(ki, torch.empty_like(
+                    st.index_k[lw.index][:1]))[0]), (lw.index, q)
 
 
 def _live(st) -> list[torch.Tensor]:

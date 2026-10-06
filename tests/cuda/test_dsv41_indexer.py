@@ -19,7 +19,7 @@ import dsv41_reference as ref
 
 from tensorfold.cuda.nvfp4.linear import Mx8Linear
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, indexer, mx8, quant, rope
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, buffers, indexer, mx8, quant, rope
 from tensorfold.families.deepseek_v41.cuda.weights import IdxW
 from tensorfold.families.glm5_next.cuda.qmm import make_b16
 
@@ -74,10 +74,10 @@ class Out:
         return self.cand[r, :int(self.cand_n[r])].cpu()
 
 
-def _run(q, w, k, ratio, pos, *, source=False, within=None, pos_host=None, buf_rows=None) -> Out:
+def _run(q, w, k, ratio, pos, *, source=False, within=None, pos_host=None, buf_rows=None, work=None) -> Out:
     o = Out(q.shape[0], k.shape[0], buf_rows)
     indexer.select(CFG, q, w, k, ratio, _pos(pos), o.s, o.lists, o.n, pos=pos_host,
-                   source=(o.cand, o.cand_n) if source else None, within=within)
+                   source=(o.cand, o.cand_n) if source else None, within=within, work=work)
     if not source:
         o.cand_n = o.cand_n[:0]
     return o
@@ -269,6 +269,93 @@ def test_prompt_row_blocks_and_windows_give_the_same_rows(ratio):
             if ratio == 1:
                 assert torch.equal(win.blocks(r), whole.blocks(a + r)), (a, r)
     _check_selection(whole, ratio, pos, source=ratio == 1)
+
+
+def _same_outputs(a: Out, b: Out, what) -> None:
+    assert torch.equal(a.n, b.n) and torch.equal(a.cand_n, b.cand_n), what
+    for r in range(a.lists.shape[0]):
+        assert torch.equal(a.list(r), b.list(r)), (what, r)
+        if a.cand_n.numel():
+            assert torch.equal(a.blocks(r), b.blocks(r)), (what, r)
+
+
+def _left_zero(work) -> bool:
+    return not work["hist"].any() and not work["bn"].any()
+
+
+@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize("ratio,pos", WINDOWS)
+def test_split_selection_equals_the_row_selection(ratio, pos, ties):
+    """A decode window's split selection writes the row selection's lists, blocks and counts, then reindex lists."""
+
+    q, w, k = _inputs(MAX_ROWS, (pos + MAX_ROWS) // ratio + 3, 2, ties)
+    work = buffers.split_work(MAX_ROWS, k.shape[0], BLOCKS * BLK, DEV)
+    for R in (MAX_ROWS, 1, 3):
+        rows = _run(q[:R], w[:R], k, ratio, pos, source=True)
+        split = _run(q[:R], w[:R], k, ratio, pos, source=True, work=work)
+        _same_outputs(split, rows, (R, "source"))
+        assert _left_zero(work)
+        if ratio == 1:
+            within = (rows.cand, rows.cand_n)
+            qi, wi, _ = _inputs(R, 1, 5, ties)
+            _same_outputs(_run(qi, wi, k, 1, pos, within=within, work=work), _run(qi, wi, k, 1, pos, within=within),
+                          (R, "within"))
+    _check_selection(split, ratio, pos, source=True)
+
+
+def test_split_selection_of_signed_zeros_equal_scores_and_negatives():
+    g = torch.Generator().manual_seed(3)
+    vis = 40000
+    rows = torch.zeros((5, vis))
+    rows[0] = torch.where(torch.rand(vis, generator=g) < 0.5, -0.0, 0.0)
+    rows[1] = torch.randint(-2, 3, (vis,), generator=g).float() * 0.5
+    rows[2] = torch.where(torch.rand(vis, generator=g) < 0.97, -0.0, 1.0)
+    rows[3] = -torch.rand(vis, generator=g)
+    rows[4] = torch.where(torch.rand(vis, generator=g) < 0.5, -math.inf, torch.rand(vis, generator=g))
+    s = rows.to(DEV)
+    work = buffers.split_work(5, vis, BLOCKS * BLK, DEV)
+    for ratio, pos in ((1, vis - 5), (1, 600), (1, 16385), (2, 2 * vis - 10), (1, 0)):
+        outs = []
+        for wk in (None, work):
+            lists = torch.full((5, K), -7, dtype=torch.int32, device=DEV)
+            n = torch.full((5,), -7, dtype=torch.int32, device=DEV)
+            cand = torch.full((5, BLOCKS), -7, dtype=torch.int32, device=DEV)
+            cand_n = torch.full((5,), -7, dtype=torch.int32, device=DEV)
+            indexer.topk(s, ratio, _pos(pos), lists, n, work=wk)
+            indexer.candidates(s, ratio, _pos(pos), cand, cand_n, block=BLK, work=wk)
+            outs.append((lists, n, cand, cand_n))
+        for x, y in zip(*outs):
+            assert torch.equal(x, y), pos
+        assert _left_zero(work)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_graph_replays_of_the_selection_equal_eager(split):
+    _, _, k = _inputs(1, 20000, 13)
+    q, w, _ = _inputs(MAX_ROWS, 1, 14)
+    pos = _pos(17000)
+    work = buffers.split_work(MAX_ROWS, k.shape[0], BLOCKS * BLK, DEV) if split else None
+    src = Out(MAX_ROWS, k.shape[0])
+
+    def step():
+        indexer.select(CFG, q, w, k, 1, pos, src.s, src.lists, src.n, source=(src.cand, src.cand_n), work=work)
+
+    step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    for p, seed in ((16380, 15), (19990, 16), (300, 17), (19990, 18)):
+        nq, nw, _ = _inputs(MAX_ROWS, 1, seed)
+        q.copy_(nq)
+        w.copy_(nw)
+        pos.fill_(p)
+        graph.replay()
+        got = [t.clone() for t in (src.lists, src.n, src.cand, src.cand_n)]
+        want = _run(q, w, k, 1, p, source=True)
+        _same_outputs(src, want, p)
+        step()
+        assert all(torch.equal(a, b) for a, b in zip(got, (src.lists, src.n, src.cand, src.cand_n))), p
 
 
 def _idx_weights(seed: int) -> IdxW:
