@@ -13,10 +13,14 @@ from typing import NamedTuple
 
 import numpy as np
 import pytest
+from dsv41_inventory import inventory
 
 from tensorfold.families.deepseek_v41 import engram_table
+from tensorfold.families.deepseek_v41.config import Config
 from tensorfold.families.deepseek_v41.cuda import split
-from tensorfold.families.deepseek_v41.engram_table import Layout, Reader, Table, rank_rows
+from tensorfold.families.deepseek_v41.engram_table import Layout, Reader, Table, rank_rows, scale_rows
+
+FIXTURE = Path(__file__).parent / "fixtures" / "deepseek_v41" / "config.json"
 
 
 class Range(NamedTuple):
@@ -315,6 +319,24 @@ def test_resident_scale_rows_are_counted_for_admission():
         assert sum(size for size, _ in sizes) == want and all(mapped == 0 for _, mapped in sizes)
         assert 2.86 < want / 2**30 < 2.87
     assert all(split.weights_estimate(name, info) == (0, 0) for name, info in infos.items())
+
+
+@pytest.mark.parametrize("layers", [None, 15, 8])
+def test_admission_counts_the_scale_rows_the_loader_keeps(layers):
+    """The engine's transform counts each rank's scale rows of exactly the tables ``loader.load`` keeps for a run of
+    ``layers`` (``scale_rows``), once: in no layer's staging, and the weight bytes nowhere."""
+
+    cfg = Config.read(FIXTURE.parent, layers)
+    names = {name: info for name, info in inventory(json.loads(FIXTURE.read_text())).items()
+             if split.rule(name) == "engram"}
+    assert sorted(scale_rows(cfg, 0, 2)) == [layer for layer in (1, 14) if layer < (layers or 43)]
+    for rank in (0, 1):
+        transform = split.rank_estimate(cfg, rank, dspark=True)
+        sizes = {name: transform(name, info) for name, info in names.items()}
+        assert all(mapped == staged == 0 for _, mapped, staged in sizes.values())
+        assert {name: size for name, (size, _, _) in sizes.items() if size} == {
+            f"layers.{layer}.engram.embed.scale": (hi - lo) * cfg.engram_head_dim // 32
+            for layer, (lo, hi) in scale_rows(cfg, rank, 2).items()}
 
 
 def test_weight_bytes_alone_skip_the_scale_reads(pack, monkeypatch):

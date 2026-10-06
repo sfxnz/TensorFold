@@ -24,6 +24,7 @@ CFG = Config.read(FIXTURE.parent)
 GIB = capacity.GIB
 NATIVE = 1 << 20
 BUDGET = int(103.8 * GIB)       # an idle GB10's MemAvailable less the admission reserve
+SCALE_ROWS = (3_072_070_048, 3_072_112_752)     # each rank's resident Engram scale rows
 
 
 class Allocation:
@@ -101,14 +102,15 @@ def test_minimum_slots_and_reserve():
     assert g.needed(65538) == g.bytes_at(65544)
 
 
-@pytest.fixture
-def weights(monkeypatch) -> capacity.Weights:
-    """split.weights_estimate over every header the pack holds, read from a synthetic header dict."""
+@pytest.fixture(params=[0, 1])
+def weights(request, monkeypatch) -> capacity.Weights:
+    """The engine's admission transform over every header the pack holds, read from a synthetic header dict."""
 
     names = inventory(json.loads(FIXTURE.read_text()))
     monkeypatch.setattr(capacity, "headers", lambda model_dir, **kw: names)
-    found = capacity.estimate_weights(Path("unused"), split.weights_estimate)
-    assert found.resident == RESIDENT and found.mapped == 0
+    found = capacity.estimate_weights(Path("unused"), split.rank_estimate(CFG, request.param, dspark=True))
+    assert found.resident == RESIDENT + SCALE_ROWS[request.param] and found.mapped == 0
+    assert found.staging == capacity.estimate_weights(Path("unused"), split.weights_estimate).staging   # rows: none
     return found
 
 
@@ -121,7 +123,7 @@ def test_default_context_is_the_native_window(weights):
     assert receipt["cache_slots"] == NATIVE + MAX_ROWS
     kept = geometry.kept_bytes(receipt, geometry.cache_wanted({}))
     assert kept == 3 * GIB                                                  # the window leaves the whole arena
-    assert receipt["total_bytes_estimate"] + kept < 83 * GIB
+    assert receipt["total_bytes_estimate"] + kept < 85 * GIB
 
 
 def test_explicit_context_past_the_fit_is_refused_with_the_fitting_size(weights):
@@ -130,7 +132,7 @@ def test_explicit_context_past_the_fit_is_refused_with_the_fitting_size(weights)
     g = geometry.dsv41_geometry(CFG, 2)
     loading = weights.resident + weights.staging
     assert capacity.make_plan(NATIVE, NATIVE, True, loading, weights, g).fitting == NATIVE
-    budget, wanted = 79 * GIB, 1 << 24
+    budget, wanted = 82 * GIB, 1 << 24
     plan = capacity.make_plan(wanted, wanted, True, budget, weights, g)
     assert NATIVE < plan.fitting < wanted
     assert weights.resident + g.needed(plan.fitting) <= budget

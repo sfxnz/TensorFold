@@ -121,19 +121,22 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
 
 def estimate_weights(model_dir: str | Path, transform: Callable, *, rank: int | None = None,
                      files: list[Path] | None = None) -> Weights:
+    """``transform(name, info)``: (device bytes, mapped bytes), or a third value when its layer's load stages less."""
+
     layers: dict[str, int] = {}
     resident = mapped = largest = 0
     for name, info in headers(model_dir, rank=rank, files=files).items():
-        size, host = transform(name, info)
+        size, host, *held = transform(name, info)
         size, host = int(size), int(host)
-        if min(size, host) < 0:
+        staged = int(held[0]) if held else size
+        if min(size, host, staged) < 0:
             raise ValueError("negative startup weight estimate")
         resident += size
         mapped += host
-        largest = max(largest, size)
+        largest = max(largest, staged)
         match = re.search(r"(?:layers|blocks)\.(\d+)\.", name)
         group = match.group(1) if match else name
-        layers[group] = layers.get(group, 0) + size
+        layers[group] = layers.get(group, 0) + staged
     # CPU expert lists/stack, GPU uploads and tiled outputs can coexist during one layer load.
     staging = 3 * max([largest, *layers.values()], default=0)
     return Weights(resident, staging, mapped)

@@ -26,8 +26,7 @@ from tensorfold.cuda.nvfp4 import experts as nvfp4
 from tensorfold.families.deepseek_v41.config import Config
 from tensorfold.families.deepseek_v41.cuda import loader, rope, split
 from tensorfold.families.deepseek_v41.cuda.geometry import rope_bytes
-from tensorfold.families.deepseek_v41.engram_hash import buckets
-from tensorfold.families.deepseek_v41.engram_table import rank_rows
+from tensorfold.families.deepseek_v41.engram_table import scale_rows
 
 tiny_dir = dsv41_tiny.tiny_dir          # the session fixture
 MODEL = os.environ.get("TF_DSV41_MODEL", "")
@@ -175,12 +174,6 @@ def _check_block(lw, index: int, p: str, layer: int | None, src: Source, cfg: Co
         _check_exl3(m.experts, f, src, cfg)
 
 
-def _engram_rows(cfg: Config, rank: int, world: int) -> dict[int, tuple[int, int]]:
-    """Each Engram layer's rows of the rank's hash columns."""
-
-    return {layer: rank_rows(b, rank, world) for layer, b in zip(cfg.engram_layer_ids, buckets(cfg).tolist())}
-
-
 def _engram_tables(model_dir: Path) -> list[tuple[Path, int, int]]:
     """(file, first byte, end byte) of every Engram table's weight bytes."""
 
@@ -228,7 +221,7 @@ def test_every_object_holds_its_source_slice(linked, tiny_dir, reads, world, ran
     assert used - src.seen == set(), "every loaded tensor compared"
     assert reads and not [(f, a, n) for f, a, n in reads for g, lo, hi in _engram_tables(tiny_dir)
                           if f == g and a < hi and lo < a + n], "Engram weight bytes are never read"
-    rows = _engram_rows(cfg, rank, world)
+    rows = scale_rows(cfg, rank, world)
     want = torch.cat([src.pack.tensor(f"layers.{layer}.engram.embed.scale").view(torch.uint8)[lo:hi]
                       for layer, (lo, hi) in rows.items()])
     _eq(w.engram_scales.rows, want, "resident Engram scale rows")
@@ -251,23 +244,24 @@ def test_a_layer_subset_without_dspark(linked, tiny_dir):
         loader.load(linked, cfg, 2, 2, None, capacity=CAP)
 
 
-def _estimate(model_dir: str, layers, world: int = 2) -> tuple[int, int]:
-    """split.weights_estimate's resident bytes of the loaded groups (with every table's resident scale rows when an
-    Engram layer is among them) and capacity's staging over them (3x the largest tensor or layer)."""
+def _estimate(model_dir: str, layers) -> tuple[int, int]:
+    """The engine's admission transform over the loaded groups (with every table's resident scale rows when an Engram
+    layer is among them) and capacity's staging over them (3x the largest staged tensor or layer)."""
 
     cfg = Config.read(model_dir)
+    transform = split.rank_estimate(cfg, 0, dspark=True)
     engram = any(cfg.roles[i].engram for i in layers)
-    rows = {layer: hi - lo for layer, (lo, hi) in _engram_rows(cfg, 0, world).items()} if engram else None
     total, groups, largest = 0, {}, 0
     for name, info in capacity.headers(model_dir).items():
         m = re.match(r"layers\.(\d+)\.", name)
-        if m and int(m[1]) not in layers and split.rule(name) != "engram":
+        table = split.rule(name) == "engram"
+        if (table and not engram) or (m and int(m[1]) not in layers and not table):
             continue
-        size, mapped = split.weights_estimate(name, info, world, engram_rows=rows)
+        size, mapped, staged = transform(name, info)
         assert mapped == 0
-        total, largest = total + size, max(largest, size)
+        total, largest = total + size, max(largest, staged)
         key = m[1] if m else name
-        groups[key] = groups.get(key, 0) + size
+        groups[key] = groups.get(key, 0) + staged
     return total, 3 * max(largest, *groups.values())
 
 

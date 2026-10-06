@@ -17,14 +17,14 @@ from tensorfold.families.glm5_next.cuda.qmm import make_b16
 from tensorfold.families.glm5_next.cuda.split import GAP, READERS, RUN
 
 from ..config import Config
-from ..engram_hash import buckets
-from ..engram_table import rank_rows
+from ..engram_table import scale_rows
 from . import MAX_ROWS, mx8, rope, split
 from .convert import fp8_block_rows, make_experts4
 from .weights import HCW, AttnW, CompW, DSparkW, EngramScales, EngramW, IdxW, LayerW, MoEW, StageW, Weights
 
 SLOT = 256                                    # alignment of each expert trellis inside its layer's buffer
 PIECE = 64 << 20                              # most bytes of one read of a run of rows (Engram scales)
+AHEAD = 4                                     # pieces read ahead of the one copied, so few are staged at once
 _DTYPES = {**DTYPES, "F8_E8M0": torch.uint8}  # E8M0 stays raw bytes, never read through a float type
 _GROUP = re.compile(r"^(layers|mtp)\.(\d+)\.")
 
@@ -216,10 +216,13 @@ class _Build:
     def engram_scales(self, parts: list[tuple[int, int, list[str]]]) -> EngramScales:
         """Each Engram layer's (first row, end row, piece keys) of the rank's scale rows, in one tensor in turn."""
 
-        out, at, shift = None, 0, []
+        order = [key for *_, keys in parts for key in keys]
+        out, at, shift, n = None, 0, [], 0
         for lo, hi, keys in parts:
             shift.append(at - lo)
             for key in keys:
+                n += 1
+                self.pack.queue(order[n:n + AHEAD])
                 piece = self.t(key)
                 if out is None:
                     out = torch.empty((sum(hi - lo for lo, hi, _ in parts), piece.shape[1]), dtype=piece.dtype,
@@ -263,11 +266,10 @@ def load(model_dir: str | Path, cfg: Config, rank: int, world: int, comm, layers
               lambda: (b.t("norm.weight"), Mx8Linear.from_checkpoint(b.t("lm_head.weight"),
                                                                      b.t("lm_head.weight_scale"))))]
     scales = []
-    if any(cfg.roles[i].engram for i in ids):       # every table's rows are staged, whichever layers are loaded
-        for layer, sizes in zip(cfg.engram_layer_ids, buckets(cfg).tolist()):
-            lo, hi = rank_rows(sizes, rank, world)
+    if any(cfg.roles[i].engram for i in ids):       # every table's rows are kept, whichever layers are loaded
+        for layer, (lo, hi) in scale_rows(cfg, rank, world).items():
             scales.append((lo, hi, pack.rows(f"layers.{layer}.engram.embed.scale", lo, hi)))
-        plan += [([k for *_, keys in scales for k in keys], lambda: b.engram_scales(scales))]
+        plan += [([k for *_, keys in scales for k in keys][:AHEAD], lambda: b.engram_scales(scales))]
     plan += [(pack.names(f"mtp.{s}."), lambda s=s: b.stage(s)) for s in stages]
     built = []
     try:

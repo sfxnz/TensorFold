@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from tensorfold.cuda.capacity import itemsize
+
+from ..config import Config
+from ..engram_table import scale_rows
 
 _BLOCK = r"^(?:layers|mtp)\.\d+\."                  # a backbone layer or a DSpark stage
 _EXL3 = r"^layers\.\d+\.ffn\.experts\.\d+\."        # the backbone's routed experts (EXL3 trellises)
@@ -103,3 +106,22 @@ def weights_estimate(name: str, info: dict, world: int = 2,
     if name.endswith(FP32):
         return 4 * n, 0
     return n * itemsize(info, name), 0
+
+
+def rank_estimate(cfg: Config, rank: int, dspark: bool) -> Callable[[str, dict], tuple[int, int, int]]:
+    """The engine's admission transform: each tensor's (device, mapped, staged) bytes as ``loader.load`` loads ``cfg``
+    on ``rank`` of two, DSpark only when ``dspark``, nothing past ``cfg``'s layers.
+
+    The resident Engram scale rows stage nothing in their layer: they load in a step of their own, a few pieces at a time.
+    """
+
+    rows = {layer: hi - lo for layer, (lo, hi) in scale_rows(cfg, rank, 2).items()}
+
+    def transform(name: str, info: dict) -> tuple[int, int, int]:
+        parts = name.split(".")
+        if (parts[0] == "mtp" and not dspark) or (parts[0] == "layers" and int(parts[1]) >= cfg.num_hidden_layers):
+            return 0, 0, 0
+        size, mapped = weights_estimate(name, info, engram_rows=rows)
+        return size, mapped, 0 if rule(name) == "engram" else size
+
+    return transform

@@ -16,6 +16,9 @@ import numpy as np
 
 from tensorfold.families.qwen4_exp.ssd_table import _fill, _no_cache
 
+from . import engram_hash
+from .config import Config
+
 WORKERS = 32                # reads in flight at once: os.pread releases the GIL
 PAGE = 4096
 _DTYPES = {"weight": "F8_E4M3", "scale": "F8_E8M0"}
@@ -73,6 +76,13 @@ def rank_rows(buckets: Sequence[int], rank: int, world: int) -> tuple[int, int]:
         raise ValueError(f"rank {rank} of {world} cannot take an even share of {len(buckets)} hash columns")
     lo = int(sum(buckets[:rank * per]))
     return lo, lo + int(sum(buckets[rank * per:(rank + 1) * per]))
+
+
+def scale_rows(cfg: Config, rank: int, world: int) -> dict[int, tuple[int, int]]:
+    """By Engram layer of ``cfg``, the rows [lo, hi) whose scale bytes rank ``rank`` keeps resident."""
+
+    tables = zip(cfg.engram_layer_ids, engram_hash.buckets(cfg).tolist())
+    return {layer: rank_rows(sizes, rank, world) for layer, sizes in tables}
 
 
 def _header(path: Path) -> tuple[bytes, int, int]:

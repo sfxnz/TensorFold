@@ -30,8 +30,6 @@ class DeepSeekV41Engine:
         from tensorfold.cuda.comm import open_comm
 
         from ..config import Config
-        from ..engram_hash import buckets
-        from ..engram_table import rank_rows
         from . import MAX_ROWS, PREFILL_ROWS, RING, loader, split
         from .cache import Kept, entries_wanted
         from .decode import Engine
@@ -48,20 +46,9 @@ class DeepSeekV41Engine:
         self.bell = protocol.Bell(getattr(self.comm, "store", None))
         cfg = Config.read(model_dir, layers)
         dspark = self.policy[0] > 0 and not self.serial_only
-        engram_rows = {layer: hi - lo for layer, (lo, hi) in
-                       zip(cfg.engram_layer_ids, (rank_rows(b, rank, 2) for b in buckets(cfg).tolist()))}
-
-        def transform(name: str, info: dict) -> tuple[int, int]:
-            """The split's per-rank bytes, without DSpark when it stays unloaded and the layers past ``layers``."""
-
-            parts = name.split(".")
-            if (parts[0] == "mtp" and not dspark) or (parts[0] == "layers" and int(parts[1]) >= cfg.num_hidden_layers):
-                return 0, 0
-            return split.weights_estimate(name, info, engram_rows=engram_rows)
-
         explicit = context is not None if context_explicit is None else bool(context_explicit)
-        plan = admit(model_dir, context, explicit, torch, lambda text: dsv41_geometry(cfg, 2), transform,
-                     rank=rank, world=2, gather=self._gather_ints)
+        plan = admit(model_dir, context, explicit, torch, lambda text: dsv41_geometry(cfg, 2),
+                     split.rank_estimate(cfg, rank, dspark), rank=rank, world=2, gather=self._gather_ints)
         self.capacity_plan, self.limit = plan, plan["context_window"]
         capacity = plan["cache_slots"]
         hasher = reader = None
