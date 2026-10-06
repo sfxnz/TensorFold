@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+from pathlib import Path
+
 import numpy as np
 import torch
 import triton
@@ -11,42 +14,97 @@ from triton.language.extra import libdevice
 from tensorfold.cuda.comm import fast_gather
 from tensorfold.cuda.nvfp4.linear import Mx8Linear
 
+from ..engram_table import WORKERS
 from . import mx8
+from .weights import EngramScales
 
 CLAMP = 1e-6            # M:341: the gate's floor on |dot| before its square root
 
 
-def stage_rows(ids: np.ndarray, reader, host: torch.Tensor, done: torch.cuda.Event, eraw: torch.Tensor) -> int:
-    """Rows ``ids`` [R, layers, columns] from the files into ``eraw`` through pinned half ``host`` -> R."""
+@lru_cache(maxsize=1)
+def _io():
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_dsv41_engram_io", sources=[str(here / "engram_io.cpp")], extra_cflags=["-O2"],
+                verbose=False)
+
+
+def read_pool(threads: int = WORKERS):
+    """The native pread pool ``engram_table.Reader`` takes: ``threads`` threads, the caller's one of them."""
+
+    return _io().Pool(threads)
+
+
+def resident(ids: np.ndarray, scales: EngramScales) -> np.ndarray:
+    """Layer-local row ids [..., layers, columns] -> int64 their rows in ``scales.rows``."""
+
+    at = np.asarray(ids, dtype=np.int64) + np.asarray(scales.shift, dtype=np.int64)[:, None]
+    if at.size and (at.min() < 0 or at.max() >= scales.rows.shape[0]):
+        raise ValueError("Engram row ids outside this rank's resident hash columns")
+    return at
+
+
+def fill_rows(ids: np.ndarray, reader, rec: np.ndarray, scales: EngramScales | None = None,
+              idx: np.ndarray | None = None) -> None:
+    """Layer-local ids [n, layers, columns] -> file records u8 [n * layers * columns, W + S] in ``rec``; with
+    ``scales`` the records' scale bytes are left as they are and each row's place in ``scales.rows`` goes to
+    ``idx`` (int64 [n * layers * columns])."""
+
+    starts = np.asarray(reader.layout.starts[:ids.shape[1]], dtype=np.int64)[:, None]
+    flat = (ids.astype(np.int64) + starts).reshape(-1)
+    if scales is None:
+        reader.gather(flat, rec[:, :reader.wrow], rec[:, reader.wrow:])
+    else:
+        idx[:] = resident(ids, scales).reshape(-1)
+        reader.gather(flat, rec[:, :reader.wrow])
+
+
+def stage_rows(ids: np.ndarray, reader, host: torch.Tensor, done: torch.cuda.Event, eraw: torch.Tensor, *,
+               scales: EngramScales | None = None, idx_host: torch.Tensor | None = None,
+               idx: torch.Tensor | None = None, first: int = 0) -> int:
+    """Rows ``ids`` [n, layers, columns] from the files into rows first..R = first + n of ``eraw`` through pinned half
+    ``host`` -> R; with ``scales``, their places in ``scales.rows`` into ``idx`` through ``idx_host``. Rows before
+    ``first`` are in the half already (``fill_rows`` after its copy's event ``done``)."""
 
     ids = np.asarray(ids)
-    if ids.ndim != 3 or ids.shape[1:] != tuple(host.shape[1:3]) or ids.shape[0] > min(host.shape[0], eraw.shape[0]):
-        raise ValueError(f"Engram ids {ids.shape} do not fit staging {tuple(host.shape)} -> {tuple(eraw.shape)}")
-    R, layers = ids.shape[0], ids.shape[1]
-    starts = np.asarray(reader.layout.starts[:layers], dtype=np.int64)
-    flat = (ids.astype(np.int64) + starts[None, :, None]).reshape(-1)
+    R = first + ids.shape[0]
+    if ids.ndim != 3 or ids.shape[1:] != tuple(host.shape[1:3]) or R > min(host.shape[0], eraw.shape[0]):
+        raise ValueError(f"Engram ids {ids.shape} from row {first} do not fit staging {tuple(host.shape)} -> "
+                         f"{tuple(eraw.shape)}")
+    per = ids.shape[1] * ids.shape[2]
     done.synchronize()
-    rec = host.numpy().reshape(-1, host.shape[-1])[:flat.size]
-    reader.gather(flat, rec[:, :reader.wrow], rec[:, reader.wrow:])
+    if first < R:
+        rec = host.numpy().reshape(-1, host.shape[-1])[first * per:R * per]
+        fill_rows(ids, reader, rec, scales, idx_host.numpy().reshape(-1)[first * per:R * per] if scales is not None
+                  else None)
     eraw[:R].copy_(host[:R], non_blocking=True)
+    if scales is not None:
+        idx[:R].copy_(idx_host[:R], non_blocking=True)
     done.record()
     return R
 
 
 @triton.jit
-def _dequant(RAW, OUT, W: tl.constexpr, S: tl.constexpr):
-    """One file row: W e4m3 bytes then S E8M0 bytes -> bf16(e4m3 * 2^(e - 127)) per 32 (0xFF NaN, 0 the subnormal)."""
+def _dequant(RAW, OUT, SCALES, IDX, W: tl.constexpr, S: tl.constexpr, RESIDENT: tl.constexpr):
+    """One file row: W e4m3 bytes then S E8M0 bytes (``RESIDENT``: row IDX[p] of SCALES) -> bf16(e4m3 * 2^(e - 127))
+    per 32 (0xFF NaN, 0 the subnormal)."""
 
     p = tl.program_id(0).to(tl.int64)
     j = tl.arange(0, W)
     v = tl.load(RAW + p * (W + S) + j).to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    e = tl.load(RAW + p * (W + S) + W + j // (W // S)).to(tl.int32)
+    if RESIDENT:
+        e = tl.load(SCALES + tl.load(IDX + p) * S + j // (W // S)).to(tl.int32)
+    else:
+        e = tl.load(RAW + p * (W + S) + W + j // (W // S)).to(tl.int32)
     s = tl.where(e == 0, 1 << 22, tl.where(e == 255, 0x7FC00000, e << 23)).to(tl.float32, bitcast=True)
     tl.store(OUT + p * W + j, (v * s).to(tl.bfloat16))
 
 
-def dequant_rows(eraw: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """Dequant: u8 [R, layers, columns, W + W/32] -> out bf16 [R, layers, columns * W], exactly M:312-320's rows."""
+def dequant_rows(eraw: torch.Tensor, out: torch.Tensor, scales: EngramScales | None = None,
+                 idx: torch.Tensor | None = None) -> torch.Tensor:
+    """Dequant: u8 [R, layers, columns, W + W/32] -> out bf16 [R, layers, columns * W], exactly M:312-320's rows; with
+    ``scales`` each row's scale bytes are row ``idx`` (int64 [R, layers, columns]) of ``scales.rows``."""
 
     R, layers, cols, width = eraw.shape
     w = width * 32 // 33
@@ -54,8 +112,13 @@ def dequant_rows(eraw: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"dequant_rows: eraw u8 [R, layers, columns, W + W/32], not {eraw.dtype} {tuple(eraw.shape)}")
     if out.dtype != torch.bfloat16 or not out.is_contiguous() or tuple(out.shape) != (R, layers, cols * w):
         raise ValueError(f"dequant_rows: out bf16 [{R}, {layers}, {cols * w}], not {out.dtype} {tuple(out.shape)}")
+    if scales is not None and (idx is None or idx.dtype != torch.int64 or not idx.is_contiguous()
+                               or tuple(idx.shape) != (R, layers, cols) or tuple(scales.rows.shape[1:]) != (w // 32,)):
+        raise ValueError(f"dequant_rows: resident scales need idx int64 [{R}, {layers}, {cols}] into u8 [n, {w // 32}]")
     if R:
-        _dequant[(R * layers * cols,)](eraw, out, W=w, S=w // 32, num_warps=2)
+        resident = scales is not None
+        _dequant[(R * layers * cols,)](eraw, out, scales.rows if resident else eraw, idx if resident else eraw, W=w,
+                                       S=w // 32, RESIDENT=resident, num_warps=2)
     return out
 
 

@@ -101,7 +101,8 @@ def _expected(rows: int, capacity: int, prefill: bool) -> dict:
         "mlog": ((rows, 384), F32), "pick": ((rows, 6), I32), "wts": ((rows, 6), F32),
         "sgu": ((rows, 2304), BF), "sact": ((rows, 1152), BF), "sd": ((rows, 5120), F32),
         "part": ((rows, 5120), F32), "gath": ((2, rows, 5120), F32),
-        "eraw": ((rows, 2, 12, 264), U8), "eloc": ((rows, 2, 3072), BF), "egat": ((2, rows, 2, 3072), BF),
+        "eraw": ((rows, 2, 12, 264), U8), "eidx": ((rows, 2, 12), torch.int64), "eloc": ((rows, 2, 3072), BF),
+        "egat": ((2, rows, 2, 3072), BF),
         "eng": ((rows, 2, 6144), BF), "ekv": ((rows, 12800), BF), "ekv_gat": ((2, rows, 12800), BF),
         "taps": ((taps, 3, 5120), BF), "hidden": ((rows, 5120), BF), "fnormed": ((rows, 5120), BF),
         "logits": ((1 if prefill else rows, 64640), F32), "mx": ((taps, 5120), BF), "mx_gat": ((2, taps, 2560), BF),
@@ -134,7 +135,7 @@ def test_buffer_shapes(rows, prefill, capacity):
             "hist": ((rows, 2048), I32), "bn": ((rows,), I32), "bkey": ((rows, capacity), I32),
             "bitem": ((rows, capacity), I32), "counts": ((rows, 3, -(-max(capacity, 16384) // 1024)), I32),
             "thr": ((rows, 2), I32)}
-    assert b.ids_host is None and b.staged is None and b.eraw_host == [] and b.eraw_done == []   # meta: no pinning
+    assert b.ids_host is None and b.staged is None and b.eraw_host == b.eraw_done == b.eidx_host == []  # no pinning
 
 
 @pytest.mark.parametrize("capacity", CAPACITIES)
@@ -177,5 +178,5 @@ def test_reduced_layer_set():
 def test_weights_fields():
     assert [f.name for f in dataclasses.fields(weights.Weights)] == [
         "cfg", "rank", "world", "comm", "device", "vocab_offset", "embed", "layers", "norm", "head", "dspark",
-        "engram", "rope"]
+        "engram", "rope", "engram_scales"]
     assert issubclass(weights.StageW, weights.LayerW)

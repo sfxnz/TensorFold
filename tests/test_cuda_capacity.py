@@ -358,6 +358,22 @@ def test_fp8_block_scales_are_sized(tmp_path):
     assert capacity.SIZES["F8_E4M3"] == capacity.SIZES["F8_E5M2"] == 1
 
 
+def test_bytes_loaded_outside_their_layer_are_resident_but_not_staged(tmp_path):
+    """A transform's third value replaces a tensor's bytes in its layer's staging group; resident keeps them."""
+
+    from tensorfold.cuda import capacity
+
+    checkpoint(tmp_path, {}, [("layers.0.w", "U8", [4, 1024], 4096), ("layers.0.table", "U8", [16, 1024], 16384),
+                              ("layers.1.w", "U8", [6, 1024], 6144)])
+    plain = capacity.estimate_weights(tmp_path, lambda name, info: (math.prod(info["shape"]), 0))
+    apart = capacity.estimate_weights(
+        tmp_path, lambda name, info: (math.prod(info["shape"]), 0, *((0,) if name.endswith("table") else ())))
+    assert plain == capacity.Weights(26624, 3 * 20480, 0)
+    assert apart == capacity.Weights(26624, 3 * 6144, 0)
+    with pytest.raises(ValueError, match="negative"):
+        capacity.estimate_weights(tmp_path, lambda name, info: (1, 0, -1))
+
+
 def test_an_unsizable_dtype_names_its_tensor_in_the_operators_message(tmp_path, monkeypatch):
     """A dtype the estimate cannot size must say which tensor carried it, and that has to survive ``admit``,
     whose message is what the operator reads when a rank cannot read its checkpoint."""

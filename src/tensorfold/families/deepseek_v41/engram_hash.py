@@ -96,6 +96,14 @@ def multipliers(layer_ids: tuple[int, ...], max_ngram: int, compressed: int) -> 
     return np.array(rows, dtype=np.int64).reshape(len(layer_ids), max_ngram)
 
 
+def buckets(cfg: Config) -> np.ndarray:
+    """int64 [layers, columns]: the rows of each Engram table's hash columns (their primes), in column order."""
+
+    layers = tuple(cfg.engram_layer_ids)
+    found = primes(layers, cfg.engram_vocab_size, cfg.engram_n_heads, cfg.engram_max_ngram_size)
+    return found.reshape(len(layers), (cfg.engram_max_ngram_size - 1) * cfg.engram_n_heads)
+
+
 class Hasher:
     """Row ids of the n-grams ending at each position, per Engram layer: column ``(n - 2) * heads + head``."""
 

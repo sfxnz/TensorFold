@@ -121,7 +121,7 @@ class Buffers:
                  device: torch.device | str = "cuda") -> None:
         dev = torch.device(device)
         host = dev.type == "cuda"        # pinned staging and events exist for a real device only
-        bf, f32, i32, u8 = torch.bfloat16, torch.float32, torch.int32, torch.uint8
+        bf, f32, i32, i64, u8 = torch.bfloat16, torch.float32, torch.int32, torch.int64, torch.uint8
         D, S, hd = cfg.hidden_size, cfg.hc_mult, cfg.head_dim
         HL = cfg.num_attention_heads // world
         V = cfg.vocab_size // world
@@ -183,6 +183,8 @@ class Buffers:
         halves = 2 if prefill else 1     # a prompt reads chunk i + 1 into one half while chunk i's half copies
         self.eraw_host = [torch.zeros(raw, dtype=u8, pin_memory=True) for _ in range(halves)] if host else []
         self.eraw_done = [torch.cuda.Event() for _ in range(halves)] if host else []   # each half's last H2D
+        self.eidx = t(raw[:3], i64)               # each row's place among the rank's resident scale rows
+        self.eidx_host = [torch.zeros(raw[:3], dtype=i64, pin_memory=True) for _ in self.eraw_done]
         width = cols * cfg.engram_head_dim
         self.eloc = t((rows, n_eng, width), bf)
         self.egat = t((world, rows, n_eng, width), bf)

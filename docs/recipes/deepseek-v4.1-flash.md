@@ -18,7 +18,8 @@ The command prints the snapshot directory, `MODEL_DIR` below: 48 shards, 357,486
 `tensorfold pull` takes the repository's `main`, which holds only the model card, so name the revision. Both
 machines need the whole revision on local disk, shards 47 and 48 included: they hold the two Engram tables
 (94.6 GiB each), and each rank reads its own half of every row (hash columns 0-11 on rank 0, 12-23 on rank 1)
-from its own disk with `pread`, through the page cache. Engram rows never cross the link and are never resident.
+from its own disk with `pread`, through the page cache. Engram rows never cross the link. The rows' weight bytes
+are never resident; each rank keeps the scale bytes of its half on the GPU (2.86 GiB).
 
 ## Serve
 
@@ -52,17 +53,17 @@ ranks the same values.
 
 ## Memory
 
-A rank holds 73.2 GiB of weights: its half of the routed experts (TP over each expert's intermediate dim, 1,152 a
-rank), of the attention heads (32), of the shared expert, of the LM head's vocabulary and of DSpark; the embedding
-and the indexers are whole on both. The caches hold the model's FP8 and FP4 codes with their scales, 890 bytes a
+A rank holds 76.1 GiB of weights: its half of the routed experts (TP over each expert's intermediate dim, 1,152 a
+rank), of the attention heads (32), of the shared expert, of the LM head's vocabulary and of DSpark, and the scale
+bytes of its half of the Engram rows; the embedding and the indexers are whole on both. The caches hold the model's FP8 and FP4 codes with their scales, 890 bytes a
 token. The caches, the RoPE tables and a prompt chunk's and a decode window's scratch are sized at startup for the
 window and allocated once, as are the kept-prompt arena and every transient the kernels take (a warm-up prompt and
 decode rounds run before serving), so serving allocates no device memory.
 
 | Window | Startup line, rank 0 (rank 1 alike) | `free -h` available after a request, rank 0 / rank 1 |
 | --- | --- | --- |
-| 65,538 | `startup estimate 78.46 GiB within 99.59 GiB; ... allocated prompt/reply window 65538` | 28 / 31 GiB |
-| default | `startup estimate 78.46 GiB within 100.11 GiB; native 1048576, allocated prompt/reply window 1048576` | 27 / 29 GiB |
+| 65,538 | `startup estimate 81.32 GiB within 99.96 GiB; ... allocated prompt/reply window 65538` | 26 / 28 GiB |
+| default | `startup estimate 81.32 GiB within 99.90 GiB; native 1048576, allocated prompt/reply window 1048576` | 24 / 26 GiB |
 
 The Engram reads fill the page cache, which admission counts as available. Across a cold 64k prompt and three
 resumes of it, `torch.cuda.memory_reserved` stayed at 80.7 GiB on rank 0.
