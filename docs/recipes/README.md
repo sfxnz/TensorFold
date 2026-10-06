@@ -22,7 +22,7 @@ Quoted from the family pages, not measured per card.
 | --- | --- |
 | CUDA, other families | Compute capability 8.9 or newer: Ada RTX 40, Hopper, and Blackwell cards (RTX 50, RTX PRO 6000, DGX Spark GB10). RTX 30 (8.6) is not supported yet. |
 | Flash Next, CUDA | sm_120 and sm_121 only: DGX Spark GB10, RTX 50, RTX PRO 6000. A card below sm_120 refuses Flash Next at startup. |
-| DeepSeek-V4.1-Flash, CUDA | Written for two GPUs with 128 GB each, one per machine: two DGX Sparks (GB10), the only machines it has run on. A rank's startup estimate is 79.1 GiB at the model's whole 1,048,576-token window (73.2 GiB of it weights), and each machine holds the whole 333 GiB checkpoint on disk, Engram tables included. |
+| DeepSeek-V4.1-Flash, CUDA | Written for two GPUs with 128 GB each, one per machine: two DGX Sparks (GB10), the only machines it has run on. A rank's startup estimate is 78.5 GiB at the model's whole 1,048,576-token window (73.2 GiB of it weights), and each machine holds the whole 333 GiB checkpoint on disk, Engram tables included. |
 | MLX, Apple Silicon | GLM-5.3-Flash is written for a 256 GB Mac, about 151 GiB resident. DeepSeek-V4-Flash is the same, about 151 GiB resident. Flash Next's default command sizes to a 128 GiB M4 Max. Qwen3.8-27B on a 32 GB Mac needs more than the default 22.4 GiB. Machine classes, not measured minimums. |
 
 Contributor guides cover [adding an MLX family](adding-a-family.md),
