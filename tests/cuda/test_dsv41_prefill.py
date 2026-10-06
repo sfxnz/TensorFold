@@ -2,7 +2,8 @@
 (rings with the DSpark stages, compressed and index-K caches, compressor tails, first-token logits, the next block's
 drafts); a request's state does not depend on the one before it; saved rows round-trip; Engram reads that lag the
 device change nothing, and a pinned half is refilled only after the device has copied it. The decoder past the last
-KV source runs only the rows the head row and the kept state read, in the bits of the whole decoder.
+KV source runs only the rows the head row and the kept state read, in the bits of the whole decoder. A snapshot at the
+last row is kept from inside its chunk.
 
 State is compared where it is defined: ring slots of the last ``window`` committed positions, cache entries of
 completed groups, tails while valid. The pack's checks need ``TF_DSV41_MODEL`` (layers 0-7 and the DSpark stages;
@@ -271,6 +272,21 @@ def test_kept_snapshot_lands_in_the_given_space(eng):
         assert x.untyped_storage().data_ptr() == space.untyped_storage().data_ptr(), "a copy outside the space"
     P.prefill(eng, prompt[:200], None)
     _equal(_snap(kept[0]), _snap(snapshot.take(eng, prompt[:200])), "a snapshot kept into the space")
+
+
+@pytest.mark.parametrize("n, rows, want", [(300, 2048, [300]), (2100, 2048, [2048, 52]), (2049, 2048, [2048, 1]),
+                                           (300, 129, [129, 129, 42])])
+def test_a_snapshot_at_the_last_row_is_kept_from_inside_its_chunk(eng, monkeypatch, n, rows, want):
+    e = eng if rows == eng.pbuf.rows else Eng(eng.w, eng.hasher, eng.reader, rows=rows)
+    prompt, sizes, kept = _ids(n, n, e.w.cfg.vocab_size), [], []
+    compute = F.compute
+    monkeypatch.setattr(F, "compute", lambda w, st, b, R, **kw: sizes.append(R) or compute(w, st, b, R, **kw))
+    got = _run(e, prompt, keep_at=n - 1, keep=kept.append)
+    assert sizes == want, "a forward of the last row alone"
+    monkeypatch.undo()
+    P.prefill(e, prompt[:-1], None)
+    _equal(_snap(kept[0]), _snap(snapshot.take(e, prompt[:-1])), f"the snapshot at {n - 1} of {n} tokens")
+    _equal(_run(e, prompt, resume=kept[0]), got, f"resumed at {n - 1}")
 
 
 class _Slow:

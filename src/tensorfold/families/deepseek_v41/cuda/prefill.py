@@ -1,5 +1,5 @@
-"""A prompt on one rank in chunks cut at the keep point, the decoder on the rows that matter, ending in the bits of
-the whole prompt at once."""
+"""A prompt on one rank in chunks cut at a keep point before its last row (one at the last row is kept from inside
+its chunk), the decoder on the rows that matter, ending in the bits of the whole prompt at once."""
 
 from __future__ import annotations
 
@@ -50,6 +50,15 @@ def decoder_rows(cfg: Config, layers: Sequence[int], begin: int, anchor: int, n:
         rows[L] = (rel(full), rel(kv))
         full = kv
     return rows, rel(anchor - win)
+
+
+def _absorb(e, b: Buffers, R: int, taps: int, since: int, upto: int) -> None:
+    """DSpark absorb of the chunk's tap rows since..upto (committed through upto), the last ring's worth of them."""
+
+    end = R - min(R - taps, b.taps.shape[0])        # tap row t is the chunk's row end + t
+    lo = max(end, since, upto - e.st.rings.shape[1])
+    if e.w.dspark is not None and lo < upto:
+        dspark.absorb(e, b, upto - lo, prompt=True, first=lo - end)
 
 
 def _stage_ids(b: Buffers, tokens: Sequence[int]) -> None:
@@ -140,7 +149,7 @@ def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapsho
         st.reset()
     else:
         snapshot.restore(e, resume)
-    spans = chunks(begin, n, keep_at, b.rows)
+    spans = chunks(begin, n, keep_at if keep_at is None or keep_at < n - 1 else None, b.rows)
     anchor = min(keep_at, n - 1) if keep_at is not None and keep_at > begin else n - 1
     layers = [lw.index for lw in w.layers]
     kept = resume if keep_at == begin else None
@@ -161,11 +170,14 @@ def prefill(e, prompt: Sequence[int], sampling: Sampling | None, resume: Snapsho
             plan, taps = decoder_rows(w.cfg, layers, begin, anchor, n, a, z)
             logits = F.compute(w, st, b, R, prompt=True, head_rows=1 if i == len(spans) - 1 else 0, rows=plan,
                                taps_from=taps)
-            F.commit(w, st, b, R, R)
-            if w.dspark is not None and taps < R:
-                dspark.absorb(e, b, min(R - taps, b.taps.shape[0]), prompt=True)
-            if z == keep_at:
+            k = keep_at - a if keep_at is not None and a < keep_at < z else R    # a snapshot inside: at row k
+            F.commit(w, st, b, R, k)
+            _absorb(e, b, R, taps, 0, k)
+            if a + k == keep_at:
                 kept = snapshot.take(e, prompt[:keep_at], space)
+            if k < R:
+                F.commit(w, st, b, R, R, first=k)
+                _absorb(e, b, R, taps, k, R)
     finally:
         if rows is not None:
             rows.drain()

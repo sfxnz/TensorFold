@@ -84,7 +84,7 @@ def test_row_views_stop_at_the_cache():
 def _expected(rows: int, capacity: int, prefill: bool) -> dict:
     """The buffer shapes for the pack's config on two ranks."""
 
-    taps = min(rows, 128)
+    taps = min(rows, 129 if prefill else 128)     # a chunk's also the row before a window: a snapshot at its last row
     scored = min(rows, buffers.score_rows(capacity)) if prefill else rows
     out = {
         "ids": ((rows,), I32), "X": ((rows, 4, 5120), BF), "pre_in": ((rows, 4), F32),

@@ -127,16 +127,17 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_row
 
 
 @torch.no_grad()
-def commit(w: Weights, st: State, b: Buffers, R: int, keep: int) -> None:
-    """Keep the last forward's first ``keep`` rows: window KV into the rings, the tails, then ``pos += keep``."""
+def commit(w: Weights, st: State, b: Buffers, R: int, keep: int, first: int = 0) -> None:
+    """Keep the last forward's rows first..keep, row first at ``st.pos`` (a prompt chunk may keep its rows in two
+    steps): window KV into the rings, the tails, then ``pos += keep - first``."""
 
-    if not 0 < keep <= R <= b.rows or (b.prefill and keep != R):
-        raise ValueError(f"commit: keep {keep} of {R} rows ({'a prompt chunk keeps all' if b.prefill else 'decode'})")
+    if not 0 <= first < keep <= R <= b.rows or (first and not b.prefill):
+        raise ValueError(f"commit: rows {first}..{keep} of {R} ({'a prompt chunk' if b.prefill else 'decode'})")
     win, layers = st.rings.shape[1], w.cfg.num_hidden_layers
-    n = min(keep, win)
-    slots = torch.arange(keep - n, keep, device=st.rings.device).add_(st.pos).remainder_(win)
+    n, at = min(keep - first, win), st.pos - first        # at: row 0's position
+    slots = torch.arange(keep - n, keep, device=st.rings.device).add_(at).remainder_(win)
     st.rings[:layers].index_copy_(1, slots, b.kvw[:layers, keep - n:keep])
-    compressor.commit_tail(st, b, st.pos, keep)
+    compressor.commit_tail(st, b, at, keep)
     back = w.cfg.engram_max_ngram_size - 1
-    st.history = (st.history + b.ids_host[:keep].tolist())[-back:] if back > 0 else []
-    st.set_pos(st.pos + keep)
+    st.history = (st.history + b.ids_host[first:keep].tolist())[-back:] if back > 0 else []
+    st.set_pos(at + keep)
