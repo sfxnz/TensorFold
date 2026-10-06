@@ -59,33 +59,38 @@ def _store(LAT, KI, COMP, INDEX_K, POS, RATIO: tl.constexpr, D: tl.constexpr, DK
         tl.store(INDEX_K + j * DK + k, tl.load(KI + r.to(tl.int64) * DK + k, mask=k < DK), mask=k < DK)
 
 
-def compress(lw: LayerW, xa: torch.Tensor, state: State, buf: Buffers, table: torch.Tensor, eps: float) -> None:
-    """Pool, index-key and entry rows of KV source ``lw`` from ``xa`` [R, D] at ``state.pos_dev`` + r."""
+def compress(lw: LayerW, xa: torch.Tensor, state: State, buf: Buffers, table: torch.Tensor, eps: float,
+             first: int = 0) -> None:
+    """Pool, index-key and entry rows of KV source ``lw`` from ``xa`` [R, D], the forward's rows first.., at
+    ``state.pos_dev`` + first + r; a row before first opens the group of an odd first row, as the tail does at 0."""
 
     layer, comp, idx = lw.index, lw.attn.comp, lw.attn.idx
     rows, hd = xa.shape[0], comp.norm.shape[0]
     if comp.ratio != state.ratio.get(layer) or idx is None or idx.wk is None:
         raise ValueError(f"layer {layer}: not a KV source of ratio {comp.ratio} with an index-K projection")
-    if not 0 < rows <= buf.rows or state.pos + rows > state.capacity:
-        raise ValueError(f"compress: {rows} rows at {state.pos} for {buf.rows}-row buffers, {state.capacity} slots")
+    if not 0 < rows <= buf.rows - first or state.pos + first + rows > state.capacity:
+        raise ValueError(f"compress: rows {first}..{first + rows} at {state.pos} for {buf.rows}-row buffers, "
+                         f"{state.capacity} slots")
+    pos = state.pos_dev if not first else state.pos_dev + first
     lat, ki = buf.lat[:rows], buf.kI[:rows]
     block = triton.next_power_of_2(hd)
     if comp.ratio == 2:
-        cmp = buf.cmp[state.pooled.index(layer), :rows]
+        slot = state.pooled.index(layer)
+        cmp = buf.cmp[slot, first:first + rows]
         qmm.matmul(xa, comp.wkv, out=cmp.view(rows, 2 * hd), f32=True)
-        _pool[(rows,)](cmp, state.tail[state.pooled.index(layer)], comp.norm, lat, buf.epos, state.pos_dev, eps,
-                       D=hd, BLOCK=block, num_warps=4, enable_fp_fusion=False)
+        _pool[(rows,)](cmp, state.tail[slot] if not first else buf.cmp[slot, first - 1], comp.norm, lat, buf.epos,
+                       pos, eps, D=hd, BLOCK=block, num_warps=4, enable_fp_fusion=False)
         positions = buf.epos[:rows]
     else:
         qmm.matmul(xa, comp.wkv, out=lat)
         norms.rmsnorm(lat, comp.norm, eps, lat)
-        positions = state.pos_dev                   # entry j = q, rotated at q
+        positions = pos                             # entry j = q, rotated at q
     qmm.matmul(lat, idx.wk, out=ki)                 # the index key reads the latent before RoPE (M:744, 749-750)
     norms.rmsnorm(ki, idx.k_norm, eps, ki)
     kp = quant.fp4_qdq_1x32_e8m0(rope.apply(ki, positions, table), buf.kIp[:rows])
     lp = quant.fp4_qdq_1x16_e4m3(rope.apply(lat, positions, table), buf.latp[:rows])
     d, dk = lp.shape[1], kp.shape[1]
-    _store[(rows,)](lp, kp, state.comp[layer], state.index_k[layer], state.pos_dev, RATIO=comp.ratio, D=d, DK=dk,
+    _store[(rows,)](lp, kp, state.comp[layer], state.index_k[layer], pos, RATIO=comp.ratio, D=d, DK=dk,
                     BLOCK=triton.next_power_of_2(d), BLOCK_K=triton.next_power_of_2(dk), num_warps=4)
 
 

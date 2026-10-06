@@ -69,14 +69,17 @@ class Eng:
         self.dbuf = buffers.Buffers(w.cfg, w.world, MAX_ROWS, CAP, device="cuda")
         self.dwork = dspark.Work(w.cfg, w.world, "cuda")
 
-    def forward(self, ids, prompt: bool, keep: int) -> tuple[buffers.Buffers, int]:
-        """A target forward of ``ids`` keeping ``keep`` rows -> (its buffers, tap rows of committed positions)."""
+    def forward(self, ids, prompt: bool, keep: int) -> tuple[buffers.Buffers, int, int]:
+        """A target forward of ``ids`` keeping ``keep`` rows -> (its buffers, the last committed positions a ring holds
+        among its tap rows, the first of those tap rows)."""
 
         b = self.pbuf if prompt else self.dbuf
         R = F.stage(self.w, self.st, b, ids, self.hasher, self.reader)
         F.compute(self.w, self.st, b, R, prompt=prompt, head_rows=0 if prompt else R)
         F.commit(self.w, self.st, b, R, keep)
-        return b, min(keep, b.taps.shape[0])
+        end = R - min(R, b.taps.shape[0])               # tap row t is the forward's row end + t
+        n = min(keep - end, self.st.rings.shape[1])
+        return b, n, keep - n - end
 
 
 def _drive(e: Eng, plan, seed: int, sampling=None, d: int = BLOCK, threshold=None) -> list[tuple]:
@@ -89,9 +92,9 @@ def _drive(e: Eng, plan, seed: int, sampling=None, d: int = BLOCK, threshold=Non
     for step in plan:
         prompt = isinstance(step, int)
         rows, keep = (step, step) if prompt else step
-        b, n = e.forward(torch.randint(2, vocab, (rows,), generator=g).tolist(), prompt, keep)
-        events.append(("absorb", b.taps[:n].clone(), e.st.pos - n))
-        dspark.absorb(e, b, n, prompt=prompt)
+        b, n, first = e.forward(torch.randint(2, vocab, (rows,), generator=g).tolist(), prompt, keep)
+        events.append(("absorb", b.taps[first:first + n].clone(), e.st.pos - n))
+        dspark.absorb(e, b, n, prompt=prompt, first=first)
         y, p = int(torch.randint(2, vocab, (1,), generator=g)), e.st.pos - 1
         drafts, conf = dspark.propose(e, y, p, sampling, d, threshold)
         events.append(("propose", y, p, drafts, conf, e.dbuf.dlog.clone()))
@@ -204,9 +207,9 @@ def test_absorb_writes_committed_positions_only(eng):
     for step in [150, (6, 4), (3, 1), (6, 6), 30, (2, 2)]:
         prompt = isinstance(step, int)
         rows, keep = (step, step) if prompt else step
-        b, n = eng.forward(torch.randint(2, cfg.vocab_size, (rows,), generator=g).tolist(), prompt, keep)
+        b, n, first = eng.forward(torch.randint(2, cfg.vocab_size, (rows,), generator=g).tolist(), prompt, keep)
         before = st.rings.clone()
-        dspark.absorb(eng, b, n, prompt=prompt)
+        dspark.absorb(eng, b, n, prompt=prompt, first=first)
         changed = (st.rings != before).any(-1)
         assert not changed[:cfg.num_hidden_layers].any(), "absorb wrote a target ring"
         for L in stages:
@@ -364,7 +367,7 @@ def _pack_taps(cfg: Config, rw: RefWeights, ids, group: int = 4) -> torch.Tensor
     R = len(ids)
     taps = torch.empty((R, len(cfg.dspark_target_layer_ids), cfg.hidden_size), dtype=torch.bfloat16, device="cuda")
 
-    def tap(b, rows, slot, first=0):                    # every row, where the forward keeps the last 128
+    def tap(b, rows, slot, first=0, lo=0, hi=None):     # every row, where the forward keeps the last 129
         glue.stream_mean(b.X[:rows].view(rows, -1), b.hidden[:rows])
         taps[:, slot].copy_(b.hidden[:rows])
 

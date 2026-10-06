@@ -178,7 +178,9 @@ the same messages):
 | TensorFold, tok/s | 887 | 1,349 | 1,531 | 1,621 | 1,684 |
 | vLLM, tok/s | 778 | 769 | 772 | 777 | 774 |
 
-In a prompt chunk the routed experts decode each EXL3 tile once for up to 32 of an expert's rows.
+In a prompt chunk the routed experts decode each EXL3 tile once for up to 32 of an expert's rows. The two ranks run
+a chunk of 1,280 rows or more as two row halves, each half's partials traded while the other half computes, and the
+state kept one token before a prompt's end is taken inside its chunk rather than by a forward of the last row alone.
 
 Long context: a 127,459-token needle document (the vLLM recipe's seeded filler, `--context 131074`) took 73.8 s cold,
 and 256 tokens decoded after it at 49.1 tok/s greedy and 50.7 tok/s at temperature 1 with `top_k` 20 (the prompt

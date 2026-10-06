@@ -2,7 +2,8 @@
 (rings with the DSpark stages, compressed and index-K caches, compressor tails, first-token logits, the next block's
 drafts); a request's state does not depend on the one before it; saved rows round-trip; Engram reads that lag the
 device change nothing, and a pinned half is refilled only after the device has copied it. The decoder past the last
-KV source runs only the rows the head row and the kept state read, in the bits of the whole decoder.
+KV source runs only the rows the head row and the kept state read, in the bits of the whole decoder. A snapshot at the
+last row is kept from inside its chunk, and two ranks run a chunk as two row halves in the bits of one pass.
 
 State is compared where it is defined: ring slots of the last ``window`` committed positions, cache entries of
 completed groups, tails while valid. The pack's checks need ``TF_DSV41_MODEL`` (layers 0-7 and the DSpark stages;
@@ -26,6 +27,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
 import dsv41_tiny
+from dsv41_pair import pair, run_pair
 from dsv41_ref_weights import RefWeights
 
 from tensorfold.engine.exact_sampling import Sampling
@@ -42,6 +44,7 @@ from tensorfold.families.deepseek_v41.cuda import (
 )
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import prefill as P
+from tensorfold.families.deepseek_v41.engram_table import Reader
 
 tiny_dir = dsv41_tiny.tiny_dir          # the session fixture
 MODEL = os.environ.get("TF_DSV41_MODEL", "")
@@ -271,6 +274,52 @@ def test_kept_snapshot_lands_in_the_given_space(eng):
         assert x.untyped_storage().data_ptr() == space.untyped_storage().data_ptr(), "a copy outside the space"
     P.prefill(eng, prompt[:200], None)
     _equal(_snap(kept[0]), _snap(snapshot.take(eng, prompt[:200])), "a snapshot kept into the space")
+
+
+@pytest.mark.parametrize("n, rows, want", [(300, 2048, [300]), (2100, 2048, [2048, 52]), (2049, 2048, [2048, 1]),
+                                           (300, 129, [129, 129, 42])])
+def test_a_snapshot_at_the_last_row_is_kept_from_inside_its_chunk(eng, monkeypatch, n, rows, want):
+    e = eng if rows == eng.pbuf.rows else Eng(eng.w, eng.hasher, eng.reader, rows=rows)
+    prompt, sizes, kept = _ids(n, n, e.w.cfg.vocab_size), [], []
+    compute = F.compute
+    monkeypatch.setattr(F, "compute", lambda w, st, b, R, **kw: sizes.append(R) or compute(w, st, b, R, **kw))
+    got = _run(e, prompt, keep_at=n - 1, keep=kept.append)
+    assert sizes == want, "a forward of the last row alone"
+    monkeypatch.undo()
+    P.prefill(e, prompt[:-1], None)
+    _equal(_snap(kept[0]), _snap(snapshot.take(e, prompt[:-1])), f"the snapshot at {n - 1} of {n} tokens")
+    _equal(_run(e, prompt, resume=kept[0]), got, f"resumed at {n - 1}")
+
+
+@pytest.mark.parametrize("rows, n, half", [(2048, 2100, None), (600, 1300, 64)])
+def test_two_ranks_run_a_chunk_in_halves_in_the_bits_of_one_pass(tiny_dir, tiny, ref, monkeypatch, rows, n, half):
+    if half is not None:                                # halves the decoder skip's rows straddle
+        monkeypatch.setattr(F, "HALF_ROWS", half)
+    comms = pair()
+    engs = [Eng(loader.load(tiny_dir, tiny.cfg, r, 2, comms[r], capacity=CAP), ref.hasher,
+                Reader(ref.reader.layout), rows=rows) for r in range(2)]
+    prompt, more = _ids(n, n, tiny.cfg.vocab_size), _ids(n + 1, 200, tiny.cfg.vocab_size)
+    halves = []
+    split = F._halves
+    monkeypatch.setattr(F, "_halves", lambda w, st, b, R, *a: halves.append(R) or split(w, st, b, R, *a))
+
+    def rank(r):
+        def go(_):
+            e, kept = engs[r], []
+            for buf in (e.pbuf, e.dbuf):
+                buf.exl3.guard_left = 0         # the overflow guard's own gather is tested in test_dsv41_moe
+            out = [_run(e, prompt, keep_at=n - 1, keep=kept.append), _snap(kept[0])]
+            return [*out, _run(e, prompt[:n - 1] + more, resume=kept[0])]
+        return go
+
+    split_runs = run_pair(rank(0), rank(1), comms)
+    want = [z - a for a, z in P.chunks(0, n, None, rows) if z - a >= 2 * F.HALF_ROWS]
+    assert want and all(halves.count(R) >= 2 * want.count(R) for R in want), "a chunk ran in one pass"
+    monkeypatch.setattr(F, "HALF_ROWS", n)
+    whole_runs = run_pair(rank(0), rank(1), comms)
+    for r in range(2):
+        for got, one, what in zip(split_runs[r], whole_runs[r], ("prompt", "snapshot", "resumed")):
+            _equal(got, one, f"rank {r}, {rows}-row chunks in halves: {what}")
 
 
 class _Slow:

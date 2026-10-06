@@ -191,8 +191,8 @@ class Buffers:
         self.eng = t((rows, n_eng, world * width), bf)
         kv = D * (S + 1) // world
         self.ekv, self.ekv_gat = t((rows, kv), bf), t((world, rows, kv), bf)
-        # DSpark taps of the last rows, final norm, head
-        taps = min(rows, cfg.sliding_window)
+        # DSpark taps of the last rows (a prompt chunk's also the row before a window: a snapshot at its last row)
+        taps = min(rows, cfg.sliding_window + int(prefill))
         self.taps = t((taps, len(cfg.dspark_target_layer_ids), D), bf)
         self.hidden, self.fnormed = t((rows, D), bf), t((rows, D), bf)
         self.logits = t((1 if prefill else rows, V), f32)
