@@ -1,6 +1,7 @@
 """DSpark drafting: block logits within the model-level gate of the reference's DSpark driver fed the same taps (tiny
 checkpoint and the pack's mtp stages), greedy drafts agreeing with the reference's on real weights, two thread ranks
-drafting alike, absorb writing committed positions only, the Markov chain stopping at d, and graph replays equal to
+drafting alike (dense or sparse Markov bias), absorb writing committed positions only, a proposal running its d Markov
+steps on the device with drafts drawn by the target's rule and its policy keeping a prefix, and graph replays equal to
 eager runs.
 
 Top-1 counts only rows the reference decides between its fp32 and mirror modes (as the forward's test does), and a row
@@ -223,7 +224,7 @@ def test_absorb_writes_committed_positions_only(eng):
         dspark.propose(eng, 5, st.pos - 1, None, BLOCK + 1)
 
 
-def test_markov_steps_run_exactly_d_times(eng, monkeypatch):
+def test_a_proposal_runs_d_steps_and_its_policy_keeps_a_prefix(eng, monkeypatch):
     calls = {"step": 0, "input": 0, "draw": 0}
 
     def counted(name, fn):
@@ -234,20 +235,25 @@ def test_markov_steps_run_exactly_d_times(eng, monkeypatch):
 
     monkeypatch.setattr(dspark, "markov_step", counted("step", dspark.markov_step))
     monkeypatch.setattr(dspark, "markov_input", counted("input", dspark.markov_input))
-    monkeypatch.setattr(dspark.sample, "draft_rows", counted("draw", dspark.sample.draft_rows))
+    monkeypatch.setattr(dspark.sample, "draft", counted("draw", dspark.sample.draft))
     _drive(eng, [150], 11)
     y, p = 9, eng.st.pos - 1
 
-    def propose(d, threshold=None):
+    def propose(d, threshold=None, sampling=None):
         for k in calls:
             calls[k] = 0
-        return dspark.propose(eng, y, p, None, d, threshold)
+        return dspark.propose(eng, y, p, sampling, d, threshold)
 
+    for sampling in SAMPLINGS:
+        full, conf = propose(BLOCK, sampling=sampling)
+        assert len(full) == len(conf) == BLOCK
+        rows = eng.dbuf.dlog[:BLOCK].clone()            # the block's logits plus each step's Markov bias
+        want, _ = dspark.sample.target_rows(eng.w, rows, [p + 2 + i for i in range(BLOCK)], sampling)
+        assert full == want, f"{sampling}: a draft is the target rule's draw from its row at its position"
+        for d in range(1, BLOCK + 1):
+            drafts, c = propose(d, sampling=sampling)
+            assert drafts == full[:d] and c == conf[:d] and calls == {"step": d, "input": d, "draw": d}
     full, conf = propose(BLOCK)
-    assert len(full) == len(conf) == BLOCK
-    for d in range(1, BLOCK + 1):
-        drafts, c = propose(d)
-        assert drafts == full[:d] and c == conf[:d] and calls == {"step": d, "input": d, "draw": d}
     prods = [math.prod(1 / (1 + math.exp(-x)) for x in conf[:i + 1]) for i in range(BLOCK)]
     print("confidence logits", [f"{x:.3g}" for x in conf], "products", [f"{x:.3g}" for x in prods])
     cases = [(1, (1 + prods[0]) / 2)] + [(k, (prods[k - 1] + prods[k]) / 2) for k in range(1, BLOCK)]
@@ -258,8 +264,8 @@ def test_markov_steps_run_exactly_d_times(eng, monkeypatch):
         tested += 1
         drafts, c = propose(BLOCK, threshold)
         assert dspark.policy(conf, BLOCK, threshold) == want
-        assert drafts == full[:want] and c == conf[:want] and calls["step"] == calls["draw"] == want
-        assert calls["input"] == min(want + 1, BLOCK), "the chain reads one confidence past its last draft"
+        assert drafts == full[:want] and c == conf[:want]
+        assert calls == {"step": BLOCK, "input": BLOCK, "draw": BLOCK}, "the chain runs its d steps in one graph"
     assert tested >= 3
 
 
@@ -268,15 +274,16 @@ def test_two_ranks_draft_alike_and_repeat(tiny_dir, tiny, ref):
     engs = [Eng(loader.load(tiny_dir, tiny.cfg, r, 2, comms[r], capacity=CAP), ref.hasher, Reader(ref.reader.layout))
             for r in range(2)]
     plan = PLAN[:9]
-    for sampling in SAMPLINGS:
+    for sampling, sparse in [(s, False) for s in SAMPLINGS] + [(s, True) for s in SAMPLINGS]:
         for d, threshold in ((3, None), (BLOCK, 0.3)):
-            def rank(r, sampling=sampling, d=d, threshold=threshold):
+            def rank(r, sampling=sampling, d=d, threshold=threshold, sparse=sparse):
                 def go(_):
+                    engs[r].dwork.sparse = sparse
                     return [ev[3:5] for ev in _drive(engs[r], plan, 2, sampling, d, threshold) if ev[0] == "propose"]
                 return go
 
             runs = [run_pair(rank(0), rank(1), comms) for _ in range(2)]
-            what = f"{sampling}, d {d}, threshold {threshold}"
+            what = f"{sampling}, sparse {sparse}, d {d}, threshold {threshold}"
             assert runs[0][0] == runs[0][1], f"{what}: the ranks drafted differently"
             assert runs[1] == runs[0], f"{what}: a repeated run drafted differently"
             assert all(0 < len(dr) <= d for dr, _ in runs[0][0])
@@ -315,9 +322,13 @@ def test_graph_replays_equal_eager(eng):
     window()
     graphs = {n: _capture(lambda n=n: dspark.absorb(eng, b, n, prompt=False)) for n in range(1, MAX_ROWS + 1)}
     k.bids[:1].fill_(17)
-    blk = _capture(lambda: dspark.block(eng))
-    ins = [_capture(lambda i=i: dspark.markov_input(eng, i)) for i in range(BLOCK)]
-    steps = [_capture(lambda i=i: dspark.markov_step(eng, i)) for i in range(BLOCK)]
+    k.chain[:1].fill_(17)
+    k.draws.set(SAMPLINGS[2])
+    chains = {}
+    for d, keyed, sparse in [(d, keyed, sparse) for d in (1, 3, BLOCK) for keyed in (False, True)
+                             for sparse in (False, True)]:
+        k.sparse = sparse
+        chains[d, keyed, sparse] = _capture(lambda d=d, keyed=keyed: dspark.chain(eng, d, keyed))
     for _ in range(2):                                   # the second pass at another position
         window()
         rings = st.rings.clone()
@@ -330,19 +341,18 @@ def test_graph_replays_equal_eager(eng):
                 st.rings[L, [q % w.cfg.sliding_window for q in range(st.pos - n, st.pos)]] = 255    # NaN codes
             graphs[n].replay()
             assert torch.equal(st.rings, eager), f"absorb {n} at {st.pos}"
-        dspark.block(eng)
-        _same([b.dlog.clone(), b.hidden[:BLOCK].clone()], blk, [b.dlog, b.hidden[:BLOCK]], f"block at {st.pos}")
-        k.mids.copy_(torch.tensor([17, 40, 3, 900, 41], dtype=torch.int32))
-        for i in range(BLOCK):
-            dspark.markov_input(eng, i)
-            outs = [b.me[i], b.conf[i:i + 1]]
-            _same([x.clone() for x in outs], ins[i], outs, f"Markov input {i}")
-            before = b.dlog[i].clone()
-            dspark.markov_step(eng, i)
-            eager = b.dlog[i].clone()
-            b.dlog[i].copy_(before)
-            steps[i].replay()
-            assert torch.equal(b.dlog[i], eager), f"Markov step {i} at {st.pos}"
+        for (d, keyed, sparse), graph in chains.items():
+            k.sparse = sparse
+            dspark.chain(eng, d, keyed)
+            outs = [b.dlog, b.hidden[:BLOCK], b.me[:d], b.conf[:d], k.chain[1:1 + d], k.host[:, :d]]
+            torch.cuda.synchronize()                     # the pinned rows' copies landed
+            eager = [x.clone() for x in outs]
+            for x in outs:
+                x.fill_(float("nan") if x.is_floating_point() else -1)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert all(torch.equal(x, y) for x, y in zip(eager, outs)), f"{d} steps, keyed {keyed}, sparse {sparse}"
+    k.sparse = False
 
 
 # -- the pack -----------------------------------------------------------------------------------------------------

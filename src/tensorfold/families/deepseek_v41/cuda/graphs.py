@@ -1,10 +1,12 @@
-"""CUDA graphs of decode's device work: a verify forward per window size, DSpark's absorb, block and steps."""
+"""CUDA graphs of decode's device work: a verify forward per window size, DSpark's absorb, and its proposals."""
 
 from __future__ import annotations
 
 import gc
 
 import torch
+
+from tensorfold.engine.exact_sampling import Sampling
 
 from . import GRAPH_ROWS, MAX_ROWS, dspark
 from . import forward as F
@@ -16,9 +18,7 @@ class Graphs:
         self.pool = torch.cuda.graph_pool_handle()
         self.verify: dict[int, torch.cuda.CUDAGraph] = {}      # by window rows
         self.absorb: dict[int, torch.cuda.CUDAGraph] = {}      # by kept rows
-        self.block: torch.cuda.CUDAGraph | None = None
-        self.inputs: list[torch.cuda.CUDAGraph] = []           # Markov step i's embedding and confidence
-        self.steps: list[torch.cuda.CUDAGraph] = []            # Markov step i's head bias
+        self.drafts: dict[tuple[int, bool], torch.cuda.CUDAGraph] = {}     # block + d Markov steps, by (d, keyed)
 
     def _capture(self, fn) -> torch.cuda.CUDAGraph:
         """``fn`` run once eagerly (compiling its kernels outside the capture), then captured into the pool."""
@@ -56,9 +56,9 @@ class Graphs:
             for n in GRAPH_ROWS:
                 self.absorb[n] = self._capture(lambda n=n: dspark.absorb(e, b, n, prompt=False))
             e.dwork.bids[:1].fill_(token)
-            e.dwork.mids.fill_(token)
-            self.block = self._capture(lambda: dspark.block(e))
-            B = w.cfg.dspark_block_size
-            self.inputs = [self._capture(lambda i=i: dspark.markov_input(e, i)) for i in range(B)]
-            self.steps = [self._capture(lambda i=i: dspark.markov_step(e, i)) for i in range(B)]
-        return len(self.verify) + len(self.absorb) + (self.block is not None) + len(self.inputs) + len(self.steps)
+            e.dwork.chain.fill_(token)
+            e.dwork.draws.set(Sampling(seed=0, temperature=1.0, top_k=0))
+            for keyed in (False, True):
+                for d in range(1, w.cfg.dspark_block_size + 1):
+                    self.drafts[d, keyed] = self._capture(lambda d=d, keyed=keyed: dspark.chain(e, d, keyed))
+        return len(self.verify) + len(self.absorb) + len(self.drafts)
