@@ -10,7 +10,7 @@ from tensorfold.engine.exact_sampling import Sampling
 
 BELL = "tf_dsv41_request_{}"
 STOP = [0]                  # a header no request sends (max_tokens is at least 1): rank 1 leaves ``follow``
-KV_STORAGE = 0              # caches hold the model's QDQ'd values as bf16
+KV_STORAGE = 1              # caches hold packed FP8 and FP4 codes with their scales (quant's rows)
 ENGRAM_SPLIT = 0            # each rank reads a contiguous half of every Engram table's hash columns
 SETTINGS = ("start_error", "dspark_loaded", "capacity", "prefill_rows", "max_rows", "ring", "drafts",
             "confidence_ppm", "layers", "world", "kv_storage", "engram_split", "engram_digest_hi", "engram_digest_lo")

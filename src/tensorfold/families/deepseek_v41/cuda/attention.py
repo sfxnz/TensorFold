@@ -31,7 +31,8 @@ def _index(w: Weights, lw: LayerW, xa: torch.Tensor, qr: torch.Tensor, state: St
     cand = (buf.cand[start:rows], buf.cand_n[start:rows])
     indexer.select(w.cfg, qI, wI, state.index_k[role.kv_src], role.ratio, at[:1], buf.scores,
                    buf.lists[start:rows], buf.list_n[start:rows], pos=state.pos + start if prompt else None,
-                   source=cand if role.candidate_source else None, within=cand if role.uses_candidates else None)
+                   source=cand if role.candidate_source else None, within=cand if role.uses_candidates else None,
+                   work=None if prompt else buf.split)
 
 
 def attention(lw: LayerW, w: Weights, state: State, buf: Buffers, rows: int, prompt: bool, start: int = 0,

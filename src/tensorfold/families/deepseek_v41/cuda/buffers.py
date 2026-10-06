@@ -11,10 +11,12 @@ from tensorfold.cuda.exl3.experts import Scratch as Exl3Scratch
 from tensorfold.families.glm5_next.cuda.glue import HC_BLOCKS
 
 from ..config import Config
-from . import MOE_WINDOW, PREFILL_ROWS, SCORE_BYTES
+from . import MOE_WINDOW, PREFILL_ROWS, SCORE_BYTES, quant
 
 HC_PART = 32            # glue._hc_partial's values a K block: the 24 mixing dots and the sum of squares, padded
 ATTN_CHUNK = 128        # list entries one sparse-attention decode partial covers
+SPLIT_SPAN = 1024       # decode selection: items one program of a row covers, at most
+SPLIT_BINS = 2048       # decode selection: bins of the first digit, a key's top 11 bits
 
 
 def score_rows(entries: int) -> int:
@@ -28,6 +30,19 @@ def entries(ratio: int, capacity: int) -> int:
     """Compressed entries a cache of ``capacity`` slots holds: entry j pools positions [j*ratio, (j+1)*ratio)."""
 
     return capacity // ratio + 1 if ratio > 1 else capacity
+
+
+def split_work(rows: int, entries: int, slots: int, device: torch.device | str) -> dict[str, torch.Tensor]:
+    """The decode selection's scratch for ``rows`` rows over up to ``entries`` scores or ``slots`` candidate slots,
+    zero as each selection leaves it."""
+
+    n = max(entries, 1)
+
+    def zeros(*shape: int) -> torch.Tensor:
+        return torch.zeros(shape, dtype=torch.int32, device=device)
+
+    return {"hist": zeros(rows, SPLIT_BINS), "bn": zeros(rows), "bkey": zeros(rows, n), "bitem": zeros(rows, n),
+            "counts": zeros(rows, 3, -(-max(n, slots) // SPLIT_SPAN)), "thr": zeros(rows, 2)}
 
 
 def _device_bytes(obj, device: torch.device) -> int:
@@ -50,11 +65,12 @@ def _device_bytes(obj, device: torch.device) -> int:
 
 
 class State:
-    """Committed state of one sequence: rings of committed rows, position-addressed compressed and index-K caches."""
+    """Committed state of one sequence: rings of committed rows, position-addressed compressed and index-K caches, each
+    row packed as ``quant`` stores it (FP8 window KV, FP4 entries per 16, FP4 index keys per 32)."""
 
     def __init__(self, cfg: Config, capacity: int, device: torch.device | str = "cuda") -> None:
         dev = torch.device(device)
-        bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
+        f32, i32, u8 = torch.float32, torch.int32, torch.uint8
         self.ratio = {layer: cfg.roles[layer].ratio for layer in cfg.kv_source_layer_ids}
         if any(r not in (1, 2) for r in self.ratio.values()):
             raise ValueError(f"KV source ratios {self.ratio}: the engine compresses by 1 or 2")
@@ -62,10 +78,12 @@ class State:
         self.pos = 0
         self.pos_dev = torch.zeros((1,), dtype=i32, device=dev)
         # slot pos % window per layer, DSpark stages last; written only at commit
-        self.rings = torch.zeros((len(cfg.roles), cfg.sliding_window, cfg.head_dim), dtype=bf, device=dev)
-        self.comp = {layer: torch.zeros((entries(r, capacity), cfg.head_dim), dtype=bf, device=dev)
+        self.rings = torch.zeros((len(cfg.roles), cfg.sliding_window, quant.width(cfg.head_dim, quant.FP8)), dtype=u8,
+                                 device=dev)
+        comp, keys = quant.width(cfg.head_dim, quant.FP4_E4M3), quant.width(cfg.index_head_dim, quant.FP4_E8M0)
+        self.comp = {layer: torch.zeros((entries(r, capacity), comp), dtype=u8, device=dev)
                      for layer, r in self.ratio.items()}
-        self.index_k = {layer: torch.zeros((entries(r, capacity), cfg.index_head_dim), dtype=bf, device=dev)
+        self.index_k = {layer: torch.zeros((entries(r, capacity), keys), dtype=u8, device=dev)
                         for layer, r in self.ratio.items()}
         self.pooled = tuple(layer for layer, r in self.ratio.items() if r == 2)   # tail slots, in this order
         self.tail = torch.zeros((len(self.pooled), 2, cfg.head_dim), dtype=f32, device=dev)   # (kv, score)
@@ -130,14 +148,15 @@ class Buffers:
         self.q = t((rows, HL, hd), bf)
         self.o = t((rows, HL, hd), bf)
         self.u = t((rows, cfg.o_groups // world * cfg.o_lora_rank), bf)
-        self.kvw = t((len(cfg.roles), rows, hd), bf)                 # this forward's window KV, every layer
+        self.kvw = t((len(cfg.roles), rows, quant.width(hd, quant.FP8)), u8)    # this forward's window KV, packed
         chunks = -(-(cfg.sliding_window + cfg.index_topk) // ATTN_CHUNK)
         self.attn_part = None if prefill else t((rows, HL, chunks, hd + 2), f32)   # (acc, max, sum)
         # compressor and indexer
         sources = [cfg.roles[layer].ratio for layer in cfg.kv_source_layer_ids]
         self.cmp = t((sources.count(2), rows, 2, hd), f32)
-        self.lat = t((rows, hd), bf)
+        self.lat, self.latp = t((rows, hd), bf), t((rows, quant.width(hd, quant.FP4_E4M3)), u8)    # entries, packed
         self.kI, self.epos = t((rows, cfg.index_head_dim), bf), t((rows,), i32)   # index keys, entry positions
+        self.kIp = t((rows, quant.width(cfg.index_head_dim, quant.FP4_E8M0)), u8)
         self.qI = t((rows, cfg.index_n_heads, cfg.index_head_dim), bf)
         self.wI = t((rows, cfg.index_n_heads), f32)
         visible = max((entries(r, capacity) for r in sources), default=0)
@@ -145,6 +164,8 @@ class Buffers:
         self.scores = t((scored, visible), f32)
         self.cand, self.cand_n = t((rows, cfg.candidate_topk_blocks), i32), t((rows,), i32)
         self.lists, self.list_n = t((rows, cfg.index_topk), i32), t((rows,), i32)   # the latest index layer's
+        if not prefill:
+            self.split = split_work(rows, visible, cfg.candidate_topk_blocks * cfg.candidate_block_size, dev)
         # MoE: routed slots only, the shared expert added to the fp32 share after them
         E, K = cfg.n_routed_experts, cfg.num_experts_per_tok
         SI = cfg.moe_intermediate_size * cfg.n_shared_experts // world
