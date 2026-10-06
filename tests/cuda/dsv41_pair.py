@@ -11,12 +11,13 @@ import torch
 
 class _Hub:
     def __init__(self) -> None:
-        self.slots: list[torch.Tensor | None] = [None, None]
+        self.slots: list = [None, None]
         self.gate = threading.Barrier(2, timeout=600)
 
 
 class PairComm:
-    """``comm.NCCL``'s all_gather for one of two thread ranks; ``barrier`` and ``ready`` have nothing to wait for."""
+    """``comm.NCCL``'s all_gather and exchange for one of two thread ranks; ``barrier`` and ``ready`` have nothing to
+    wait for."""
 
     world = 2
     store = None
@@ -34,6 +35,17 @@ class PairComm:
         for r in range(self.world):
             flat[r * n:(r + 1) * n].copy_(self.hub.slots[r].reshape(-1))
         torch.cuda.current_stream().synchronize()          # copied before either rank reuses its send
+        self.hub.gate.wait()
+
+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
+        if len(sends) != len(recvs) or peer != 1 - self.rank:
+            raise ValueError("exchange: one receive per send, with the other rank")
+        torch.cuda.current_stream().synchronize()
+        self.hub.slots[self.rank] = sends
+        self.hub.gate.wait()
+        for r, s in zip(recvs, self.hub.slots[peer]):
+            r.copy_(s.reshape(r.shape))
+        torch.cuda.current_stream().synchronize()
         self.hub.gate.wait()
 
     def barrier(self) -> None:

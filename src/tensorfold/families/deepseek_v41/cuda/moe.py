@@ -130,11 +130,13 @@ def _side(device: torch.device) -> torch.cuda.Stream:
     return streams[device]
 
 
-def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) -> torch.Tensor:
-    """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share b.part [R, D]; decode runs the shared
-    expert on a side stream beside the routed ones (they share only xf until the add)."""
+def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None,
+             out: torch.Tensor | None = None) -> torch.Tensor:
+    """A backbone layer's MoE for xf [R, D] bf16 -> the rank's fp32 share in ``out`` (default b.part [R, D]); decode
+    runs the shared expert on a side stream beside the routed ones (they share only xf until the add)."""
 
     R = xf.shape[0]
+    out = b.part[:R] if out is None else out
     main = torch.cuda.current_stream(xf.device)
     side = None if prompt else _side(xf.device)
     if side is not None:
@@ -146,14 +148,14 @@ def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None) ->
     s = b.exl3
     for r0 in range(0, R, s.rows):
         n = min(s.rows, R - r0)
-        exl3.routed(xf[r0:r0 + n], b.pick[r0:r0 + n], b.wts[r0:r0 + n], m.experts, s, b.part[r0:r0 + n], n,
+        exl3.routed(xf[r0:r0 + n], b.pick[r0:r0 + n], b.wts[r0:r0 + n], m.experts, s, out[r0:r0 + n], n,
                     cfg.swiglu_limit, exl3.ACT_F32, prompt=prompt)
         _guard(s, n * s.slots, comm)
     if side is None:
         shared(cfg, m, xf, b, prompt=prompt)
     else:
         main.wait_stream(side)
-    return b.part[:R].add_(b.sd[:R])
+    return out.add_(b.sd[:R])
 
 
 def dspark_moe(cfg, m, xf: torch.Tensor, b) -> torch.Tensor:

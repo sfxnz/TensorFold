@@ -367,7 +367,7 @@ def _pack_taps(cfg: Config, rw: RefWeights, ids, group: int = 4) -> torch.Tensor
     R = len(ids)
     taps = torch.empty((R, len(cfg.dspark_target_layer_ids), cfg.hidden_size), dtype=torch.bfloat16, device="cuda")
 
-    def tap(b, rows, slot, first=0):                    # every row, where the forward keeps the last 129
+    def tap(b, rows, slot, first=0, lo=0, hi=None):     # every row, where the forward keeps the last 129
         glue.stream_mean(b.X[:rows].view(rows, -1), b.hidden[:rows])
         taps[:, slot].copy_(b.hidden[:rows])
 

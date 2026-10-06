@@ -36,18 +36,19 @@ def _index(w: Weights, lw: LayerW, xa: torch.Tensor, qr: torch.Tensor, state: St
 
 
 def attention(lw: LayerW, w: Weights, state: State, buf: Buffers, rows: int, prompt: bool, start: int = 0,
-              kv_from: int = 0) -> torch.Tensor | None:
+              kv_from: int = 0, first: int = 0) -> torch.Tensor | None:
     """``buf.X`` rows start.. of ``rows`` -> the rank's fp32 share ``buf.part[start:rows]`` after ``wo_b`` (None when
-    start is ``rows``); rows kv_from.. write their window KV, and a KV source pools every row."""
+    start is ``rows``); rows kv_from.. write their window KV, and a KV source pools rows first.. (the rows before
+    pooled already)."""
 
     cfg, a, role, L = w.cfg, lw.attn, lw.role, lw.index
-    if role.mode == "dspark" or not 0 < rows <= buf.rows or not 0 <= kv_from <= start <= rows:
-        raise ValueError(f"attention: layer {L} ({role.mode}) on rows {start}/{kv_from}..{rows} of a "
+    if role.mode == "dspark" or not 0 < rows <= buf.rows or not 0 <= first <= kv_from <= start <= rows:
+        raise ValueError(f"attention: layer {L} ({role.mode}) on rows {first}/{kv_from}/{start}..{rows} of a "
                          f"{buf.rows}-row buffer")
     eps, table, pos = cfg.rms_norm_eps, w.rope[role.rope], state.pos_dev
     source = bool(role.ratio) and role.kv_src == L
     anchors = _anchors(pos, rows)
-    lo = 0 if source else kv_from
+    lo = first if source else kv_from
     norms.collapse_norm(buf.X[lo:rows].view(rows - lo, -1), buf.pre_in[lo:rows], lw.attn_norm, buf.xn[lo:rows], eps)
     if kv_from < rows:
         qakv = buf.qakv[kv_from:rows]
@@ -55,7 +56,7 @@ def attention(lw: LayerW, w: Weights, state: State, buf: Buffers, rows: int, pro
         quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, pos if kv_from == 0 else anchors[kv_from:],
                             table, buf.kvw[L, kv_from:rows])
     if source:
-        compressor.compress(lw, buf.xn[:rows], state, buf, table, eps)
+        compressor.compress(lw, buf.xn[first:rows], state, buf, table, eps, first)
     if start == rows:
         return None
     n, at = rows - start, pos if start == 0 else anchors[start:]
