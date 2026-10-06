@@ -70,7 +70,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                 mtp_confidence: float | None = None, **options: Any):
     """The two-rank engine drafting with its DSpark stages; ``mtp_drafts`` 0 or ``no_drafts``: serial decoding."""
 
-    from .cuda import BLOCK, DEFAULT_DRAFTS
+    from .cuda import BLOCK, DEFAULT_CONFIDENCE, DEFAULT_DRAFTS
 
     if int(tp) != 2:
         raise ValueError(f"{TITLE} needs two GPUs, one per machine: run the same `tensorfold serve` command with "
@@ -87,7 +87,10 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         print(f"[tensorfold] {TITLE} serves one request at a time: --parallel {streams} is ignored", flush=True)
     from .cuda.engine import DeepSeekV41Engine
 
-    confidence = None if mtp_confidence is None else float(mtp_confidence)
+    if mtp_confidence is not None:
+        confidence = float(mtp_confidence)
+    else:                                   # --mtp-drafts alone: that many drafts every round
+        confidence = DEFAULT_CONFIDENCE if mtp_drafts is None else None
     # the policy: drafts a round (0: serial), and the confidence product below which a chain stops (None: fixed)
     return DeepSeekV41Engine(Path(model_dir), rank=int(rank), master=master, port=int(master_port),
                              policy=(drafts, confidence), context=options.get("context"),

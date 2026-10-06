@@ -40,8 +40,8 @@ start builds four CUDA extensions (about two minutes); later starts load in abou
 | --- | --- |
 | `--tp 2 --rank R --master ADDR` | Required: one GPU a machine. One rank, or a separate `--drafter`, is refused. |
 | `--context N` | The prompt-plus-reply window. Omitted, the whole 1,048,576-token window when it fits. |
-| `--mtp-drafts D` | DSpark drafts a round, 1 to 5 (default 3); 0 decodes one token a round. |
-| `--mtp-confidence P` | Draft fewer when unsure: stop before the first draft whose product of DSpark's confidence scores falls under `P` (at least one). |
+| `--mtp-drafts D` | DSpark drafts every round, 1 to 5; 0 decodes one token a round. Omitted (with `--mtp-confidence` omitted too), up to 5 a round by DSpark's confidence, `P` 0.15. |
+| `--mtp-confidence P` | Draft fewer when unsure: stop before the first draft whose product of DSpark's confidence scores falls under `P` (at least one, at most `--mtp-drafts`, 5 when omitted). |
 | `--no-drafts` | The serial reference: DSpark is not loaded. |
 | `--no-thinking`, `--reasoning-effort` | Request defaults, as on every family; a request's own switch wins. |
 | `--parallel N` | Accepted and ignored with a note: requests run one at a time. |
@@ -121,8 +121,8 @@ emit the same tokens. Every kernel computes a row alone in an order fixed by the
 gets the same bits alone or in a verify window of up to 6 rows (the target token and 5 drafts), eager or in a CUDA
 graph, at any context. The prompt path and decode path take different kernels, chosen by the call site, never by
 the row count, so a prompt's rows never depend on its chunking; their bits differ from decode's, so each request
-keeps its prompt's state one token before its end, and a follow-up turn resumes there. DSpark drafts with the same
-keyed draws (over each rank's 1,024 best candidates when top-k is off), and the target keeps a draft only when it
+keeps its prompt's state one token before its end, and a follow-up turn resumes there. DSpark draws its drafts on
+the device by the same keyed rule (top-k at most 1,024, and 1,024 when off), and the target keeps a draft only when it
 equals its own draw. Each row is drawn with its absolute position's key from candidates both ranks gather, so the
 ranks pick the same tokens, keep the same rows and commit alike without a broadcast, and both decode every request
 to `max_tokens` or an end token. Fp32 partials are gathered and added in rank order, and every collective, the
@@ -144,7 +144,7 @@ tool calls 22/22 with exact arguments, needles 9/9 up to about 130k tokens.
 
 ## Speed
 
-Two DGX Sparks over their direct cable, `--context 65538`, default drafting (3 drafts a round), against the vLLM
+Two DGX Sparks over their direct cable, `--context 65538`, 3 drafts a round, against the vLLM
 recipe for this checkpoint on the same machines and weights, measured in a separate session (not interleaved; vLLM's
 sampled fibonacci-raw runs ranged from 40 to 65 tok/s). `tools/bench_openai.py` (64 tokens, median tok/s of 5):
 

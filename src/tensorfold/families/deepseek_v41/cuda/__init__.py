@@ -10,4 +10,5 @@ RING = 128                          # sliding-window slots per layer (the checkp
 PREFILL_ROWS = 2048                 # rows of one prompt chunk
 MOE_WINDOW = 1024                   # prompt rows per routed-expert pass
 SCORE_BYTES = 1 << 30               # the indexer's score scratch, the cap on its prompt row blocks
-DEFAULT_DRAFTS = 3                  # drafts a round unless --mtp-drafts or --mtp-confidence asks otherwise
+DEFAULT_DRAFTS = BLOCK              # the most drafts a round unless --mtp-drafts asks otherwise
+DEFAULT_CONFIDENCE = 0.15           # drafts stop under this DSpark confidence product unless a flag sets the policy

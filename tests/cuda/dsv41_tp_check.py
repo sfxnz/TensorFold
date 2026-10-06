@@ -18,7 +18,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import DEFAULT_DRAFTS, sample
+from tensorfold.families.deepseek_v41.cuda import DEFAULT_CONFIDENCE, DEFAULT_DRAFTS, sample
 from tensorfold.families.deepseek_v41.cuda.engine import DeepSeekV41Engine
 
 LAYERS = 8
@@ -123,7 +123,7 @@ def _lead(e: DeepSeekV41Engine, prompts: list[list[int]]) -> None:
 
 
 def _engine(model: Path, rank: int, **kw) -> DeepSeekV41Engine:
-    return DeepSeekV41Engine(model, rank=rank, policy=(DEFAULT_DRAFTS, None), context=CONTEXT,
+    return DeepSeekV41Engine(model, rank=rank, policy=(DEFAULT_DRAFTS, DEFAULT_CONFIDENCE), context=CONTEXT,
                              context_explicit=True, layers=LAYERS, **kw)
 
 

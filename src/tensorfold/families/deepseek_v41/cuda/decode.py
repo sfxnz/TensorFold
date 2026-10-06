@@ -13,7 +13,7 @@ import torch
 from tensorfold.engine.exact_sampling import Sampling
 
 from ..engram_hash import rank_columns
-from . import BLOCK, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, engram, sample
+from . import BLOCK, DEFAULT_CONFIDENCE, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, engram, sample
 from . import forward as F
 from .buffers import Buffers, State
 from .graphs import Graphs
@@ -266,7 +266,7 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 
 @torch.no_grad()
 def dspark_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, drafts: int = DEFAULT_DRAFTS,
-                  confidence: float | None = None, stop_eos: bool = True, on_tokens=None) -> DecodeResult:
+                  confidence: float | None = DEFAULT_CONFIDENCE, stop_eos: bool = True, on_tokens=None) -> DecodeResult:
     """``serial_decode``'s tokens in windows of the pending token and up to ``drafts`` DSpark drafts."""
 
     if e.w.dspark is None:
