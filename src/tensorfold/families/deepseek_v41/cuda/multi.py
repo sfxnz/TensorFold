@@ -1,4 +1,4 @@
-"""Concurrent requests on one rank: shared verify rounds over the decoding lanes, prompts filling between them."""
+"""Concurrent requests over lanes: shared verify rounds over the decoding lanes, prompts filling between them."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .buffers import Buffers
 from .decode import Engine, _clock, accept
 from .lanes import Lanes, stage_tables
 from .multi_fill import FillPlan, span_rows
+from .multi_tp import TwoRanks
 from .prefill import Fill
 
 STAGES_ENV = "TF_DSV41_STAGES"      # "1": each stream's stats carry its rounds' mean ms by part as ``stages_ms``
@@ -33,10 +34,10 @@ def _elapsed(start: torch.cuda.Event, end: torch.cuda.Event) -> float:
     return start.elapsed_time(end) / 1e3
 
 
-class LaneDecoder:
+class LaneDecoder(TwoRanks):
     """Upstream's decoder contract (``tensorfold.cuda.scheduler``) over ``lanes``, ``engines[k]`` lane k's Engine on the
     shared buffers; ``policy`` is (drafts a round, confidence stop or None), ``graphs`` LaneGraphs or None, ``kept`` a
-    Kept over ``engines`` or None."""
+    Kept over ``engines`` or None. On two ranks rank 0 sets ``link`` and rank 1 runs ``follow``."""
 
     def __init__(self, w, lanes: Lanes, engines: Sequence[Engine], mbuf: Buffers, pbuf: Buffers,
                  policy: tuple[int, float | None], eos: Sequence[int], graphs, share: float, kept=None) -> None:
@@ -88,11 +89,15 @@ class LaneDecoder:
         empty = [k for k in free if not self.kept.holds(k)]
         return empty[0] if empty else min(free, key=lambda k: self.used[k])
 
-    @torch.no_grad()
-    def admit(self, s: Stream) -> None:
-        """Queue ``s``'s prompt in a free lane, running no forward: later steps fill it a span at a time, from its
-        longest kept prefix when it drafts."""
+    def _rows_in(self, hit) -> int | str | None:
+        """Where ``hit``'s rows are: a lane, "arena" once saved, or None without a hit."""
 
+        if hit is None:
+            return None
+        lane = self.kept.lane(hit)
+        return "arena" if lane is None else lane
+
+    def _valid(self, s: Stream) -> None:
         prompt, C, vocab = s.prompt, self.lanes.capacity, self.w.cfg.vocab_size
         if not prompt:
             raise ValueError("an empty prompt")
@@ -100,17 +105,32 @@ class LaneDecoder:
             raise ValueError(f"prompt of {len(prompt)} tokens: lanes hold {C} positions")
         if min(prompt) < 0 or max(prompt) >= vocab:
             raise ValueError(f"prompt token ids must lie in [0, {vocab})")
+
+    def _plan(self, s: Stream) -> tuple[dict, object]:
+        """Rank 0's admission of ``s``: {lane, cached, rows_in, rows}, and the kept snapshot it resumes."""
+
+        self._valid(s)
         free = self._free()
         if not free:
             raise NoRoom(f"all {self.lanes.slots} lanes are busy")
-        s.count = max(1, min(s.count, C - len(prompt)))
-        hit = self.kept.lookup(prompt) if self.kept is not None and s.draft else None
-        lane = self._lane(free, hit)
+        s.count = max(1, min(s.count, self.lanes.capacity - len(s.prompt)))
+        hit = self.kept.lookup(s.prompt) if self.kept is not None and s.draft else None
+        rows = span_rows(self.pbuf.rows, any(not x.done for x in self.streams.values()))
+        plan = {"lane": self._lane(free, hit), "cached": len(hit.ids) if hit is not None else 0,
+                "rows_in": self._rows_in(hit), "rows": rows}
+        return plan, hit
+
+    @torch.no_grad()
+    def admit(self, s: Stream, told: dict | None = None) -> None:
+        """Queue ``s``'s prompt in a free lane, running no forward: later steps fill it a span at a time, from its
+        longest kept prefix when it drafts; rank 1 is ``told`` rank 0's plan."""
+
+        plan, hit = self._admission(s, told)
+        lane, rows = plan["lane"], plan["rows"]
         e = self.engines[lane]
         e.drop_reads()
-        rows = span_rows(self.pbuf.rows, any(not x.done for x in self.streams.values()))
-        s.fill = Fill(e, prompt, s.sampling, rows=rows) if self.kept is None else self._resume(s, lane, hit, rows)
-        s.lane, s.sid, s.prefill_s, s.cached = lane, self.next_id, 0.0, len(hit.ids) if hit is not None else 0
+        s.fill = Fill(e, s.prompt, s.sampling, rows=rows) if self.kept is None else self._resume(s, lane, hit, rows)
+        s.lane, s.sid, s.prefill_s, s.cached, s.span_rows = lane, self.next_id, 0.0, plan["cached"], rows
         self.used[lane] = self.next_id
         self.next_id += 1
         self.filling.append(s)
@@ -134,18 +154,17 @@ class LaneDecoder:
             raise
 
     @torch.no_grad()
-    def round(self) -> list[Stream]:
-        """Up to FILL_SPANS spans of a prompt when no lane decodes, else a span or a decode round -> streams ended."""
+    def round(self, told: dict | None = None) -> list[Stream]:
+        """Up to FILL_SPANS spans of a prompt when no lane decodes, else a span or a decode round -> streams ended;
+        rank 1 is ``told`` rank 0's plan."""
 
-        decoding = any(not s.done for s in self.streams.values())
-        arrived = bool(self.filling) and not decoding and self.arrived()
-        s, spans = self.plan.next(self.filling, decoding, arrived)
+        s, spans, decode = self._round_plan(told)
         if s is not None:
             done = self._fill(s, spans)
-        elif decoding:
+        elif decode:
             start = time.perf_counter()
             done = self._decode()
-            if self.filling:
+            if self.filling and self.follower is None:
                 self.plan.spent(time.perf_counter() - start)
         else:
             done = []
@@ -171,7 +190,8 @@ class LaneDecoder:
                 return [s]
             end.record()
             s.prefill_s += time.perf_counter() - t
-            self.plan.spanned(s, self.filling, lambda start=start, end=end: _elapsed(start, end))
+            if self.follower is None:               # rank 0's credit; rank 1 is told
+                self.plan.spanned(s, self.filling, lambda start=start, end=end: _elapsed(start, end))
             if last:
                 return self._join(s)
         return []
@@ -275,6 +295,8 @@ class LaneDecoder:
     def finish(self, done: list[Stream]) -> None:
         """Free the lanes of streams that ended: done, a client gone, or a background stream yielding."""
 
+        if done:
+            self._send(["finish", [s.sid for s in done]])
         for s in done:
             filling = any(x is s for x in self.filling)
             if not filling and self.streams.get(s.sid) is not s:
@@ -289,6 +311,7 @@ class LaneDecoder:
     def drop(self) -> list[Stream]:
         """Every live stream, all lanes freed; a failed round may leave the decode selection's scratch dirty: zeroed."""
 
+        self._send(["drop"])
         live = [s for s in self.streams.values() if not s.done] + self.filling
         for s in self.filling:
             s.fill.close()
