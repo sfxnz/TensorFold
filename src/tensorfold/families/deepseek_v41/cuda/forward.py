@@ -196,17 +196,19 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_row
 
 
 @torch.no_grad()
-def commit(w: Weights, st: State, b: Buffers, R: int, keep: int, first: int = 0) -> None:
-    """Keep the last forward's rows first..keep, row first at ``st.pos`` (a prompt chunk may keep its rows in two
-    steps): window KV into the rings, the tails, then ``pos += keep - first``."""
+def commit(w: Weights, st: State, b: Buffers, R: int, keep: int, first: int = 0, row0: int = 0) -> None:
+    """Keep the last forward's rows first..keep of the R from row ``row0`` (a lane's segment), row first at
+    ``st.pos`` (a prompt chunk may keep its rows in two steps): window KV into the rings, the tails, then
+    ``pos += keep - first``."""
 
-    if not 0 <= first < keep <= R <= b.rows or (first and not b.prefill):
-        raise ValueError(f"commit: rows {first}..{keep} of {R} ({'a prompt chunk' if b.prefill else 'decode'})")
+    if not 0 <= first < keep <= R <= b.rows - row0 or row0 < 0 or (first and not b.prefill):
+        raise ValueError(f"commit: rows {first}..{keep} of {R} from {row0} "
+                         f"({'a prompt chunk' if b.prefill else 'decode'})")
     win, layers = st.rings.shape[1], w.cfg.num_hidden_layers
     n, at = min(keep - first, win), st.pos - first        # at: row 0's position
     slots = torch.arange(keep - n, keep, device=st.rings.device).add_(at).remainder_(win)
-    st.rings[:layers].index_copy_(1, slots, b.kvw[:layers, keep - n:keep])
-    compressor.commit_tail(st, b, at, keep)
+    st.rings[:layers].index_copy_(1, slots, b.kvw[:layers, row0 + keep - n:row0 + keep])
+    compressor.commit_tail(st, b, at, keep, row0)
     back = w.cfg.engram_max_ngram_size - 1
-    st.history = (st.history + b.ids_host[first:keep].tolist())[-back:] if back > 0 else []
+    st.history = (st.history + b.ids_host[row0 + first:row0 + keep].tolist())[-back:] if back > 0 else []
     st.set_pos(at + keep)

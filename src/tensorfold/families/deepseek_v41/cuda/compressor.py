@@ -122,13 +122,14 @@ def compress(lw: LayerW, xa: torch.Tensor, state: State, buf: Buffers, table: to
                     BLOCK=triton.next_power_of_2(d), BLOCK_K=triton.next_power_of_2(dk), LANES=lanes, num_warps=4)
 
 
-def commit_tail(state: State, buf: Buffers, pos: int, keep: int) -> None:
-    """After a forward at ``pos`` keeps ``keep`` rows: an open group's first row becomes each ratio-2 source's tail."""
+def commit_tail(state: State, buf: Buffers, pos: int, keep: int, row0: int = 0) -> None:
+    """After a forward at ``pos`` keeps ``keep`` rows from row ``row0``: an open group's first row becomes each
+    ratio-2 source's tail."""
 
     if not state.pooled:
         return
     if (pos + keep) % 2:
-        state.tail.copy_(buf.cmp[:, keep - 1])
+        state.tail.copy_(buf.cmp[:, row0 + keep - 1])
         state.tail_valid.fill_(1)
     else:
         state.tail_valid.zero_()

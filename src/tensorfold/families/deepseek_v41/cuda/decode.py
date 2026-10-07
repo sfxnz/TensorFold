@@ -29,18 +29,24 @@ def _clock() -> dict[str, float]:
 
 
 class Engine:
-    """One rank's weights, sequence state, buffers, DSpark scratch and Engram host side; tests replace ``propose``."""
+    """One rank's weights, sequence state, buffers, DSpark scratch and Engram host side; tests replace ``propose``. A
+    lane Engine is given a lane's ``st`` and the shared buffers, and its windows run in the shared forward."""
 
     def __init__(self, w: Weights, capacity: int, prefill_rows: int = PREFILL_ROWS, graphs: bool = False, *,
-                 hasher=None, reader=None) -> None:
+                 hasher=None, reader=None, st: State | None = None, pbuf: Buffers | None = None,
+                 dbuf: Buffers | None = None, dwork: dspark.Work | None = None, ahead=None) -> None:
         if w.engram and (hasher is None or reader is None):
             raise ValueError("a checkpoint with Engram layers needs its hasher and reader")
+        if st is not None and st.capacity != capacity:
+            raise ValueError(f"a lane of {st.capacity} positions for an engine of {capacity}")
         cfg, dev = w.cfg, w.device
-        self.w, self.hasher, self.reader = w, hasher, reader
-        self.st = State(cfg, capacity, dev)
-        self.pbuf = Buffers(cfg, w.world, min(prefill_rows, capacity), capacity, prefill=True, device=dev)
-        self.dbuf = Buffers(cfg, w.world, MAX_ROWS, capacity, device=dev)
-        self.dwork = dspark.Work(cfg, w.world, dev) if w.dspark is not None else None
+        self.w, self.hasher, self.reader, self.lane = w, hasher, reader, st is not None
+        self.st = State(cfg, capacity, dev) if st is None else st
+        self.pbuf = Buffers(cfg, w.world, min(prefill_rows, capacity), capacity, prefill=True, device=dev) \
+            if pbuf is None else pbuf
+        self.dbuf = Buffers(cfg, w.world, MAX_ROWS, capacity, device=dev) if dbuf is None else dbuf
+        self.dwork = dspark.Work(cfg, w.world, dev) if dwork is None and w.dspark is not None else dwork
+        self.ahead = self.dbuf if ahead is None else ahead     # pinned Engram rows read ahead for the next window
         self.eos: tuple[int, ...] = (cfg.eos_token_id,)
         self.clock = _clock()                       # the current round's
         self.replays = {"graph": 0, "eager": 0}     # verify forwards by path
@@ -63,6 +69,8 @@ class Engine:
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
         """A verify window at ``st.pos``, staged then replayed (or eager) -> logits fp32 [R, V / world]."""
 
+        if self.lane:
+            raise RuntimeError("a lane Engine's windows run in the shared forward over its lanes, not forward()")
         w, st, b = self.w, self.st, self.dbuf
         t = time.perf_counter()
         R = F.stage(w, st, b, tokens, self.hasher, self.reader, ready=self._ready(tokens))
@@ -96,13 +104,13 @@ class Engine:
         t = time.perf_counter()
         if row == 0:
             self._settle()
-            self.dbuf.eraw_done[0].synchronize()
+            self.ahead.eraw_done[0].synchronize()
         key = self._key(context, token)
         self.fetched[row] = (key, self._fetch.submit(self._read_row, row, key))
         self._timed("engram", t)
 
     def _read_row(self, row: int, key: tuple) -> None:
-        w, b = self.w, self.dbuf
+        w, b = self.w, self.ahead
         ids = self.hasher.ids(np.asarray(key[0], dtype=np.int64), np.asarray([key[1]], dtype=np.int64))
         idx = b.eidx_host[0][row].numpy().reshape(-1) if w.engram_scales is not None else None
         engram.fill_rows(rank_columns(ids, w.rank, w.world), self.reader, b.eraw_host[0][row].numpy().reshape(
