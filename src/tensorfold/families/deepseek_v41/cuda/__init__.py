@@ -12,3 +12,5 @@ MOE_WINDOW = 1024                   # prompt rows per routed-expert pass
 SCORE_BYTES = 1 << 30               # the indexer's score scratch, the cap on its prompt row blocks
 DEFAULT_DRAFTS = BLOCK              # the most drafts a round unless --mtp-drafts asks otherwise
 DEFAULT_CONFIDENCE = 0.15           # drafts stop under this DSpark confidence product unless a flag sets the policy
+MAX_LANES = 4                       # sequences one shared verify forward serves (--parallel at most)
+DEFAULT_SHARE = 0.5                 # --parallel 2 or more: rounds take this share of a prompt span's time

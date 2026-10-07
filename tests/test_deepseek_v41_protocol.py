@@ -17,7 +17,7 @@ torch = pytest.importorskip("torch")
 TCPStore = pytest.importorskip("torch.distributed").TCPStore
 SETTINGS = {"start_error": False, "dspark": True, "capacity": 65544, "prefill_rows": 2048, "max_rows": 6,
             "ring": 128, "policy": (3, None), "layers": 43, "world": 2, "engram_digest": -0x123456789ABCDEF0,
-            "cache_bytes": 3 << 30, "cache_entries": 8}
+            "lanes": 4, "decode_share": 0.5, "cache_bytes": 3 << 30, "cache_entries": 8}
 
 
 @pytest.mark.parametrize("sampling", [
@@ -185,6 +185,7 @@ def test_equal_settings_agree_on_the_smaller_room():
     ("engram_digest", -0x123456789ABCDEF0 + 1),         # the low word differs
     ("engram_digest", -0x123456789ABCDEF0 + (1 << 40)),  # the high word differs
     ("capacity", 4102), ("dspark", False), ("policy", (3, 0.5)), ("policy", (0, None)), ("layers", 8),
+    ("lanes", 2), ("decode_share", 0.25),
 ])
 def test_different_settings_refuse_naming_both_values(name, value):
     a = protocol.settings(**SETTINGS)

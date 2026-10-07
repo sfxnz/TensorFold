@@ -97,12 +97,15 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     speed.add_argument("--parallel", default="auto",
                        help="requests decoded together, their windows sharing each round's forward: a number, or "
                             "auto (Mac: up to 8, each started only while the projected memory fits the budget; "
-                            "CUDA: one at a time, the others waiting their turn)")
+                            "CUDA: one at a time, the others waiting their turn). DeepSeek-V4.1-Flash on CUDA: 1 to 4, "
+                            "each lane holding a whole --context window")
     speed.add_argument("--decode-share", type=float, default=None, help="Mac: while prompts prefill, running replies "
                        "keep moving for this share of each chunk's time, and a new prompt starts at the next chunk "
                        "(default 0.25; 0: whole prompts first, in order, as 0.3.6.2). CUDA Flash Next --parallel: "
                        "replies decode inside each prompt pass; a share sizes the passes so a round's decoding takes "
-                       "it (default 0: whole passes)")
+                       "it (default 0: whole passes). CUDA DeepSeek-V4.1-Flash --parallel 2 or more: prompts fill "
+                       "between decode rounds, which take this share of each prompt span's time (default 0.5; 0: "
+                       "whole prompts first; no effect at --parallel 1)")
     speed.add_argument("--prefill-pass", type=int, default=8, help="Mac: prompt chunks one forward takes while a "
                        "prompt fills alone, for models with a prompt pass (1: one chunk a forward, as 0.5.0)")
     speed.add_argument("--pass-cache-gib", type=float, default=16.0, help="Mac: MLX's cache of freed buffers during "

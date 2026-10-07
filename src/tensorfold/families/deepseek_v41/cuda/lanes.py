@@ -7,10 +7,8 @@ from collections.abc import Sequence
 import torch
 
 from ..config import Config
-from . import MAX_ROWS
+from . import MAX_LANES, MAX_ROWS
 from .buffers import Buffers, State, _device_bytes
-
-MAX_LANES = 4                   # sequences one shared verify forward serves
 
 
 class Lanes:

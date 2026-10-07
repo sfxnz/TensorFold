@@ -18,7 +18,8 @@ from tensorfold.cuda import capacity
 from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3 import experts as exl3_experts
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, geometry, split
+from tensorfold.families.deepseek_v41.cuda import MAX_LANES, MAX_ROWS, PREFILL_ROWS, buffers, dspark, geometry, split
+from tensorfold.families.deepseek_v41.cuda.lanes import Lanes
 
 CFG = Config.read(FIXTURE.parent)
 GIB = capacity.GIB
@@ -74,8 +75,28 @@ def test_estimate_equals_the_allocations(allocated, slots):
     recorded = allocated(build)
     assert any(t.shape == (slots, 288) for t in recorded)                   # the ratio-1 cache: the constructors ran
     assert any(t.device is None for t in recorded)                          # pinned staging, outside the estimate
-    estimate = geometry.dsv41_geometry(CFG, 2).bytes_at(slots)
+    estimate = geometry.dsv41_geometry(CFG, 2, lanes=1).bytes_at(slots)
     assert _on_device(recorded) + 512 * slots == estimate                   # RoPE: fp32 cos and sin, two kinds x 32
+
+
+@pytest.mark.parametrize("lanes", range(2, MAX_LANES + 1))
+@pytest.mark.parametrize("slots", [4096, NATIVE + MAX_ROWS])
+def test_lanes_estimate_equals_the_allocations(allocated, lanes, slots):
+    """S States stacked, the shared forward's buffers over S lanes, the prompt chunk's, and S drafters' scratch."""
+
+    def build():
+        for _ in range(lanes):
+            buffers.State(CFG, slots, "cuda")
+        buffers.Buffers(CFG, 2, MAX_ROWS * lanes, slots, device="cuda", lanes=lanes)
+        buffers.Buffers(CFG, 2, PREFILL_ROWS, slots, prefill=True, device="cuda")
+
+    recorded = allocated(build)
+    meta = torch.device("meta")
+    assert Lanes(CFG, lanes, slots, meta).nbytes() == lanes * buffers.State(CFG, slots, meta).nbytes()
+    work = buffers._device_bytes(dspark.Work(CFG, 2, meta), meta)
+    estimate = geometry.dsv41_geometry(CFG, 2, lanes=lanes).bytes_at(slots)
+    assert _on_device(recorded) + lanes * work + 512 * slots == estimate
+    assert estimate > geometry.dsv41_geometry(CFG, 2).bytes_at(slots)
 
 
 def test_bytes_grow_by_kv_rope_and_score_rows():

@@ -44,12 +44,20 @@ start builds four CUDA extensions (about two minutes); later starts load in abou
 | `--mtp-confidence P` | Draft fewer when unsure: stop before the first draft whose product of DSpark's confidence scores falls under `P` (at least one, at most `--mtp-drafts`, 5 when omitted). |
 | `--no-drafts` | The serial reference: DSpark is not loaded. |
 | `--no-thinking`, `--reasoning-effort` | Request defaults, as on every family; a request's own switch wins. |
-| `--parallel N` | Accepted and ignored with a note: requests run one at a time. |
+| `--parallel N` | Requests decoded together, 1 to 4 (default 1: one at a time). Each lane holds a whole `--context` window, allocated at startup; an explicit `--context` that cannot hold N windows is refused, and without one the window shrinks until N fit. More than 4 is refused. |
+| `--decode-share S` | With `--parallel` 2 or more, a new prompt fills between decode rounds, which take this share of each prompt span's time (default 0.5; 0: whole prompts first). No effect at `--parallel 1`. |
 | `--prefill-fp8` | Refused: prompt matmuls take bf16 activations. |
 
 `TF_DSV41_CACHE_GIB` (default 3) sizes the device arena that keeps other conversations' prompt states and
-`TF_DSV41_CACHE_ENTRIES` (default 8) how many it keeps; the startup log says when the window leaves less. Give both
-ranks the same values.
+`TF_DSV41_CACHE_ENTRIES` (default 8, plus one a lane under `--parallel` 2 or more) how many it keeps; the startup log
+says when the window leaves less. Give both ranks the same values.
+
+Under `--parallel` 2 or more, each live request's verify window shares one forward with the others' and every reply
+equals its solo run. Rank 0 plans each step and sends it to rank 1, and both check they agree before any collective. A
+request's client that leaves ends it after its next round; one that leaves while its prompt fills is noticed at its
+first token. A background request that yields its lane to a waiting one later replays its whole reply, sending only
+the tokens it had not sent. An fp16 overflow of the routed experts in one lane while the first forwards still check
+for it fails that round for every live request; the requests after it are served as usual.
 
 ## Memory
 
@@ -189,6 +197,6 @@ which keeps the per-round device time at 128k close to its time at short context
 
 ## Not yet
 
-Images (DeepSeek-V4.1's vision encoder), grammars and `response_format`, `logprobs`, concurrent streams, one GPU, a
-Mac, and other exports of the model: the check refuses a BF16 LM head and EXL3 outside the routed experts, so
+Images (DeepSeek-V4.1's vision encoder), grammars and `response_format`, `logprobs`, one GPU, a Mac, and other
+exports of the model: the check refuses a BF16 LM head and EXL3 outside the routed experts, so
 `Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw` (EXL3 throughout) is refused.
