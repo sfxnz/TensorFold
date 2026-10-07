@@ -6,6 +6,8 @@ dequantized on load to the same bf16 values.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -113,17 +115,24 @@ def _bounds(POS, ANCH, CNT, r, WIN: tl.constexpr, HAS_EXTRA: tl.constexpr):
 
 
 @triton.jit
-def _chunks(Q, RING, KVW, EXTRA, LISTS, CNT, POS, ANCH, PART, q_row, q_head, kv_stride, e_stride, l_stride,
-            p_row, p_head, p_chunk, H: tl.constexpr, LW: tl.constexpr, WIN: tl.constexpr, CH: tl.constexpr,
-            HBT: tl.constexpr, KTT: tl.constexpr, SCALE: tl.constexpr, HAS_EXTRA: tl.constexpr,
-            PACKED_WIN: tl.constexpr, PACKED_EXTRA: tl.constexpr):
-    """Program (row, head block, chunk): partial (acc, max, sum) of HB heads over list entries [c CH, (c+1) CH)."""
+def _chunks(Q, RING, KVW, EXTRA, LISTS, CNT, POS, ANCH, PART, LANE, SEG0, q_row, q_head, kv_stride, e_stride,
+            l_stride, ring_lane, extra_lane, p_row, p_head, p_chunk, H: tl.constexpr, LW: tl.constexpr,
+            WIN: tl.constexpr, CH: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr, SCALE: tl.constexpr,
+            HAS_EXTRA: tl.constexpr, PACKED_WIN: tl.constexpr, PACKED_EXTRA: tl.constexpr, LANES: tl.constexpr):
+    """Program (row, head block, chunk): partial (acc, max, sum) of HB heads over list entries [c CH, (c+1) CH);
+    LANES: row r reads lane LANE[r]'s ring, extra rows and start, its fresh rows from SEG0[r]."""
 
     r = tl.program_id(0).to(tl.int64)
     hh = tl.program_id(1) * HBT + tl.arange(0, HBT)
     c = tl.program_id(2)
     hok = hh < H
     k = tl.arange(0, LW)
+    if LANES:
+        lane = tl.load(LANE + r).to(tl.int64)
+        RING += lane * ring_lane
+        EXTRA += lane * extra_lane
+        KVW += tl.load(SEG0 + r).to(tl.int64) * kv_stride
+        POS += lane
     pos, lo, nw, total = _bounds(POS, ANCH, CNT, r, WIN, HAS_EXTRA)
     m = tl.full((HBT,), float("-inf"), tl.float32)
     l = tl.zeros((HBT,), tl.float32)
@@ -218,13 +227,26 @@ def chunks(width: int, window: int = 128) -> int:
     return triton.cdiv(window + width, CHUNK)
 
 
+class LaneArgs(NamedTuple):
+    """A shared decode forward's tables: each row's lane and segment start, each lane's start, lane strides in
+    elements."""
+
+    lane: torch.Tensor
+    seg0: torch.Tensor
+    pos: torch.Tensor
+    ring_stride: int
+    extra_stride: int
+
+
 def attention(q: torch.Tensor, ring: torch.Tensor, kvw: torch.Tensor | None, pos: torch.Tensor,
               anchors: torch.Tensor, extra: torch.Tensor | None, lists: torch.Tensor | None,
               counts: torch.Tensor | None, sink: torch.Tensor, out: torch.Tensor, *, prompt: bool,
-              part: torch.Tensor | None = None) -> torch.Tensor:
+              part: torch.Tensor | None = None, lanes: LaneArgs | None = None) -> torch.Tensor:
     """q [R, H, 512] bf16 -> out bf16 over each row's ring window, this forward's rows and its list.
 
-    ``ring`` and ``kvw``: bf16 rows, or packed FP8 uint8 rows; ``extra``: bf16 rows, or packed FP4 rows per 16."""
+    ``ring`` and ``kvw``: bf16 rows, or packed FP8 uint8 rows; ``extra``: bf16 rows, or packed FP4 rows per 16.
+    ``lanes`` (decode): ``ring`` and ``extra`` are lane 0's, ``lanes.pos`` stands for ``pos``, ``anchors`` are row
+    positions."""
 
     R, H, LW = q.shape
     WIN = ring.shape[0]
@@ -247,6 +269,9 @@ def attention(q: torch.Tensor, ring: torch.Tensor, kvw: torch.Tensor | None, pos
             raise ValueError(f"attention: {name} rows must be contiguous")
     if not ring.is_contiguous():
         raise ValueError("attention: ring must be contiguous")
+    if lanes is not None and (prompt or lanes.lane.shape[0] < R or lanes.seg0.shape[0] < R):
+        raise ValueError(f"attention: lane tables {tuple(lanes.lane.shape)}, {tuple(lanes.seg0.shape)} for {R} "
+                         f"decode rows")
     kvw_ = kvw if kvw is not None else ring
     extra_, lists_, counts_ = (extra, lists, counts) if has_extra else (ring, anchors, anchors)
     l_stride = lists.stride(0) if has_extra else 0
@@ -263,8 +288,10 @@ def attention(q: torch.Tensor, ring: torch.Tensor, kvw: torch.Tensor | None, pos
             or part.shape[3] != LW + 2 or part.stride(3) != 1:
         raise ValueError(f"attention: decode needs part [>= {R}, {H}, >= {nch}, {LW + 2}] fp32")
     strides = (part.stride(0), part.stride(1), part.stride(2))
+    lane, seg0, pos, ring_lane, extra_lane = lanes if lanes is not None else (anchors, anchors, pos, 0, 0)
     _chunks[(R, triton.cdiv(H, HB), nch)](
-        q, ring, kvw_, extra_, lists_, counts_, pos, anchors, part, q.stride(0), q.stride(1), kvw_.stride(0),
-        extra_.stride(0), l_stride, *strides, CH=CHUNK, HBT=HB, KTT=KT, num_warps=8, num_stages=1, **common)
+        q, ring, kvw_, extra_, lists_, counts_, pos, anchors, part, lane, seg0, q.stride(0), q.stride(1),
+        kvw_.stride(0), extra_.stride(0), l_stride, ring_lane, extra_lane, *strides, CH=CHUNK, HBT=HB, KTT=KT,
+        LANES=lanes is not None, num_warps=8, num_stages=1, **common)
     _merge[(R, H)](part, sink, out, out.stride(0), out.stride(1), *strides, nch, LW=LW, num_warps=4)
     return out
