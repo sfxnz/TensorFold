@@ -156,7 +156,8 @@ def tiny(tiny_dir):
 @pytest.fixture(scope="module")
 def geng(tiny, ref):
     e = _engine(tiny, ref, graphs=True)
-    assert e.st.pos == 0 and len(e.graphs.verify) == MAX_ROWS and len(e.graphs.drafts) == 2 * BLOCK
+    assert e.st.pos == 0 and len(e.graphs.verify) == len(e.graphs.absorb) == MAX_ROWS
+    assert len(e.graphs.drafts) == 2 * BLOCK
     return e
 
 
