@@ -90,6 +90,19 @@ class State:
         self.tail_valid = torch.zeros((len(self.pooled),), dtype=i32, device=dev)
         self.history: list[int] = []     # the last engram_max_ngram_size - 1 committed ids, oldest first
 
+    @classmethod
+    def view(cls, stack, k: int) -> State:
+        """Lane ``k`` of a lane-first ``stack`` of these fields as a State over its slices, allocating nothing."""
+
+        st = cls.__new__(cls)
+        st.ratio, st.capacity, st.device, st.pooled = dict(stack.ratio), stack.capacity, stack.device, stack.pooled
+        st.pos, st.pos_dev, st.rings = 0, stack.pos_dev[k:k + 1], stack.rings[k]
+        st.comp = {layer: c[k] for layer, c in stack.comp.items()}
+        st.index_k = {layer: c[k] for layer, c in stack.index_k.items()}
+        st.tail, st.tail_valid = stack.tail[k], stack.tail_valid[k]
+        st.history = []
+        return st
+
     def set_pos(self, pos: int) -> None:
         self.pos = pos
         self.pos_dev.fill_(pos)
@@ -115,10 +128,11 @@ class State:
 
 
 class Buffers:
-    """Scratch for a window of up to ``rows`` rows (sliced [:R]); ``prefill``: a prompt chunk's, every output kept."""
+    """Scratch for a window of up to ``rows`` rows (sliced [:R]); ``prefill``: a prompt chunk's, every output kept;
+    ``lanes``: a shared forward's over that many lanes, with its row tables."""
 
     def __init__(self, cfg: Config, world: int, rows: int, capacity: int, prefill: bool = False,
-                 device: torch.device | str = "cuda") -> None:
+                 device: torch.device | str = "cuda", lanes: int = 0) -> None:
         dev = torch.device(device)
         host = dev.type == "cuda"        # pinned staging and events exist for a real device only
         bf, f32, i32, i64, u8 = torch.bfloat16, torch.float32, torch.int32, torch.int64, torch.uint8
@@ -135,6 +149,11 @@ class Buffers:
         self.ids = torch.zeros((rows,), dtype=i32, device=dev)
         self.ids_host = torch.zeros((rows,), dtype=i32, pin_memory=True) if host else None
         self.staged = torch.cuda.Event() if host else None
+        if lanes:       # each row's lane, position and segment start; each segment's (start row, rows) and their count
+            tables = {"lane": (rows,), "rpos": (rows,), "seg0": (rows,), "segs": (lanes, 2), "nseg": (1,)}
+            for name, shape in tables.items():
+                setattr(self, name, torch.zeros(shape, dtype=i32, device=dev))
+                setattr(self, name + "_host", torch.zeros(shape, dtype=i32, pin_memory=True) if host else None)
         self.X = t((rows, S, D), bf)
         self.pre_in = t((rows, S), f32)
         # mHC, attention side then FFN side

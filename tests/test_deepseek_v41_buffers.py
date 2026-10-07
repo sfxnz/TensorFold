@@ -12,6 +12,7 @@ pytest.importorskip("triton")
 
 from tensorfold.families.deepseek_v41.config import Config
 from tensorfold.families.deepseek_v41.cuda import buffers, weights
+from tensorfold.families.deepseek_v41.cuda.lanes import MAX_LANES, Lanes
 
 CFG = Config.read(Path(__file__).parent / "fixtures" / "deepseek_v41")
 CAPACITIES = (4096, 65536, 1 << 20)
@@ -173,6 +174,51 @@ def test_reduced_layer_set():
     b = buffers.Buffers(cfg, 2, 6, 4096, device="meta")
     assert b.kvw.shape == (11, 6, 528) and b.cmp.shape == (1, 6, 2, 512) and b.scores.shape == (6, 2049)
     assert b.eraw.shape == (6, 1, 12, 264)
+
+
+@pytest.mark.parametrize("slots", range(1, MAX_LANES + 1))
+def test_lanes_stack_a_state_per_lane(slots):
+    lanes, one = Lanes(CFG, slots, 65536, "meta"), buffers.State(CFG, 65536, "meta")
+    assert lanes.rings.shape == (slots, 43, 128, 528) and lanes.tail.shape == (slots, 3, 2, 512)
+    assert {k: tuple(v.shape) for k, v in lanes.comp.items()} == {k: (slots, *v.shape) for k, v in one.comp.items()}
+    assert {k: tuple(v.shape) for k, v in lanes.index_k.items()} == {
+        k: (slots, *v.shape) for k, v in one.index_k.items()}
+    assert lanes.tail_valid.shape == (slots, 3) and lanes.pos_dev.shape == (slots,)
+    assert lanes.nbytes() == slots * one.nbytes() == slots * lanes.view(slots - 1).nbytes()
+
+
+def test_lanes_bound():
+    with pytest.raises(ValueError, match="slots"):
+        Lanes(CFG, MAX_LANES + 1, 4096, "meta")
+
+
+def test_a_lane_view_aliases_the_stack():
+    lanes = Lanes(CFG, 3, 64, "cpu")
+    v = lanes.view(1)
+    assert v is lanes.view(1) and v.pos == 0 and v.history == [] and v.capacity == 64 and v.pooled == (2, 8, 14)
+    assert v.rings.data_ptr() == lanes.rings[1].data_ptr() and v.rings.is_contiguous()
+    v.set_pos(37)
+    for t in (v.rings, v.tail, v.tail_valid, *v.comp.values(), *v.index_k.values()):
+        t.fill_(7)
+    assert lanes.pos_dev.tolist() == [0, 37, 0] and lanes.view(0).pos == lanes.view(2).pos == 0
+    for t in (lanes.rings, lanes.tail, lanes.tail_valid, *lanes.comp.values(), *lanes.index_k.values()):
+        assert (t[1] == 7).all() and not t[0].any() and not t[2].any()
+    v.reset()
+    assert int(lanes.pos_dev[1]) == 0 and not lanes.tail_valid[1].any()
+
+
+@pytest.mark.parametrize("slots", range(1, MAX_LANES + 1))
+def test_lane_tables_add_only_their_bytes(slots):
+    rows = 6 * slots
+    solo, b = buffers.Buffers(CFG, 2, rows, 65536, device="meta"), buffers.Buffers(CFG, 2, rows, 65536,
+                                                                                    device="meta", lanes=slots)
+    assert not hasattr(solo, "lane") and not hasattr(solo, "segs")
+    assert {n: (tuple(getattr(b, n).shape), getattr(b, n).dtype) for n in ("lane", "rpos", "seg0", "segs", "nseg")} \
+        == {"lane": ((rows,), I32), "rpos": ((rows,), I32), "seg0": ((rows,), I32), "segs": ((slots, 2), I32),
+            "nseg": ((1,), I32)}
+    assert b.lane_host is b.rpos_host is b.seg0_host is b.segs_host is b.nseg_host is None
+    assert b.nbytes() - solo.nbytes() == 4 * (3 * rows + 2 * slots + 1) and b.nbytes() == _walk(b)
+    assert solo.nbytes() == buffers.bytes(CFG, 2, rows, 65536)
 
 
 def test_weights_fields():
