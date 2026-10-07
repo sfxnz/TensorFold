@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import triton
@@ -71,12 +71,16 @@ def _keys(KEYS, e, ok, d, D: tl.constexpr, BT: tl.constexpr, PACKED: tl.constexp
 
 
 @triton.jit
-def _scores(Q, W, KEYS, OUT, POS, CAND, CANDN, R, row0, ratio, slots, sq, sw, so, sc,
+def _scores(Q, W, KEYS, OUT, POS, CAND, CANDN, LANE, SEGS, NSEG, R, row0, ratio, slots, key_lane, sq, sw, so, sc,
             H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr, BT: tl.constexpr, RB: tl.constexpr,
-            G: tl.constexpr, CANDIDATES: tl.constexpr, PACKED: tl.constexpr):
-    """Items (rows, tile) over a persistent grid; row r's entry t is at absolute position pos + row0 + r."""
+            G: tl.constexpr, CANDIDATES: tl.constexpr, PACKED: tl.constexpr, LANES: tl.constexpr,
+            SP: tl.constexpr):
+    """Items (rows, tile) over a persistent grid; row r's entry t is at absolute position pos + row0 + r. LANES: POS
+    holds each row's position, row r reads lane LANE[r]'s keys, and items are (segment, tile) of the NSEG segments
+    (start row, rows) in SEGS."""
 
-    first = tl.load(POS).to(tl.int64) + row0
+    if not LANES:
+        first = tl.load(POS).to(tl.int64) + row0
     h = tl.arange(0, HP)
     hok = h < H
     d = tl.arange(0, D)
@@ -90,10 +94,31 @@ def _scores(Q, W, KEYS, OUT, POS, CAND, CANDN, R, row0, ratio, slots, sq, sw, so
             if (i % tiles) * BT < n:
                 blk = tl.load(CAND + r * sc + c // G, mask=c < n, other=0).to(tl.int64)
                 e = blk * G + c % G
-                ok = (c < n) & (e < (first + r + 1) // ratio)
-                k = _keys(KEYS, e, ok, d, D, BT, PACKED)
+                if LANES:
+                    ok = (c < n) & (e < (tl.load(POS + r).to(tl.int64) + 1) // ratio)
+                    k = _keys(KEYS + tl.load(LANE + r).to(tl.int64) * key_lane, e, ok, d, D, BT, PACKED)
+                else:
+                    ok = (c < n) & (e < (first + r + 1) // ratio)
+                    k = _keys(KEYS, e, ok, d, D, BT, PACKED)
                 s = _row_scores(Q + r * sq, W + r * sw, k, h, hok, d, D)
                 tl.store(OUT + r * so + c, s, mask=ok)     # slots past the row's entries are never read
+    elif LANES:                                     # a tile is one segment's, so never read across lanes
+        g = tl.arange(0, SP)
+        nseg = tl.load(NSEG)
+        last = tl.load(SEGS + 2 * g, mask=g < nseg, other=0) + tl.load(SEGS + 2 * g + 1, mask=g < nseg, other=1) - 1
+        tops = (tl.load(POS + last, mask=g < nseg, other=-1).to(tl.int64) + 1) // ratio
+        tiles = tl.cdiv(tl.max(tops, 0), BT)        # the most entries a segment's last row sees
+        for i in range(tl.program_id(0), nseg * tiles, tl.num_programs(0)):
+            lo = tl.load(SEGS + 2 * (i // tiles))
+            hi = lo + tl.load(SEGS + 2 * (i // tiles) + 1)
+            top = (tl.load(POS + hi - 1).to(tl.int64) + 1) // ratio
+            e = (i % tiles) * BT + j
+            if (i % tiles) * BT < top:
+                k = _keys(KEYS + tl.load(LANE + lo).to(tl.int64) * key_lane, e, e < top, d, D, BT, PACKED)
+                for r in range(lo, hi):
+                    s = _row_scores(Q + r * sq, W + r * sw, k, h, hok, d, D)
+                    s = tl.where(e < (tl.load(POS + r).to(tl.int64) + 1) // ratio, s, float("-inf"))
+                    tl.store(OUT + r * so + e, s, mask=e < top)
     else:
         tiles = tl.cdiv((first + R) // ratio, BT)
         for i in range(tl.program_id(0), tl.cdiv(R, RB) * tiles, tl.num_programs(0)):
@@ -116,11 +141,23 @@ def _sms(device: torch.device) -> int:
     return _SMS[i]
 
 
+class LaneArgs(NamedTuple):
+    """A shared decode forward's tables: each row's lane and position, the segments (start row, rows) and their
+    count, the keys' lane stride in elements."""
+
+    lane: torch.Tensor
+    rpos: torch.Tensor
+    segs: torch.Tensor
+    nseg: torch.Tensor
+    stride: int
+
+
 def scores(qI: torch.Tensor, wI: torch.Tensor, keys: torch.Tensor, ratio: int, pos: torch.Tensor,
            out: torch.Tensor, *, row0: int = 0, cand: torch.Tensor | None = None,
-           cand_n: torch.Tensor | None = None, block: int = 8) -> torch.Tensor:
+           cand_n: torch.Tensor | None = None, block: int = 8, tables: LaneArgs | None = None) -> torch.Tensor:
     """Each row's fp32 sum_h relu(q_h . k_t) * w_h over the entries it sees (M:556-567), -inf past them; ``keys``:
-    bf16 rows, or packed FP4 rows per 32 (the same bits)."""
+    bf16 rows, or packed FP4 rows per 32 (the same bits). ``tables`` (decode): ``keys`` are lane 0's, row r is lane
+    lane[r]'s at rpos[r]."""
 
     R, H, D = qI.shape
     packed = keys.dtype == torch.uint8
@@ -132,21 +169,33 @@ def scores(qI: torch.Tensor, wI: torch.Tensor, keys: torch.Tensor, ratio: int, p
         raise ValueError(f"scores: fp32 weights [{R}, {H}] with unit-stride heads")
     if out.dtype != torch.float32 or out.shape[0] < R or out.stride(1) != 1 or out.shape[1] < keys.shape[0]:
         raise ValueError(f"scores: fp32 out of {R} rows and at least {keys.shape[0]} columns")
+    _check_tables(tables, R, row0)
     if R == 0:
         return out
     if cand is None:
-        items, slots = triton.cdiv(R, ROWS) * triton.cdiv(keys.shape[0], TILE), 0
+        blocks = tables.segs.shape[0] if tables is not None else triton.cdiv(R, ROWS)
+        items, slots = blocks * triton.cdiv(keys.shape[0], TILE), 0
     else:
         if cand.dtype != torch.int32 or cand.shape[0] < R or cand.stride(1) != 1 or cand_n is None:
             raise ValueError("scores: int32 candidate blocks [rows, blocks] and their counts")
         slots = cand.shape[1] * block
         items = R * triton.cdiv(slots, TILE)
     grid = (max(1, min(items, WAVES * _sms(qI.device))),)
-    _scores[grid](qI, wI, keys, out, pos, cand if cand is not None else qI, cand_n if cand is not None else qI, R,
-                  row0, ratio, slots, qI.stride(0), wI.stride(0), out.stride(0),
-                  cand.stride(0) if cand is not None else 0, H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
-                  BT=TILE, RB=ROWS, G=block, CANDIDATES=cand is not None, PACKED=packed, num_warps=4)
+    lane, segs, nseg, stride = (tables.lane, tables.segs, tables.nseg, tables.stride) if tables is not None else \
+        (pos, pos, pos, 0)
+    _scores[grid](qI, wI, keys, out, tables.rpos if tables is not None else pos, cand if cand is not None else qI,
+                  cand_n if cand is not None else qI, lane, segs, nseg, R, row0, ratio, slots, stride, qI.stride(0),
+                  wI.stride(0), out.stride(0), cand.stride(0) if cand is not None else 0, H=H,
+                  HP=max(16, triton.next_power_of_2(H)), D=D, BT=TILE, RB=ROWS, G=block, CANDIDATES=cand is not None,
+                  PACKED=packed, LANES=tables is not None,
+                  SP=triton.next_power_of_2(segs.shape[0]) if tables is not None else 1, num_warps=4)
     return out
+
+
+def _check_tables(tables: LaneArgs | None, R: int, row0: int) -> None:
+    if tables is not None and (row0 or tables.lane.shape[0] < R or tables.rpos.shape[0] < R):
+        raise ValueError(f"indexer: lane tables {tuple(tables.lane.shape)}, {tuple(tables.rpos.shape)} for {R} "
+                         f"decode rows from {row0}")
 
 
 @triton.jit
@@ -182,10 +231,14 @@ def _items(S, CAND, c0, n, vis, G: tl.constexpr, BLOCKS: tl.constexpr, CANDIDATE
 
 
 @triton.jit
-def _extent(POS, CANDN, r, row0, ratio, G: tl.constexpr, BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr):
-    """(entries row r sees, items it selects among)."""
+def _extent(POS, CANDN, r, row0, ratio, G: tl.constexpr, BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr,
+            LANES: tl.constexpr):
+    """(entries row r sees, items it selects among); LANES: POS holds each row's position."""
 
-    vis = (tl.load(POS).to(tl.int64) + row0 + r + 1) // ratio
+    if LANES:
+        vis = (tl.load(POS + r).to(tl.int64) + 1) // ratio
+    else:
+        vis = (tl.load(POS).to(tl.int64) + row0 + r + 1) // ratio
     if BLOCKS:
         n = tl.cdiv(vis, G)
     elif CANDIDATES:
@@ -197,11 +250,11 @@ def _extent(POS, CANDN, r, row0, ratio, G: tl.constexpr, BLOCKS: tl.constexpr, C
 
 @triton.jit
 def _select(S, OUT, OUTN, POS, CAND, CANDN, row0, ratio, K, ss, so, sc, G: tl.constexpr,
-            BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr, B: tl.constexpr):
+            BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr, B: tl.constexpr, LANES: tl.constexpr):
     """Program r: radix select of the K-th best key, then the items above it and the lowest-numbered ties."""
 
     r = tl.program_id(0).to(tl.int64)
-    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES)
+    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES, LANES)
     row = S + r * ss
     cand = CAND + r * sc
     bins = tl.arange(0, 256)
@@ -247,12 +300,13 @@ def _digit(hist, need, bins):
 
 @triton.jit
 def _split_hist(S, POS, CAND, CANDN, HIST, COUNTS, row0, ratio, ss, sc, P, G: tl.constexpr, BLOCKS: tl.constexpr,
-                CANDIDATES: tl.constexpr, B: tl.constexpr, STEPS: tl.constexpr, NB: tl.constexpr):
+                CANDIDATES: tl.constexpr, B: tl.constexpr, STEPS: tl.constexpr, NB: tl.constexpr,
+                LANES: tl.constexpr):
     """Program (r, p): the first digit's histogram of items [p STEPS B, (p + 1) STEPS B) added into row r's."""
 
     r = tl.program_id(0).to(tl.int64)
     p = tl.program_id(1)
-    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES)
+    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES, LANES)
     tl.store(COUNTS + (r * 3 + 1) * P + p, 0)       # the counts _split_refine adds to, left by the last selection
     tl.store(COUNTS + (r * 3 + 2) * P + p, 0)
     c0 = p * (STEPS * B)
@@ -267,12 +321,12 @@ def _split_hist(S, POS, CAND, CANDN, HIST, COUNTS, row0, ratio, ss, sc, P, G: tl
 @triton.jit
 def _split_gather(S, POS, CAND, CANDN, HIST, BN, BKEY, BITEM, COUNTS, row0, ratio, K, ss, sc, sb, P,
                   G: tl.constexpr, BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr, B: tl.constexpr,
-                  STEPS: tl.constexpr, NB: tl.constexpr):
+                  STEPS: tl.constexpr, NB: tl.constexpr, LANES: tl.constexpr):
     """Program (r, p): its items past the first digit's bin counted, those in the bin appended to row r's list."""
 
     r = tl.program_id(0).to(tl.int64)
     p = tl.program_id(1)
-    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES)
+    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES, LANES)
     hist = tl.load(HIST + r * NB + tl.arange(0, NB))
     digit = _digit(hist, tl.minimum(K, tl.sum(hist, 0)), tl.arange(0, NB))[0]
     above = 0
@@ -338,13 +392,13 @@ def _split_refine(OUTN, HIST, BN, BKEY, BITEM, COUNTS, THR, K, sb, P, B: tl.cons
 @triton.jit
 def _split_write(S, OUT, POS, CAND, CANDN, COUNTS, THR, row0, ratio, ss, so, sc, P, G: tl.constexpr,
                  BLOCKS: tl.constexpr, CANDIDATES: tl.constexpr, B: tl.constexpr, STEPS: tl.constexpr,
-                 PP: tl.constexpr):
+                 PP: tl.constexpr, LANES: tl.constexpr):
     """Program (r, p): its items above the K-th best key and its share of the lowest-numbered ties, after the
     items the earlier programs write."""
 
     r = tl.program_id(0).to(tl.int64)
     p = tl.program_id(1)
-    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES)
+    vis, n = _extent(POS, CANDN, r, row0, ratio, G, BLOCKS, CANDIDATES, LANES)
     c0 = p * (STEPS * B)
     if c0 < n:
         q = tl.arange(0, PP)
@@ -377,7 +431,7 @@ def _check(s: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor) -> int:
 
 def _split(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor, row0: int,
            cand: torch.Tensor | None, cand_n: torch.Tensor | None, block: int, work: dict[str, torch.Tensor],
-           blocks: bool) -> None:
+           blocks: bool, lanes: bool) -> None:
     """``_select``'s lists from a decode window's few rows, each row spread over programs: one histogram pass of
     the first digit, the rest resolved on that digit's bin, then each program writes its share in item order."""
 
@@ -391,7 +445,7 @@ def _split(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, ou
         raise ValueError(f"select: split scratch for {hist.shape[0]} rows, {bkey.shape[1]} entries and "
                          f"{counts.shape[2]} programs, not {R} rows of {items} items")
     cand_, cand_n_, sc = (cand, cand_n, cand.stride(0)) if cand is not None else (s, s, 0)
-    mode = {"G": block, "BLOCKS": blocks, "CANDIDATES": cand is not None, "B": B, "STEPS": STEPS}
+    mode = {"G": block, "BLOCKS": blocks, "CANDIDATES": cand is not None, "B": B, "STEPS": STEPS, "LANES": lanes}
     Pw = counts.shape[2]
     _split_hist[(R, P)](s, pos, cand_, cand_n_, hist, counts, row0, ratio, s.stride(0), sc, Pw, NB=SPLIT_BINS, **mode,
                         num_warps=4)
@@ -404,32 +458,37 @@ def _split(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, ou
 
 
 def candidates(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor, *,
-               block: int = 8, row0: int = 0, work: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+               block: int = 8, row0: int = 0, work: dict[str, torch.Tensor] | None = None,
+               tables: LaneArgs | None = None) -> torch.Tensor:
     """Each row's best blocks of ``block`` entries by their best score (M:583-610), ascending into out; ``work``:
-    a decode window's split selection (the same lists)."""
+    a decode window's split selection (the same lists); ``tables``: row r at rpos[r]."""
 
     R = _check(s, out, out_n)
+    _check_tables(tables, R, row0)
+    lanes, pos = tables is not None, tables.rpos if tables is not None else pos
     if R and work is not None:
-        _split(s, ratio, pos, out, out_n, row0, None, None, block, work, True)
+        _split(s, ratio, pos, out, out_n, row0, None, None, block, work, True, lanes)
     elif R:
         _select[(R,)](s, out, out_n, pos, s, s, row0, ratio, out.shape[1], s.stride(0), out.stride(0), 0,
-                      G=block, BLOCKS=True, CANDIDATES=False, B=PICK // 2, num_warps=4)
+                      G=block, BLOCKS=True, CANDIDATES=False, B=PICK // 2, LANES=lanes, num_warps=4)
     return out
 
 
 def topk(s: torch.Tensor, ratio: int, pos: torch.Tensor, out: torch.Tensor, out_n: torch.Tensor, *,
          row0: int = 0, cand: torch.Tensor | None = None, cand_n: torch.Tensor | None = None,
-         block: int = 8, work: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+         block: int = 8, work: dict[str, torch.Tensor] | None = None, tables: LaneArgs | None = None) -> torch.Tensor:
     """Each row's best visible entries (M:577-580), ascending into out; with ``cand``, of its candidates; ``work``:
-    a decode window's split selection (the same lists)."""
+    a decode window's split selection (the same lists); ``tables``: row r at rpos[r]."""
 
     R = _check(s, out, out_n)
+    _check_tables(tables, R, row0)
+    lanes, pos = tables is not None, tables.rpos if tables is not None else pos
     if R and work is not None:
-        _split(s, ratio, pos, out, out_n, row0, cand, cand_n, block, work, False)
+        _split(s, ratio, pos, out, out_n, row0, cand, cand_n, block, work, False, lanes)
     elif R:
         _select[(R,)](s, out, out_n, pos, cand if cand is not None else s, cand_n if cand is not None else s, row0,
                       ratio, out.shape[1], s.stride(0), out.stride(0), cand.stride(0) if cand is not None else 0,
-                      G=block, BLOCKS=False, CANDIDATES=cand is not None, B=PICK, num_warps=4)
+                      G=block, BLOCKS=False, CANDIDATES=cand is not None, B=PICK, LANES=lanes, num_warps=4)
     return out
 
 
@@ -437,11 +496,13 @@ def select(cfg: Config, qI: torch.Tensor, wI: torch.Tensor, keys: torch.Tensor, 
            buf: torch.Tensor, lists: torch.Tensor, list_n: torch.Tensor, *, pos: int | None = None,
            source: tuple[torch.Tensor, torch.Tensor] | None = None,
            within: tuple[torch.Tensor, torch.Tensor] | None = None,
-           work: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+           work: dict[str, torch.Tensor] | None = None, tables: LaneArgs | None = None) -> torch.Tensor:
     """Scores, candidate blocks and top-k lists for rows at pos_dev + r; ``pos`` marks a prompt chunk; ``work``:
-    a decode window's split-selection scratch."""
+    a decode window's split-selection scratch; ``tables``: a shared decode forward's rows over lane 0's ``keys``."""
 
     R = qI.shape[0]
+    if tables is not None and pos is not None:
+        raise ValueError("select: lane tables are for decode rows, not a prompt chunk")
     step = R if pos is None else min(score_rows((pos + R) // ratio), buf.shape[0])
     blk = cfg.candidate_block_size
     for a in range(0, R, max(step, 1)):
@@ -449,9 +510,10 @@ def select(cfg: Config, qI: torch.Tensor, wI: torch.Tensor, keys: torch.Tensor, 
         part = buf[:n]
         cand = (within[0][a:a + n], within[1][a:a + n]) if within is not None else (None, None)
         scores(qI[a:a + n], wI[a:a + n], keys, ratio, pos_dev, part, row0=a, cand=cand[0], cand_n=cand[1],
-               block=blk)
+               block=blk, tables=tables)
         if source is not None:
-            candidates(part, ratio, pos_dev, source[0][a:a + n], source[1][a:a + n], block=blk, row0=a, work=work)
+            candidates(part, ratio, pos_dev, source[0][a:a + n], source[1][a:a + n], block=blk, row0=a, work=work,
+                       tables=tables)
         topk(part, ratio, pos_dev, lists[a:a + n], list_n[a:a + n], row0=a, cand=cand[0], cand_n=cand[1], block=blk,
-             work=work)
+             work=work, tables=tables)
     return lists
