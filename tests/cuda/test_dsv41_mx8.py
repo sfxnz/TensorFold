@@ -22,6 +22,8 @@ from tensorfold.families.deepseek_v41.cuda.split import slice_for
 MODEL = os.environ.get("TF_DSV41_MODEL")
 needs_model = pytest.mark.skipif(not MODEL, reason="set TF_DSV41_MODEL to the checkpoint")
 ROWS = range(1, 7)
+LANE_ROWS = 24                      # rows of four 6-row lanes in one forward
+MM_ROWS = (*range(1, LANE_ROWS + 1), 32, 33, 48, 64, 65, 96)   # and past the 16/32-row tiles, to wo_a's 4 x 24
 PROMPTS = (1, 7, 256, 2048)
 GROUPS = 4                          # wo_a groups a rank holds
 # one rank's projections at world 2: (n, K, fp32 output)
@@ -75,11 +77,11 @@ def test_bf16_is_mx8linears_bits_and_fp32_rounds_to_them(name):
 @pytest.mark.parametrize("name", SHAPES)
 def test_rows_do_not_depend_on_the_row_count(name, f32):
     lin = _linear(name)
-    x = _x(6, lin.k, 3)
-    full = mx8.mm(lin, x, f32=f32)
-    for r in ROWS:
-        assert torch.equal(mx8.mm(lin, x[:r], f32=f32), full[:r]), r
-        assert torch.equal(mx8.mm(lin, x[6 - r:], f32=f32), full[6 - r:]), r
+    x = _x(max(MM_ROWS), lin.k, 3)
+    alone = torch.cat([mx8.mm(lin, x[r:r + 1], f32=f32) for r in range(x.shape[0])])
+    for m in MM_ROWS:
+        assert torch.equal(mx8.mm(lin, x[:m], f32=f32), alone[:m]), m
+        assert torch.equal(mx8.mm(lin, x[-m:], f32=f32), alone[-m:]), m
     xp = _x(2048, lin.k, 4)
     full = mx8.mm(lin, xp, f32=f32, prompt=True)
     for p in PROMPTS:
@@ -120,16 +122,16 @@ def test_grouped_projects_each_group_from_its_heads(prompt):
         assert torch.equal(out, torch.cat(want, dim=1)), m
 
 
-def _groups(seed: int = 50) -> tuple[mx8.Groups, list[Mx8Linear]]:
+def _groups(seed: int = 50, count: int = GROUPS) -> tuple[mx8.Groups, list[Mx8Linear]]:
     """wo_a's groups built from one stacked checkpoint tensor, and each group built from its own rows."""
 
     n, k, _ = SHAPES["wo_a"]
     g = torch.Generator(device="cuda").manual_seed(seed)
-    w = torch.randint(0, 256, (GROUPS * n, k), generator=g, dtype=torch.uint8, device="cuda")
+    w = torch.randint(0, 256, (count * n, k), generator=g, dtype=torch.uint8, device="cuda")
     w[(w & 0x7F) >= 0x70] = 0x30
-    s = torch.randint(118, 131, (GROUPS * n, k // 32), generator=g, dtype=torch.uint8, device="cuda")
+    s = torch.randint(118, 131, (count * n, k // 32), generator=g, dtype=torch.uint8, device="cuda")
     w = w.view(torch.float8_e4m3fn)
-    alone = [Mx8Linear.from_checkpoint(w[i * n:(i + 1) * n], s[i * n:(i + 1) * n]) for i in range(GROUPS)]
+    alone = [Mx8Linear.from_checkpoint(w[i * n:(i + 1) * n], s[i * n:(i + 1) * n]) for i in range(count)]
     return mx8.Groups.from_checkpoint(w, s, n), alone
 
 
@@ -164,6 +166,23 @@ def test_decode_groups_run_in_one_launch_with_each_groups_bits(monkeypatch):
         got = mx8.grouped(groups, o, torch.empty_like(want), prompt=m > 6)
         assert torch.equal(got, want), m
         assert calls == ([] if m > 6 else [GROUPS * n]), m
+
+
+@pytest.mark.parametrize("count", [2, 4])
+def test_stacked_group_rows_do_not_depend_on_the_row_count(count):
+    """Every row of a 1..24-row stacked launch (G x rows up to 96) has the bits of that row through each group alone."""
+
+    groups, alone = _groups(60 + count, count)
+    k, n = groups[0].k, groups[0].n
+    o = _x(LANE_ROWS, count * k, 13)
+
+    def run(lins, x):
+        return mx8.grouped(lins, x, torch.empty((x.shape[0], count * n), dtype=torch.bfloat16, device="cuda"))
+
+    one = torch.cat([run(alone, o[r:r + 1]) for r in range(LANE_ROWS)])
+    for rows in range(1, LANE_ROWS + 1):
+        for a in (0, LANE_ROWS - rows):
+            assert torch.equal(run(groups, o[a:a + rows]), one[a:a + rows]), (count, rows, a)
 
 
 def test_an_output_buffer_takes_no_allocation():
