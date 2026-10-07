@@ -65,12 +65,16 @@ def check(model_dir: str | Path) -> None:
           "serve with --tp 2 on both (docs/recipes/deepseek-v4.1-flash.md)", flush=True)
 
 
+CUDA_DECODE_SHARE = True           # --parallel 2 or more: rounds take --decode-share of each prompt span's time
+
+
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None,
-                mtp_confidence: float | None = None, **options: Any):
-    """The two-rank engine drafting with its DSpark stages; ``mtp_drafts`` 0 or ``no_drafts``: serial decoding."""
+                mtp_confidence: float | None = None, decode_share: float | None = None, **options: Any):
+    """The two-rank engine drafting with its DSpark stages; ``mtp_drafts`` 0 or ``no_drafts``: serial decoding;
+    ``parallel`` 2 to MAX_LANES requests decode together."""
 
-    from .cuda import BLOCK, DEFAULT_CONFIDENCE, DEFAULT_DRAFTS
+    from .cuda import BLOCK, DEFAULT_CONFIDENCE, DEFAULT_DRAFTS, DEFAULT_SHARE, MAX_LANES
 
     if int(tp) != 2:
         raise ValueError(f"{TITLE} needs two GPUs, one per machine: run the same `tensorfold serve` command with "
@@ -83,8 +87,11 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     if not 0 <= drafts <= BLOCK:
         raise ValueError(f"--mtp-drafts {drafts}: {TITLE} drafts 0 (serial decoding) to {BLOCK} tokens a round")
     streams = int(options.get("parallel") or 1)
-    if streams > 1:
-        print(f"[tensorfold] {TITLE} serves one request at a time: --parallel {streams} is ignored", flush=True)
+    if not 1 <= streams <= MAX_LANES:
+        raise ValueError(f"--parallel {streams}: {TITLE} decodes at most MAX_LANES = {MAX_LANES} requests together, "
+                         "the count its exactness and memory receipts on two DGX Sparks cover; more lanes need a "
+                         "receipt at that count first")
+    share = DEFAULT_SHARE if decode_share is None else float(decode_share)
     from .cuda.engine import DeepSeekV41Engine
 
     if mtp_confidence is not None:
@@ -94,7 +101,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     # the policy: drafts a round (0: serial), and the confidence product below which a chain stops (None: fixed)
     return DeepSeekV41Engine(Path(model_dir), rank=int(rank), master=master, port=int(master_port),
                              policy=(drafts, confidence), context=options.get("context"),
-                             context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts))
+                             context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts),
+                             lanes=streams, share=share)
 
 
 def __getattr__(name: str) -> Any:

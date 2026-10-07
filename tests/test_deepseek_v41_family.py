@@ -55,7 +55,7 @@ def test_discovery_and_cuda_engine_refusals_never_import_torch():
               "assert f.families()['deepseek_v41'].lanes\n"
               "from tensorfold.families import deepseek_v41\n"
               "for bad in ({'tp': 1}, {'tp': 2}, {'tp': 2, 'master': 'm', 'drafter': 'd'},\n"
-              "            {'tp': 2, 'master': 'm', 'mtp_drafts': 6}):\n"
+              "            {'tp': 2, 'master': 'm', 'mtp_drafts': 6}, {'tp': 2, 'master': 'm', 'parallel': 5}):\n"
               "    try:\n"
               "        deepseek_v41.cuda_engine('.', **bad)\n"
               "    except ValueError:\n"
@@ -124,7 +124,9 @@ def test_check_refuses_a_downloaded_layout_it_does_not_read(tmp_path, names, mes
 @pytest.mark.parametrize("options, message", [
     ({"tp": 1}, "needs two GPUs"), ({"tp": 2}, "needs --master"),
     ({**RANKS, "drafter": "/drafter"}, "own DSpark stages"),
-    ({**RANKS, "mtp_drafts": 6}, "--mtp-drafts 6"), ({**RANKS, "mtp_drafts": -1}, "--mtp-drafts -1")])
+    ({**RANKS, "mtp_drafts": 6}, "--mtp-drafts 6"), ({**RANKS, "mtp_drafts": -1}, "--mtp-drafts -1"),
+    ({**RANKS, "parallel": 5}, "--parallel 5: .* MAX_LANES = 4 .* receipt"),
+    ({**RANKS, "parallel": 9}, "--parallel 9: .* MAX_LANES = 4")])
 def test_cuda_engine_refuses_settings_before_building(tmp_path, engine, options, message):
     with pytest.raises(ValueError, match=message):
         deepseek_v41.cuda_engine(tmp_path, **options)
@@ -141,9 +143,11 @@ def test_cuda_engine_passes_its_policy_and_context(tmp_path, engine, capsys):
     assert deepseek_v41.cuda_engine(tmp_path, mtp_confidence=0.6, **RANKS).policy == (5, 0.6)
     assert deepseek_v41.cuda_engine(tmp_path, mtp_drafts=4, mtp_confidence=0.6, **RANKS).policy == (4, 0.6)
     assert deepseek_v41.cuda_engine(tmp_path, no_drafts=True, **RANKS).serial_only is True
-    deepseek_v41.cuda_engine(tmp_path, parallel=4, **RANKS)
-    assert "--parallel 4 is ignored" in capsys.readouterr().out
-    assert "parallel" not in engine[-1]
+    assert (built.lanes, built.share) == (1, 0.5)                          # one request at a time by default
+    for streams in range(1, 5):
+        assert deepseek_v41.cuda_engine(tmp_path, parallel=streams, **RANKS).lanes == streams
+    assert deepseek_v41.cuda_engine(tmp_path, parallel=4, decode_share=0.25, **RANKS).share == 0.25
+    assert "ignored" not in capsys.readouterr().out
 
 
 def test_cuda_app_is_imported_on_first_use(monkeypatch):
@@ -155,7 +159,7 @@ def test_cuda_app_is_imported_on_first_use(monkeypatch):
 
 
 def test_serve_options_refuse_prefill_fp8_and_take_mtp_confidence(tmp_path):
-    """No CUDA_PREFILL_FP8: prompts always run bf16 activations; --mtp-confidence reaches cuda_engine."""
+    """No CUDA_PREFILL_FP8: prompts always run bf16 activations; --mtp-confidence and --decode-share reach cuda_engine."""
 
     family = SimpleNamespace(title=deepseek_v41.TITLE, package=deepseek_v41, model_type="deepseek_v41")
     assert not hasattr(deepseek_v41, "CUDA_PREFILL_FP8")
@@ -164,3 +168,5 @@ def test_serve_options_refuse_prefill_fp8_and_take_mtp_confidence(tmp_path):
         serve_options.check(args, family, "cuda")
     args = cli.build_parser().parse_args(["serve", str(tmp_path), "--mtp-confidence", "0.6"])
     assert serve_options.check(args, family, "cuda") is None
+    args = cli.build_parser().parse_args(["serve", str(tmp_path), "--parallel", "4", "--decode-share", "0.25"])
+    assert deepseek_v41.CUDA_DECODE_SHARE and serve_options.check(args, family, "cuda") is None

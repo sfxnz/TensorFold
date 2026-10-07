@@ -9,13 +9,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import protocol
+from . import DEFAULT_SHARE, MAX_LANES, protocol
 
 NO_DIGEST = 0           # the agreement's Engram digest for a checkpoint without Engram layers
 
 
 class DeepSeekV41Engine:
-    """One rank; ``policy`` is (drafts a round, confidence stop or None); ``comm``/``layers``/``graphs`` for tests."""
+    """One rank; ``policy`` is (drafts a round, confidence stop or None); ``lanes`` above 1 serves that many requests
+    together, rounds taking ``share`` of each prompt span's time; ``comm``/``layers``/``graphs`` for tests."""
 
     tp = 2
     supports_logprobs = False
@@ -23,7 +24,8 @@ class DeepSeekV41Engine:
 
     def __init__(self, model_dir: str | Path, *, rank: int, master: str, port: int,
                  policy: tuple[int, float | None], context: int | None = None, context_explicit: bool | None = None,
-                 serial_only: bool = False, comm=None, layers: int | None = None, graphs: bool = True) -> None:
+                 serial_only: bool = False, lanes: int = 1, share: float = DEFAULT_SHARE, comm=None,
+                 layers: int | None = None, graphs: bool = True) -> None:
         import torch
 
         from tensorfold.cuda.capacity import admit
@@ -37,24 +39,35 @@ class DeepSeekV41Engine:
 
         if rank not in (0, 1):
             raise ValueError(f"rank {rank}: {type(self).__name__} runs on ranks 0 and 1")
+        if not 1 <= lanes <= MAX_LANES:
+            raise ValueError(f"{lanes} lanes: {type(self).__name__} serves 1 to {MAX_LANES}")
         drafts, confidence = policy
         model_dir = Path(model_dir)
         torch.cuda.set_device(0)
         self.rank, self.policy, self.serial_only = rank, (int(drafts), confidence), bool(serial_only)
+        self.slots, self.share, self.master = int(lanes), float(share), master
+        self.concurrent, self.scheduler, self.decoder = self.slots > 1, None, None
         self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
         self.comm.barrier()
         self.bell = protocol.Bell(getattr(self.comm, "store", None))
         cfg = Config.read(model_dir, layers)
         dspark = self.policy[0] > 0 and not self.serial_only
         explicit = context is not None if context_explicit is None else bool(context_explicit)
-        plan = admit(model_dir, context, explicit, torch, lambda text: dsv41_geometry(cfg, 2),
-                     split.rank_estimate(cfg, rank, dspark), rank=rank, world=2, gather=self._gather_ints)
+        try:
+            plan = admit(model_dir, context, explicit, torch, lambda text: dsv41_geometry(cfg, 2, lanes=self.slots),
+                         split.rank_estimate(cfg, rank, dspark), rank=rank, world=2, gather=self._gather_ints)
+        except ValueError as exc:               # the window is per lane: name the flag that multiplies it
+            if self.slots == 1 or "cannot fit" not in str(exc):
+                raise
+            raise ValueError(f"{exc} With --parallel {self.slots}, each of the {self.slots} lanes holds a whole "
+                             "window: lower --parallel or --context.") from None
         self.capacity_plan, self.limit = plan, plan["context_window"]
         capacity = plan["cache_slots"]
         hasher = reader = None
         failure, digest, wanted, entries = None, NO_DIGEST, 0, 0
         try:                                    # a failure here reaches the gather, so both ranks name it
-            wanted, entries = kept_bytes(plan, cache_wanted()), entries_wanted()
+            extra = self.slots if self.concurrent else 0        # room for each lane's prompt beside the others'
+            wanted, entries = kept_bytes(plan, cache_wanted()), entries_wanted(lanes=extra)
             hasher, reader = self._engram(model_dir, cfg)
             digest = reader.layout.digest() if reader is not None else NO_DIGEST
         except Exception as exc:                # noqa: BLE001 - raised below on both ranks
@@ -62,8 +75,8 @@ class DeepSeekV41Engine:
         prefill_rows = min(PREFILL_ROWS, capacity)
         mine = protocol.settings(start_error=failure is not None, dspark=dspark, capacity=capacity,
                                  prefill_rows=prefill_rows, max_rows=MAX_ROWS, ring=RING, policy=self.policy,
-                                 layers=cfg.num_hidden_layers, world=2, engram_digest=digest, cache_bytes=wanted,
-                                 cache_entries=entries)
+                                 layers=cfg.num_hidden_layers, world=2, engram_digest=digest, lanes=self.slots,
+                                 decode_share=self.share, cache_bytes=wanted, cache_entries=entries)
         both = self._gather_ints(mine)
         if failure is not None or both[1 - rank][0]:
             raise ValueError("the TF_DSV41_* variables or the Engram tables could not be read on " +
@@ -78,10 +91,53 @@ class DeepSeekV41Engine:
         self.w = loader.load(model_dir, cfg, rank, 2, self.comm, dspark=dspark, capacity=capacity)
         self.comm.ready("loading")              # a peer stuck loading is named, not waited on in the all-gather
         self.comm.barrier()
+        if self.concurrent:
+            self._lanes(capacity, prefill_rows, graphs, hasher, reader, cache_bytes, entries)
+            return
         self.e = Engine(self.w, capacity, prefill_rows, graphs=graphs, hasher=hasher, reader=reader)
         self.kept = Kept(self.e, cache_bytes, entries)    # allocated now: a request allocates no snapshot memory
         self.eos = self.e.eos
         self._warm()
+
+    def _lanes(self, capacity: int, prefill_rows: int, graphs: bool, hasher, reader, cache_bytes: int,
+               entries: int) -> None:
+        """The lane decoder over ``slots`` lanes, every lane on the one Engram reader; warmed, then rank 0's
+        scheduler and link."""
+
+        from tensorfold.cuda.nvfp4.linear import FUSED_ROWS
+        from tensorfold.cuda.scheduler import Scheduler
+
+        from . import MAX_ROWS
+        from .buffers import Buffers
+        from .cache import Kept
+        from .decode import Engine
+        from .graphs import LaneGraphs
+        from .lanes import Ahead, Lanes
+        from .multi import LaneDecoder
+        from .multi_tp import Link
+
+        w, S = self.w, self.slots
+        cfg, dev = w.cfg, w.device
+        rows = cfg.o_groups // w.world * MAX_ROWS * S
+        if rows >= FUSED_ROWS:                  # the stacked wo_a rows must stay on the row-invariant tiles
+            raise ValueError(f"--parallel {S}: {rows} stacked output-projection rows reach TF_QMMF_FUSED_ROWS "
+                             f"{FUSED_ROWS}, where its tiles change with the row count")
+        self.lanes = Lanes(cfg, S, capacity, dev)
+        self.mbuf = Buffers(cfg, w.world, MAX_ROWS * S, capacity, device=dev, lanes=S)
+        self.pbuf = Buffers(cfg, w.world, prefill_rows, capacity, prefill=True, device=dev)
+        self.engines = [Engine(w, capacity, hasher=hasher, reader=reader, st=self.lanes.view(k), pbuf=self.pbuf,
+                               dbuf=self.mbuf, ahead=Ahead(cfg, w.world)) for k in range(S)]
+        self.kept = Kept(self.engines, cache_bytes, entries)
+        self.eos = (cfg.eos_token_id,)
+        lane_graphs = LaneGraphs(w, self.lanes, self.mbuf, self.engines) if graphs else None
+        if lane_graphs is not None:
+            lane_graphs.warm()
+        self.decoder = LaneDecoder(w, self.lanes, self.engines, self.mbuf, self.pbuf, self.policy, self.eos,
+                                   lane_graphs, self.share, kept=self.kept)
+        self._warm_lanes()
+        if self.rank == 0:
+            self.decoder.link = Link(getattr(self.comm, "store", None), rank=0, host=self.master or None)
+            self.scheduler = Scheduler(self.decoder, max_streams=S)
 
     def _warm(self) -> None:
         """Run a prompt chunk and decode rounds once and reset, so serving reserves no more device memory."""
@@ -101,6 +157,55 @@ class DeepSeekV41Engine:
         else:
             dspark_decode(e, first, 2 * MAX_ROWS, sampling, drafts=drafts, confidence=confidence, stop_eos=False)
         e.reset()
+        for s, left in guards:
+            if left is None:
+                vars(s).pop("guard_left", None)
+            else:
+                s.guard_left = left
+
+    def _warm_lanes(self) -> None:
+        """Serve requests once on both ranks and reset: a full span and one cut at its keep point, greedy, keyed and
+        top_k 0 rounds with every lane drafting, kept rows copied between lanes and loaded from the arena."""
+
+        from tensorfold.cuda.streams import Stream
+        from tensorfold.engine.exact_sampling import Sampling
+
+        from . import MAX_ROWS
+        from .multi_fill import FillPlan
+
+        dec, kept, S = self.decoder, self.kept, self.slots
+        guards = [(b.exl3, vars(b.exl3).get("guard_left")) for b in (dec.pbuf, dec.mbuf)]
+        modes = (None, Sampling(seed=0, temperature=1.0, top_k=20, top_p=0.95), Sampling(seed=0, temperature=1.0,
+                                                                                         top_k=0))
+        cfg, plan = self.w.cfg, dec.plan
+        dec.plan = FillPlan(0.0)                # whole prompts first: the ranks plan alike without a link
+
+        def prompt(k: int, n: int) -> list[int]:
+            return [cfg.bos_token_id] + [(cfg.bos_token_id + 1 + k) % cfg.vocab_size] * (n - 1)
+
+        def run(prompts: list[list[int]], first: int) -> None:
+            waiting = [Stream(p, 2 * MAX_ROWS, modes[(first + j) % len(modes)], stop_eos=False)
+                       for j, p in enumerate(prompts)]
+            streams = list(waiting)
+            while waiting or dec.live():
+                while waiting and dec.live() < S:
+                    dec.admit(waiting.pop(0))
+                dec.finish(dec.round())
+            failed = next((s.error for s in streams if s.error is not None), None)
+            if failed is not None:
+                raise failed
+
+        long = min(dec.pbuf.rows + MAX_ROWS + 1, dec.lanes.capacity - 3 * MAX_ROWS)
+        lanes = [prompt(k, long if k == 0 else 2 * MAX_ROWS + k) for k in range(S)]
+        run(lanes, 0)       # lane 0's prompt: a full span, then one its keep point cuts
+        # lane 1 resumed in place, then from another lane (copied), a new prompt, and lane 0's from the arena
+        run([lanes[1], lanes[1] + [cfg.bos_token_id] * MAX_ROWS, prompt(S, 3 * MAX_ROWS), lanes[0]], 1)
+        dec.drop()
+        for x in list(kept.cache):
+            kept._drop(x)
+        for e in dec.engines:
+            e.reset()
+        dec.plan, dec.next_id, dec.used = plan, 0, [-1] * S
         for s, left in guards:
             if left is None:
                 vars(s).pop("guard_left", None)
@@ -130,8 +235,9 @@ class DeepSeekV41Engine:
         return protocol.share(self.comm, self.rank, values)
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens: Callable[[list[int]], Any],
-                 draft: bool = True, stop_eos: bool = True) -> dict[str, Any]:
-        """Serve one request on rank 0 while rank 1 mirrors it; ``draft`` False is the serial reference."""
+                 draft: bool = True, stop_eos: bool = True, background: bool = False) -> dict[str, Any]:
+        """Serve one request on rank 0 while rank 1 mirrors it; ``draft`` False is the serial reference; with lanes,
+        ``on_tokens`` returning True ends it and ``background`` goes last, yielding its lane to a waiting request."""
 
         prompt = [int(t) for t in prompt]
         if not prompt:
@@ -143,6 +249,11 @@ class DeepSeekV41Engine:
             raise ValueError(f"prompt token ids must lie in [0, {vocab})")
         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
         drafting = bool(draft) and not self.serial_only
+        if self.scheduler is not None:
+            stats = self.scheduler.submit(prompt, max_tokens, sampling, drafting, on_tokens, stop_eos=stop_eos,
+                                          background=background)
+            serial = not drafting or self.policy[0] == 0 or self.w.dspark is None
+            return {**stats, "policy": _policy(self.policy, serial)}
         hit = self.kept.lookup(prompt) if drafting else None
         header = protocol.encode(max_tokens, stop_eos, drafting, len(hit.ids) if hit is not None else 0, sampling,
                                  self.policy)
@@ -154,6 +265,11 @@ class DeepSeekV41Engine:
     def follow(self) -> None:
         """Rank 1: mirror every request rank 0 serves, until rank 0's ``shutdown``."""
 
+        if self.decoder is not None:
+            from .multi_tp import Link
+
+            self.decoder.follow(Link(getattr(self.comm, "store", None), rank=1, host=self.master or None))
+            return
         while True:
             self.bell.wait()
             header = self._share(None)
@@ -167,9 +283,18 @@ class DeepSeekV41Engine:
     def shutdown(self) -> None:
         """Rank 0: tell rank 1 to leave ``follow``."""
 
-        if self.rank == 0:
+        if self.rank == 0 and self.decoder is not None:
+            self.decoder.link.send(["stop"])
+        elif self.rank == 0:
             self.bell.ring()
             self._share(protocol.STOP)
+
+    def close(self) -> None:
+        """Rank 0: stop the scheduler's worker once its requests have ended."""
+
+        if self.scheduler is not None:
+            self.scheduler.close()
+            self.scheduler = None
 
     def _run(self, prompt: list[int], req: protocol.Request, hit, on_tokens) -> dict[str, Any]:
         """One request on this rank: snapshots taken over, the prompt prefilled from ``hit``, then decoded."""
@@ -201,7 +326,13 @@ class DeepSeekV41Engine:
                                 stop_eos=req.stop_eos, on_tokens=on_tokens)
         kept.live = list(prompt) + res.tokens[:e.st.pos - len(prompt)]
         stats.update(res.stats())
-        stats.update(min_rows=1 + min(res.depths, default=0), drafts=req.draft,
-                     policy="0" if serial else f"{drafts}" if confidence is None else f"c{drafts}:{confidence:g}",
+        stats.update(min_rows=1 + min(res.depths, default=0), drafts=req.draft, policy=_policy(req.policy, serial),
                      sha256=hashlib.sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
         return stats
+
+
+def _policy(policy: tuple[int, float | None], serial: bool) -> str:
+    """The stats' name of a request's drafting: "0" serial, "D" drafts a round, "cD:P" stopping by confidence."""
+
+    drafts, confidence = policy
+    return "0" if serial else f"{drafts}" if confidence is None else f"c{drafts}:{confidence:g}"
