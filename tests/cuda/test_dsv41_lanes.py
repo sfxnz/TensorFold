@@ -1,6 +1,7 @@
 """The shared verify forward over 2, 3 and 4 lanes: each row's logits, window KV, taps, pooled rows and entry position
 equal the legacy forward of its lane's window alone, for every total of rows and random layouts, and each lane's state
-after its own commit and absorb equals legacy's; rows of a 24-row window equal each row run alone.
+after its own commit and absorb equals legacy's; rows of a 24-row window equal each row run alone; the lane graphs
+(verify by total rows, each lane's absorb and proposals) replay eager's bits.
 
 Lanes are prefilled on their views with prompts across the tiny config's transitions (16 visible entries, 32-entry
 candidate pools, the 128-slot ring) and up to 5000 tokens. The pack's check needs ``TF_DSV41_MODEL``.
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import time
 from pathlib import Path
 
 import pytest
@@ -26,12 +28,14 @@ import dsv41_tiny
 from dsv41_pair import pair, run_pair
 from dsv41_ref_weights import RefWeights
 
+from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, dspark, engram, loader
+from tensorfold.families.deepseek_v41.cuda import BLOCK, GRAPH_ROWS, MAX_ROWS, dspark, engram, loader
 from tensorfold.families.deepseek_v41.cuda import decode as D
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import prefill as P
 from tensorfold.families.deepseek_v41.cuda.buffers import Buffers
+from tensorfold.families.deepseek_v41.cuda.graphs import LaneGraphs
 from tensorfold.families.deepseek_v41.cuda.lanes import Ahead, Lanes, stage_tables
 from tensorfold.families.deepseek_v41.engram_hash import rank_columns
 from tensorfold.families.deepseek_v41.engram_table import Reader
@@ -45,6 +49,7 @@ RANDOM = 20                             # random layouts beside every total of r
 WIDE = 24                               # rows of the widest shared forward, four lanes of six
 STARTS = [5, 30, 62, 125, 600, 1010]
 PACK_CAP, PACK_PROMPTS = 1024, (40, 400, 129, 5)
+KEYED = Sampling(seed=7, temperature=1.0, top_k=20, top_p=0.95)
 
 
 def _ids(seed: int, n: int, vocab: int) -> list[int]:
@@ -116,9 +121,11 @@ def _same_row(a: Buffers, ra: int, b: Buffers, rb: int, layers: int, what: str) 
         assert torch.equal(_u8(x), _u8(y)), f"{what}: {name}"
 
 
-def _same_state(st, want, what: str) -> None:
+def _same_state(st, want, what: str, open_entry: bool = True) -> None:
     assert st.pos == want.pos == int(st.pos_dev[0]) and st.history == want.history, what
     views = zip(st.row_views(st.pos), want.row_views(want.pos))
+    if not open_entry:          # each cache's last entry is open at pos, and a warm's forwards may have written it
+        views = ((x[:-1], y[:-1]) for x, y in views)
     for name, x, y in (("rings", st.rings, want.rings), ("tail", st.tail, want.tail),
                        ("tail flags", st.tail_valid, want.tail_valid), *(("cache rows", x, y) for x, y in views)):
         assert torch.equal(_u8(x), _u8(y)), f"{what}: {name}"
@@ -222,6 +229,107 @@ def test_a_24_row_window_row_equals_the_row_run_alone(tiny, ref, start):
         F.commit(e.w, e.st, e.dbuf, 1, 1)
     for got in windows:
         assert got == alone[:len(got)], f"a {len(got)}-row window at {start}"
+
+
+def _memory() -> tuple[int, int, int]:
+    """(memory_reserved, the device's free bytes, the host's MemAvailable bytes or 0 where /proc has none)."""
+
+    avail = 0
+    if Path("/proc/meminfo").is_file():
+        fields = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines() if ":" in line)
+        avail = int(fields.get("MemAvailable", "0 kB").split()[0]) * 1024
+    return torch.cuda.memory_reserved(), torch.cuda.mem_get_info()[0], avail
+
+
+def _warm(w, lg: LaneGraphs, S: int) -> None:
+    """Warm the lane graphs, printing the capture seconds and memory before and after as information."""
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()            # as capture does on entry, so the deltas are the graphs'
+    before, start = _memory(), time.perf_counter()
+    count = lg.warm()
+    seconds, after = time.perf_counter() - start, _memory()
+    print(f"\nlane graphs at {S} lanes: {count} captured in {seconds:.1f} s; "
+          + "; ".join(f"{name} {a} -> {b} ({b - a:+d})" for name, a, b in
+                      zip(("memory_reserved", "mem_get_info free", "MemAvailable"), before, after)))
+    assert count == len(lg.verify) + sum(map(len, lg.absorb)) + sum(map(len, lg.drafts))
+    assert sorted(lg.verify) == list(range(1, MAX_ROWS * S + 1))
+    if w.dspark is not None:
+        assert count == 22 * S
+        assert all(sorted(a) == list(GRAPH_ROWS) for a in lg.absorb) and all(len(d) == 2 * BLOCK for d in lg.drafts)
+
+
+def _proposal(e: D.Engine, y: int, sampling, d: int, run=None) -> tuple[list[int], list[float], str]:
+    e.dwork.host.zero_()                # nothing left from the last proposal
+    e.dbuf.dlog.zero_()
+    drafts, conf = dspark.propose(e, y, e.st.pos - 1, sampling, d, run=run)
+    return drafts, conf, _bits(e.dbuf.dlog)
+
+
+@pytest.mark.parametrize("S", (2, 4))
+def test_lane_graphs_replay_the_eager_forward_absorb_and_proposals(tiny, ref, S):
+    """verify[T] for every T and random layouts gives eager's logits, window KV and taps; each lane's absorb graph
+    (forward row 0) gives eager's stage rings; each lane's chain graphs give eager's drafts, confidences and block
+    logits, and a legacy engine's at the same state."""
+
+    w = tiny
+    layers, vocab = w.cfg.num_hidden_layers, w.cfg.vocab_size
+    lanes, mbuf, engines = _lanes(w, ref, S, CAP, ref.reader)
+    with pytest.raises(ValueError, match="lane graphs"):
+        LaneGraphs(w, lanes, mbuf, engines[::-1])
+    lg = LaneGraphs(w, lanes, mbuf, engines)
+    _warm(w, lg, S)
+    for e in engines:
+        assert e.st.pos == 0 and not e.st.history and not e.st.tail_valid.any()
+    assert not lanes.pos_dev.any()
+    legacy = [D.Engine(w, CAP, hasher=ref.hasher, reader=ref.reader) for _ in range(S)]
+    g, pending = random.Random(S), []
+    for k, n in enumerate(PROMPTS[S]):
+        prompt = _ids(31 * S + k, n, vocab)
+        pending.append(P.prefill(engines[k], prompt, None))
+        assert P.prefill(legacy[k], prompt, None) == pending[-1], f"lane {k}: first token"
+    for k, e in enumerate(engines):                         # each lane alone, so its rows start at forward row 0
+        for n in GRAPH_ROWS:
+            tokens = [pending[k], *(g.randrange(2, vocab) for _ in range(g.randint(n, MAX_ROWS) - 1))]
+            T = stage_tables(mbuf, [(k, e.st.pos, tokens)])
+            _stage_rows(e, mbuf, 0, tokens)
+            F.compute(w, lanes, mbuf, T, prompt=False, head_rows=T)
+            legacy[k].forward(tokens)
+            for x in (e, legacy[k]):
+                F.commit(w, x.st, x.dbuf, T, n)
+            saved = lanes.rings.clone()
+            dspark.absorb(e, mbuf, n, prompt=False)
+            want = _bits(lanes.rings)
+            lanes.rings.copy_(saved)
+            lg.absorb[k][n].replay()
+            assert _bits(lanes.rings) == want, f"lane {k}: absorb[{n}] != eager"
+            dspark.absorb(legacy[k], legacy[k].dbuf, n, prompt=False)
+            _same_state(e.st, legacy[k].st, f"lane {k} kept {n} of {T}", open_entry=False)
+            pending[k] = g.randrange(2, vocab)
+        for keyed in (False, True):
+            for d in range(1, BLOCK + 1):
+                sampling = KEYED if keyed else None
+                want = _proposal(legacy[k], pending[k], sampling, d)
+                assert _proposal(e, pending[k], sampling, d) == want, f"lane {k}: eager proposal {d}, {keyed}"
+                got = _proposal(e, pending[k], sampling, d, run=lambda _, d, keyed, k=k: lg.drafts[k][d, keyed].replay())
+                assert got == want, f"lane {k}: drafts[{d}, {keyed}] != eager"
+    for i, layout in enumerate(_layouts(S, S, RANDOM)):
+        windows = [(k, engines[k].st.pos, [g.randrange(2, vocab) for _ in range(R)]) for k, R in layout]
+        T, s0 = stage_tables(mbuf, windows), 0
+        for k, _, tokens in windows:
+            _stage_rows(engines[k], mbuf, s0, tokens)
+            s0 += len(tokens)
+        rows = (mbuf.logits[:T], mbuf.kvw[:layers, :T], mbuf.taps[:T])
+        F.compute(w, lanes, mbuf, T, prompt=False, head_rows=T)
+        want = [_bits(x) for x in rows]
+        for x in rows:
+            x.zero_()
+        lg.verify[T].replay()
+        assert [_bits(x) for x in rows] == want, f"layout {i} {layout}: verify[{T}] != eager"
+        s0 = 0
+        for k, _, tokens in windows:                       # lanes move on to random positions
+            F.commit(w, engines[k].st, mbuf, len(tokens), g.randint(1, len(tokens)), row0=s0)
+            s0 += len(tokens)
 
 
 # -- the pack -----------------------------------------------------------------------------------------------------

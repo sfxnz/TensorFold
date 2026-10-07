@@ -10,6 +10,7 @@ from tensorfold.engine.exact_sampling import Sampling
 
 from . import GRAPH_ROWS, MAX_ROWS, dspark
 from . import forward as F
+from .lanes import stage_tables
 
 
 class Graphs:
@@ -38,6 +39,21 @@ class Graphs:
         torch.cuda.synchronize()
         return g
 
+    def _proposals(self, e) -> tuple[dict[int, torch.cuda.CUDAGraph], dict[tuple[int, bool], torch.cuda.CUDAGraph]]:
+        """Engine ``e``'s absorb graphs from tap row 0 by kept rows, then its proposals' by (d, keyed); e sits at
+        MAX_ROWS or later."""
+
+        w, b, token = e.w, e.dbuf, e.w.cfg.bos_token_id
+        absorb = {n: self._capture(lambda n=n: dspark.absorb(e, b, n, prompt=False)) for n in GRAPH_ROWS}
+        e.dwork.bids[:1].fill_(token)
+        e.dwork.chain.fill_(token)
+        e.dwork.draws.set(Sampling(seed=0, temperature=1.0, top_k=0))
+        drafts = {}
+        for keyed in (False, True):
+            for d in range(1, w.cfg.dspark_block_size + 1):
+                drafts[d, keyed] = self._capture(lambda d=d, keyed=keyed: dspark.chain(e, d, keyed))
+        return absorb, drafts
+
     @torch.no_grad()
     def warm(self) -> int:
         """Capture every graph -> how many; each runs eagerly first, so the engine resets the sequence after."""
@@ -53,12 +69,45 @@ class Graphs:
             F.stage(w, st, b, [token] * R, e.hasher, e.reader)
             self.verify[R] = self._capture(lambda R=R: F.compute(w, st, b, R, prompt=False, head_rows=R))
         if w.dspark is not None:
-            for n in GRAPH_ROWS:
-                self.absorb[n] = self._capture(lambda n=n: dspark.absorb(e, b, n, prompt=False))
-            e.dwork.bids[:1].fill_(token)
-            e.dwork.chain.fill_(token)
-            e.dwork.draws.set(Sampling(seed=0, temperature=1.0, top_k=0))
-            for keyed in (False, True):
-                for d in range(1, w.cfg.dspark_block_size + 1):
-                    self.drafts[d, keyed] = self._capture(lambda d=d, keyed=keyed: dspark.chain(e, d, keyed))
+            self.absorb, self.drafts = self._proposals(e)
         return len(self.verify) + len(self.absorb) + len(self.drafts)
+
+
+class LaneGraphs(Graphs):
+    """Graphs of the shared forward over ``lanes``: verify by total rows T (the row tables are data, so one graph serves
+    every layout), and each lane Engine's absorb from forward row 0 and its proposals, in one pool."""
+
+    def __init__(self, w, lanes, mbuf, engines) -> None:
+        if len(engines) != lanes.slots or any(e.st is not lanes.view(k) or e.dbuf is not mbuf
+                                              for k, e in enumerate(engines)):
+            raise ValueError(f"lane graphs: {len(engines)} engines for {lanes.slots} lanes, each on its lane's view "
+                             "and the shared buffers")
+        self.w, self.lanes, self.mbuf, self.engines = w, lanes, mbuf, engines
+        self.pool = torch.cuda.graph_pool_handle()
+        self.verify: dict[int, torch.cuda.CUDAGraph] = {}      # by total rows T
+        self.absorb: list[dict[int, torch.cuda.CUDAGraph]] = [{} for _ in engines]     # per lane, by kept rows
+        self.drafts: list[dict[tuple[int, bool], torch.cuda.CUDAGraph]] = [{} for _ in engines]
+
+    @torch.no_grad()
+    def warm(self) -> int:
+        """Capture every graph -> how many: each lane at MAX_ROWS, every T laid out round-robin; then every lane is
+        reset."""
+
+        w, lanes, b, S = self.w, self.lanes, self.mbuf, self.lanes.slots
+        if lanes.capacity < 2 * MAX_ROWS:
+            raise ValueError(f"graphs warm at positions {MAX_ROWS}..{2 * MAX_ROWS - 1}: lanes of {lanes.capacity}")
+        for e in self.engines:
+            e.st.reset()
+            e.st.set_pos(MAX_ROWS)
+        b.eraw.zero_()          # the Engram rows the warm forwards read: any finite bytes
+        b.eidx.zero_()
+        token = w.cfg.bos_token_id
+        for T in range(1, MAX_ROWS * S + 1):
+            stage_tables(b, [(k, MAX_ROWS, [token] * (T // S + (k < T % S))) for k in range(min(S, T))])
+            self.verify[T] = self._capture(lambda T=T: F.compute(w, lanes, b, T, prompt=False, head_rows=T))
+        if w.dspark is not None:
+            for k, e in enumerate(self.engines):
+                self.absorb[k], self.drafts[k] = self._proposals(e)
+        for e in self.engines:
+            e.reset()
+        return len(self.verify) + sum(map(len, self.absorb)) + sum(map(len, self.drafts))
