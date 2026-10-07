@@ -104,6 +104,14 @@ def load_rows(e, snap: Snapshot) -> None:
         dst.copy_(src)
 
 
+@torch.no_grad()
+def copy_rows(src, dst, n: int) -> None:
+    """The rows the first ``n`` tokens wrote, from State ``src``'s caches into ``dst``'s, byte for byte."""
+
+    for to, rows in zip(dst.row_views(n), src.row_views(n)):
+        to.copy_(rows)
+
+
 def snapshot_bytes(snap: Snapshot) -> int:
     """A kept snapshot's space: rings, tails and any saved rows."""
 
