@@ -34,6 +34,7 @@ needs_model = pytest.mark.skipif(not MODEL or not Path(MODEL).is_dir(), reason="
 D, I, E, K = CFG.hidden_size, CFG.moe_intermediate_size, CFG.n_routed_experts, CFG.num_experts_per_tok
 LIMIT, CAP, SETS, HAD = CFG.swiglu_limit, 512, 8, 128
 T2_REL, T2_COS = 4 * 2.0**-8, 0.9999
+LANE_ROWS = 24                      # rows of four 6-row lanes in one forward
 F64 = torch.float64
 _CACHE: dict = {}
 
@@ -281,12 +282,20 @@ def test_rank_halves_add_in_rank_order_to_the_fp64_reference_within_t1():
 
 def test_rows_do_not_depend_on_the_row_count_or_the_prompt_window():
     m, _ = _random_layer()
-    b = _buffers()
-    x = _x(6, 70)
-    full = moe.backbone(CFG, m, x, b).clone()
-    for r in range(1, 7):
-        assert torch.equal(moe.backbone(CFG, m, x[:r], b), full[:r]), r
-        assert torch.equal(moe.backbone(CFG, m, x[6 - r:], b), full[6 - r:]), r
+    b = _buffers(rows=LANE_ROWS)
+    x = _x(LANE_ROWS, 70)
+
+    def run(rows: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        R = rows.shape[0]
+        out = moe.backbone(CFG, m, rows, b).clone()
+        return out, b.mlog[:R].clone(), b.pick[:R].clone(), b.wts[:R].clone()
+
+    alone = [torch.cat(t) for t in zip(*(run(x[r:r + 1]) for r in range(LANE_ROWS)))]
+    for r in range(1, LANE_ROWS + 1):
+        for a in (0, LANE_ROWS - r):
+            got = run(x[a:a + r])
+            for i, (u, v) in enumerate(zip(got, alone)):
+                assert torch.equal(u, v[a:a + r]), (r, a, ("out", "mlog", "pick", "wts")[i])
     bp = _buffers(rows=2048, prefill=True)
     assert bp.exl3.rows == 1024
     xp = _x(2048, 71)

@@ -24,6 +24,7 @@ MODEL = os.environ.get("TF_DSV41_MODEL")
 EPS, HC_EPS, ITERS = 1e-20, 1e-6, 20
 D = 5120
 PROMPT = (1, 7, 129, 2048)
+LANE_ROWS = 24                      # rows of four 6-row lanes in one forward
 
 
 def _ulps(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -163,7 +164,11 @@ def test_rows_alone_equal_rows_in_windows_and_prompt_chunks():
     x = _streams(2048, gen).cuda()
     args = _cuda(*_mhc(gen))
     full = _all(x, *args)
-    for rows in range(1, 7):
+    for r in range(LANE_ROWS):
+        one = _all(x[r:r + 1].clone(), *args)
+        for i, (a, b) in enumerate(zip(one, full)):
+            assert torch.equal(a, b[r:r + 1]), (r, i)
+    for rows in range(1, LANE_ROWS + 1):
         for start in (0, 5, 1000, 2048 - rows):
             win = _all(x[start:start + rows].clone(), *args)
             for i, (a, b) in enumerate(zip(win, full)):

@@ -1,4 +1,5 @@
-"""The shared 4-bit lane matmul: rows never depend on the row count, and the 27B's Triton kernel's bits."""
+"""The shared 4-bit lane matmul: rows never depend on the row count, and the 27B's Triton kernel's bits; GLM's BF16
+matmul's rows never depend on its row bucket."""
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ if not torch.cuda.is_available():
 from tensorfold.cuda.kernels import qmm  # noqa: E402
 
 ROWS = [1, 2, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129, 200, 256, 384, 512, 700, 1024, 1500, 2048]
+B16_ROWS = (*range(1, 25), 32, 33, 64, 65, 128, 129)    # every row count of four 6-row lanes, then each bucket's edge
 
 
 def _weights(n: int, k: int, gs: int, seed: int):
@@ -68,6 +70,23 @@ def test_accuracy_matches_fp32_reference(n, k, gs):
     y = qmm.matmul(x, qmm.pack(*w, gs)).float()
     ref = x.float() @ _dequant(*w, gs).T
     assert (y - ref).abs().max().item() <= ref.abs().max().item() * 2 ** -7
+
+
+@pytest.mark.parametrize("n,k", [(1024, 5120), (512, 5120), (32, 5120), (128, 512), (129280, 256)])
+def test_b16_rows_do_not_depend_on_the_row_bucket(n, k):
+    """DeepSeek-V4.1's BF16 shapes (compressor, indexer weights and keys, Markov head): each row of an M-row call has
+    its 1-row bits, bf16 and fp32."""
+
+    from tensorfold.families.glm5_next.cuda import qmm as glm
+
+    g = torch.Generator(device="cuda").manual_seed(n + k)
+    w = glm.make_b16(torch.randn((n, k), generator=g, device="cuda") * k ** -0.5)
+    x = torch.randn((max(B16_ROWS), k), generator=g, device="cuda").bfloat16()
+    for f32 in (False, True):
+        alone = torch.cat([glm.matmul(x[r:r + 1], w, f32=f32) for r in range(x.shape[0])])
+        for m in B16_ROWS:
+            assert torch.equal(glm.matmul(x[:m], w, f32=f32), alone[:m]), (n, k, m, f32)
+            assert torch.equal(glm.matmul(x[-m:], w, f32=f32), alone[-m:]), (n, k, m, f32)
 
 
 def test_split_depends_only_on_shape():
