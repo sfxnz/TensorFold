@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Sequence
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,12 +35,13 @@ def _elapsed(start: torch.cuda.Event, end: torch.cuda.Event) -> float:
 
 class LaneDecoder:
     """Upstream's decoder contract (``tensorfold.cuda.scheduler``) over ``lanes``, ``engines[k]`` lane k's Engine on the
-    shared buffers; ``policy`` is (drafts a round, confidence stop or None), ``graphs`` LaneGraphs or None."""
+    shared buffers; ``policy`` is (drafts a round, confidence stop or None), ``graphs`` LaneGraphs or None, ``kept`` a
+    Kept over ``engines`` or None."""
 
     def __init__(self, w, lanes: Lanes, engines: Sequence[Engine], mbuf: Buffers, pbuf: Buffers,
                  policy: tuple[int, float | None], eos: Sequence[int], graphs, share: float, kept=None) -> None:
-        if kept is not None:                        # prompts resume from no kept snapshot over lanes yet
-            raise ValueError("lane prompts resume from no kept snapshots: kept must be None")
+        if kept is not None and [id(e) for e in getattr(kept, "lanes", ())] != [id(e) for e in engines]:
+            raise ValueError("lane prompts resume from kept snapshots of these lanes' engines only")
         if len(engines) != lanes.slots or any(e.st is not lanes.view(k) or e.dbuf is not mbuf or e.pbuf is not pbuf
                                               for k, e in enumerate(engines)):
             raise ValueError(f"lane decoder: {len(engines)} engines for {lanes.slots} lanes, each on its lane's view "
@@ -48,7 +50,7 @@ class LaneDecoder:
             raise ValueError(f"{policy[0]} drafts a round: DSpark proposes 0 to {BLOCK}")
         self.w, self.lanes, self.engines, self.mbuf, self.pbuf = w, lanes, list(engines), mbuf, pbuf
         self.drafts, self.confidence = int(policy[0]), policy[1]
-        self.eos, self.graphs = tuple(eos), graphs
+        self.eos, self.graphs, self.kept = tuple(eos), graphs, kept
         for k, e in enumerate(self.engines):        # each lane's absorb and proposals replay its own graphs
             e.graphs = None if graphs is None else SimpleNamespace(verify={}, absorb=graphs.absorb[k],
                                                                    drafts=graphs.drafts[k])
@@ -58,6 +60,7 @@ class LaneDecoder:
         self.arrived = lambda: False                # the Scheduler's: whether a foreground request waits
         self.current: Stream | None = None          # the prompt that ran the last span
         self.next_id = 0
+        self.used = [-1] * lanes.slots              # the stream id each lane last took
         self.stages = os.environ.get(STAGES_ENV) == "1"
 
     def live(self) -> int:
@@ -73,9 +76,22 @@ class LaneDecoder:
     def _drafting(self, s: Stream) -> bool:
         return s.draft and self.drafts > 0 and self.w.dspark is not None
 
+    def _lane(self, free: list[int], hit) -> int:
+        """The hit's lane if free, else the lowest free lane holding no kept rows, else the free lane used least
+        recently."""
+
+        if self.kept is None:
+            return free[0]
+        at = self.kept.lane(hit)
+        if at in free:
+            return at
+        empty = [k for k in free if not self.kept.holds(k)]
+        return empty[0] if empty else min(free, key=lambda k: self.used[k])
+
     @torch.no_grad()
     def admit(self, s: Stream) -> None:
-        """Queue ``s``'s prompt in the lowest free lane, running no forward: later steps fill it a span at a time."""
+        """Queue ``s``'s prompt in a free lane, running no forward: later steps fill it a span at a time, from its
+        longest kept prefix when it drafts."""
 
         prompt, C, vocab = s.prompt, self.lanes.capacity, self.w.cfg.vocab_size
         if not prompt:
@@ -88,13 +104,34 @@ class LaneDecoder:
         if not free:
             raise NoRoom(f"all {self.lanes.slots} lanes are busy")
         s.count = max(1, min(s.count, C - len(prompt)))
-        e = self.engines[free[0]]
+        hit = self.kept.lookup(prompt) if self.kept is not None and s.draft else None
+        lane = self._lane(free, hit)
+        e = self.engines[lane]
         e.drop_reads()
-        decoding = any(not x.done for x in self.streams.values())
-        s.fill = Fill(e, prompt, s.sampling, rows=span_rows(self.pbuf.rows, decoding))
-        s.lane, s.sid, s.prefill_s = free[0], self.next_id, 0.0
+        rows = span_rows(self.pbuf.rows, any(not x.done for x in self.streams.values()))
+        s.fill = Fill(e, prompt, s.sampling, rows=rows) if self.kept is None else self._resume(s, lane, hit, rows)
+        s.lane, s.sid, s.prefill_s, s.cached = lane, self.next_id, 0.0, len(hit.ids) if hit is not None else 0
+        self.used[lane] = self.next_id
         self.next_id += 1
         self.filling.append(s)
+
+    def _resume(self, s: Stream, lane: int, hit, rows: int) -> Fill:
+        """``s``'s fill in ``lane`` from ``hit``, its rows put in the lane, the snapshot before its last token kept
+        when it drafts; the hit stays pinned and the span reserved until the lane's fill settles."""
+
+        kept, prompt = self.kept, s.prompt
+        keep_at = max(1, len(prompt) - 1) if s.draft else None
+        fresh = keep_at is not None and (hit is None or len(hit.ids) != keep_at)
+        space = kept.reserve(hit, lane, room=fresh)
+        if fresh and space is None:
+            keep_at = None
+        try:
+            kept.take_over(hit, lane)
+            return Fill(self.engines[lane], prompt, s.sampling, resume=hit, keep_at=keep_at, space=space, rows=rows,
+                        keep=partial(kept.remember, lane=lane) if keep_at is not None else None)
+        except BaseException:
+            kept.settle(lane)
+            raise
 
     @torch.no_grad()
     def round(self) -> list[Stream]:
@@ -142,6 +179,8 @@ class LaneDecoder:
     def _unfill(self, s: Stream) -> None:
         self.filling = [x for x in self.filling if x is not s]
         s.fill = None
+        if self.kept is not None:
+            self.kept.settle(s.lane)
         if self.current is s:
             self.current = None
 
@@ -150,6 +189,8 @@ class LaneDecoder:
 
         first = s.fill.first
         self._unfill(s)
+        if self.kept is not None:
+            self.kept.live[s.lane] = list(s.prompt)
         s.context = list(s.prompt)
         s.started = time.perf_counter()
         s.take([first], self._ends(s))
@@ -210,8 +251,10 @@ class LaneDecoder:
             e.clock["device"] += device
             sampled = e.sample(b.logits[s.seg0:s.seg0 + s.R], [pos + 1 + r for r in range(s.R)], s.sampling)
             kept.append(sampled[:accept(sampled, s.drafts, self._ends(s))])
-        for s, e, new in zip(live, engines, kept):  # 7. commit
+        for s, e, new, (_, _, tokens) in zip(live, engines, kept, windows):     # 7. commit
             F.commit(w, e.st, b, s.R, len(new), row0=s.seg0)
+            if self.kept is not None:
+                self.kept.live[s.lane] += tokens[:len(new)]
         for s, e, new in zip(live, engines, kept):  # 8-9. absorb and read ahead, for lanes that go on drafting
             if not self._drafting(s) or len(s.out) + len(new) >= s.count or new[-1] in self._ends(s):
                 continue
@@ -250,6 +293,10 @@ class LaneDecoder:
         for s in self.filling:
             s.fill.close()
             s.fill = None
+        if self.kept is not None:
+            for k in list(self.kept.pinned):
+                self.kept.settle(k)
+            self.kept.live.clear()
         for e in self.engines:
             e.drop_reads()
         self.streams, self.filling, self.current = {}, [], None
