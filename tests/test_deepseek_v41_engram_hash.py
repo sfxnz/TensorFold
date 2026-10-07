@@ -120,6 +120,21 @@ def test_vectorized_ids_equal_the_reference_one_position_at_a_time():
                 assert np.array_equal(hasher.ids(raw[:5], raw[5:]), want[5:])
 
 
+def test_ids_hashed_a_chunk_at_a_time_equal_the_whole_prompts_rows():
+    P = pytest.importorskip("tensorfold.families.deepseek_v41.cuda.prefill")
+    rng = np.random.default_rng(11)
+    for cfg, token_map in (_small(), (CFG, _fixture_map()[1])):
+        known, hasher = np.flatnonzero(token_map.table >= 0), Hasher(cfg, token_map)
+        for _ in range(30):
+            prompt = rng.choice(known, size=int(rng.integers(1, 60))).tolist()
+            n, whole = len(prompt), hasher.ids([], prompt)
+            for begin in (0, int(rng.integers(0, n))):      # fresh, or resumed after its history
+                history = prompt[:begin][-(hasher.max_ngram - 1):]
+                cuts = sorted({begin, n, *rng.integers(begin, n + 1, size=int(rng.integers(0, 6))).tolist()})
+                got = [P.span_ids(hasher, history, prompt, begin, a, z) for a, z in pairwise(cuts)]
+                assert np.array_equal(np.concatenate(got), whole[begin:]), (n, begin, cuts)
+
+
 def test_the_fixture_ids_are_reproduced_from_its_token_map():
     data, token_map = _fixture_map()
     hasher = Hasher(CFG, token_map)

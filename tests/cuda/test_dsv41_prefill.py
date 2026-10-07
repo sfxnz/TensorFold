@@ -103,7 +103,12 @@ def _snap(s: snapshot.Snapshot) -> dict:
 def _run(e: Eng, prompt, sampling=SAMPLING, **kw) -> dict:
     """Prefill ``prompt``, then the next block's drafts -> everything a later step reads, as bits."""
 
-    first = P.prefill(e, prompt, sampling, **kw)
+    return _after(e, prompt, P.prefill(e, prompt, sampling, **kw), sampling)
+
+
+def _after(e: Eng, prompt, first: int, sampling=SAMPLING) -> dict:
+    """``_run``'s result for a prefill that drew ``first``, read before another prompt's chunk reuses ``pbuf``."""
+
     out = {"first": torch.tensor([first]), "logits": _bits(e.pbuf.logits[0]), **_state(e)}
     drafts, conf = dspark.propose(e, first, len(prompt) - 1, sampling, BLOCK)
     out.update(drafts=torch.tensor(drafts), conf=torch.tensor(conf), dlog=_bits(e.dbuf.dlog))
@@ -366,6 +371,71 @@ def test_a_pinned_half_is_refilled_only_after_its_copy(tiny, ref):
     got = b.eraw[:129].cpu().numpy().reshape(-1, b.eraw.shape[-1])[:, :reader.wrow]
     assert np.array_equal(got, want), "chunk 0 got another chunk's rows"
     assert np.array_equal(b.eidx[:129].cpu().numpy().reshape(-1), rows._ids(0, rows.idx)), "chunk 0's scale rows"
+
+
+# -- prompts on their own states taking turns on one pbuf, a chunk a step -----------------------------------------
+
+def _sharing(tiny, ref, k: int, rows: int) -> list[Eng]:
+    engs = [Eng(tiny, ref.hasher, ref.reader, rows=rows) for _ in range(k)]
+    for e in engs[1:]:
+        e.pbuf = engs[0].pbuf
+    return engs
+
+
+def _turns(fills: list[tuple[Eng, P.Fill]], order: list[int]) -> list[dict]:
+    """Steps in ``order``, then each fill to its end, one paused whenever another steps -> each fill's ``_after``."""
+
+    out, now = [None] * len(fills), None
+    for j in [*order, *(j for j, (_, f) in enumerate(fills) for _ in f.spans)]:
+        e, f = fills[j]
+        if out[j] is not None:
+            continue
+        if now not in (None, j) and out[now] is None:
+            assert fills[now][1].reads.pending is not None, "a switch with no read ahead in flight"
+            fills[now][1].pause()
+        now = j
+        if f.step():
+            out[j] = _after(e, f.prompt, f.first, f.sampling)
+    return out
+
+
+TURNS = {"same parity": [1, 0] * 8, "other parity": [0] + [1, 0] * 8, "one paused for three": [0, 1, 1, 1, 0]}
+
+
+@pytest.mark.parametrize("rows", [7, 129])
+@pytest.mark.parametrize("turns", TURNS)
+@pytest.mark.parametrize("delay", [0, 0.05])             # reads held back on the reader's thread
+def test_fills_taking_turns_on_one_pbuf_equal_their_solo_runs(tiny, ref, rows, turns, delay):
+    engs = _sharing(tiny, ref, 2, rows)
+    prompts = [_ids(21, 6 * rows + 3, tiny.cfg.vocab_size), _ids(22, 5 * rows + 1, tiny.cfg.vocab_size)]
+    keeps, kept = [6 * rows + 2, 3 * rows + 2], [[], []]   # inside the last chunk, and inside an earlier one
+    want = [_run(e, p, keep_at=k, keep=c.append) for e, p, k, c in zip(engs, prompts, keeps, kept)]
+    for e in engs:
+        if delay:
+            e.reader = _Slow(ref.reader, delay)
+    fills = [(e, P.Fill(e, p, SAMPLING, keep_at=k, keep=c.append)) for e, p, k, c in zip(engs, prompts, keeps, kept)]
+    got = _turns(fills, TURNS[turns])
+    for j in range(2):
+        _equal(got[j], want[j], f"prompt {j} in turns ({turns}), {rows}-row chunks, reads {delay} s late")
+        _equal(_snap(kept[j][1]), _snap(kept[j][0]), f"prompt {j}'s snapshot in turns ({turns})")
+
+
+def test_fills_of_other_chunk_sizes_and_a_resumed_fill_take_turns(tiny, ref):
+    prompts, held, snap = [_ids(41 + j, n, tiny.cfg.vocab_size) for j, n in enumerate((90, 600, 500))], [], []
+    whole = Eng(tiny, ref.hasher, ref.reader, rows=600)
+    want = [_run(whole, p) for p in prompts[:2]] + [_run(whole, prompts[2], keep_at=450, keep=held.append)]
+    engs = _sharing(tiny, ref, 3, 129)
+    P.prefill(engs[2], prompts[2][:201], None, keep_at=200, keep=snap.append)
+    with pytest.raises(ValueError, match="130-row chunks"):
+        P.Fill(engs[0], prompts[0], None, rows=130)
+    fills = [P.Fill(engs[0], prompts[0], SAMPLING, rows=7), P.Fill(engs[1], prompts[1], SAMPLING),
+             P.Fill(engs[2], prompts[2], SAMPLING, resume=snap[0], keep_at=450, keep=held.append)]
+    assert [f.rows_left for f in fills] == [90, 600, 300]
+    got = _turns(list(zip(engs, fills)), [0, 1, 2] * 4)
+    assert [f.rows_left for f in fills] == [0, 0, 0]
+    for j, what in enumerate(("7-row chunks", "129-row chunks", "resumed at 200")):
+        _equal(got[j], want[j], f"{what} in turns against the whole prompt")
+    _equal(_snap(held[1]), _snap(held[0]), "the resumed fill's snapshot at 450")
 
 
 # -- the pack -----------------------------------------------------------------------------------------------------
