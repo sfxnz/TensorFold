@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from . import GRAPH_ROWS, MAX_ROWS, dspark
+from . import GRAPH_ROWS, MAX_ROWS, dspark, proposals
 from . import forward as F
 from .lanes import stage_tables
 
@@ -75,9 +75,10 @@ class Graphs:
 
 class LaneGraphs(Graphs):
     """Graphs of the shared forward over ``lanes``: verify by total rows T (the row tables are data, so one graph serves
-    every layout), and each lane Engine's absorb from forward row 0 and its proposals, in one pool."""
+    every layout), each lane Engine's absorb from forward row 0 and its proposals, and with ``batch`` the proposals of
+    2.. lanes in one block by (lanes, keyed of them, d), in one pool."""
 
-    def __init__(self, w, lanes, mbuf, engines) -> None:
+    def __init__(self, w, lanes, mbuf, engines, batch=None) -> None:
         if len(engines) != lanes.slots or any(e.st is not lanes.view(k) or e.dbuf is not mbuf
                                               for k, e in enumerate(engines)):
             raise ValueError(f"lane graphs: {len(engines)} engines for {lanes.slots} lanes, each on its lane's view "
@@ -87,6 +88,7 @@ class LaneGraphs(Graphs):
         self.verify: dict[int, torch.cuda.CUDAGraph] = {}      # by total rows T
         self.absorb: list[dict[int, torch.cuda.CUDAGraph]] = [{} for _ in engines]     # per lane, by kept rows
         self.drafts: list[dict[tuple[int, bool], torch.cuda.CUDAGraph]] = [{} for _ in engines]
+        self.batch, self.batched = batch, {}
 
     @torch.no_grad()
     def warm(self) -> int:
@@ -108,6 +110,19 @@ class LaneGraphs(Graphs):
         if w.dspark is not None:
             for k, e in enumerate(self.engines):
                 self.absorb[k], self.drafts[k] = self._proposals(e)
+            if self.batch is not None:
+                self._batched(token)
         for e in self.engines:
             e.reset()
-        return len(self.verify) + sum(map(len, self.absorb)) + sum(map(len, self.drafts))
+        return len(self.verify) + sum(map(len, self.absorb)) + sum(map(len, self.drafts)) + len(self.batched)
+
+    def _batched(self, token: int) -> None:
+        """The block of lanes 0.. drafting together, by (lanes, keyed of them, d)."""
+
+        k, sampling = self.batch, Sampling(seed=0, temperature=1.0, top_k=0)
+        for L in range(2, min(k.slots, self.lanes.slots) + 1):
+            for keyed in range(L + 1):
+                proposals.set_slots(k, [(j, token, sampling if j >= L - keyed else None) for j in range(L)])
+                for d in range(1, self.w.cfg.dspark_block_size + 1):
+                    self.batched[L, keyed, d] = self._capture(
+                        lambda L=L, keyed=keyed, d=d: proposals.chain(self.w, self.lanes, self.mbuf, k, L, keyed, d))

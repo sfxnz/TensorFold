@@ -59,6 +59,11 @@ first token. A background request that yields its lane to a waiting one later re
 the tokens it had not sent. An fp16 overflow of the routed experts in one lane while the first forwards still check
 for it fails that round for every live request; the requests after it are served as usual.
 
+`TF_DSV41_BATCHED_DRAFTS=1` runs the DSpark proposals of two or more drafting requests in one block forward, each
+request's rows on its own ring and positions. Every kernel in it is row-invariant, so each request drafts the bits it
+drafts alone and its replies and draft stats are unchanged. Both ranks must set it alike; they refuse to serve
+otherwise.
+
 ## Memory
 
 A rank holds 76.1 GiB of weights: its half of the routed experts (TP over each expert's intermediate dim, 1,152 a

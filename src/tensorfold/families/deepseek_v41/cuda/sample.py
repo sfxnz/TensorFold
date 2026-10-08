@@ -174,20 +174,32 @@ class Draws:
     def set(self, sampling: Sampling | None) -> bool:
         """Write ``sampling``'s knobs when they changed -> whether its drafts are keyed draws (else greedy)."""
 
-        if sampling is None or sampling.temperature <= 0:
+        if not keyed(sampling):
             return False
         want = (sampling.seed, sampling.temperature, sampling.top_k, sampling.top_p, sampling.min_p)
         if want != self.set_for:
-            with np.errstate(over="ignore"):         # ``exact_sampling.uniform``'s first mix: the seed's alone
-                key = _mix(np.uint64(sampling.seed & 0xFFFFFFFFFFFFFFFF) + np.uint64(0x9E3779B97F4A7C15))
-            k = min(int(sampling.top_k) or DRAFT_TOP_K, DRAFT_TOP_K, self.world * self.width)
-            top_p = sampling.top_p if 0.0 < sampling.top_p < 1.0 else NO_CUT
-            floats = np.array([max(float(sampling.temperature), 1e-6), top_p, sampling.min_log], dtype=np.float64)
-            knobs = np.concatenate([np.array([key], dtype=np.uint64).view(np.int64), np.array([k], dtype=np.int64),
-                                    floats.view(np.int64)])
-            self.knobs.copy_(torch.from_numpy(knobs))
+            self.knobs.copy_(torch.from_numpy(knobs(sampling, self.world * self.width)))
             self.set_for = want
         return True
+
+
+def keyed(sampling: Sampling | None) -> bool:
+    """Whether ``sampling``'s drafts are keyed draws (else greedy)."""
+
+    return sampling is not None and sampling.temperature > 0
+
+
+def knobs(sampling: Sampling, candidates: int) -> np.ndarray:
+    """A keyed draft draw's int64 knobs over ``candidates`` gathered keys: key, top_k, float64 bits of t, top_p, ln
+    min_p."""
+
+    with np.errstate(over="ignore"):                 # ``exact_sampling.uniform``'s first mix: the seed's alone
+        key = _mix(np.uint64(sampling.seed & 0xFFFFFFFFFFFFFFFF) + np.uint64(0x9E3779B97F4A7C15))
+    k = min(int(sampling.top_k) or DRAFT_TOP_K, DRAFT_TOP_K, candidates)
+    top_p = sampling.top_p if 0.0 < sampling.top_p < 1.0 else NO_CUT
+    floats = np.array([max(float(sampling.temperature), 1e-6), top_p, sampling.min_log], dtype=np.float64)
+    return np.concatenate([np.array([key], dtype=np.uint64).view(np.int64), np.array([k], dtype=np.int64),
+                           floats.view(np.int64)])
 
 
 @triton.jit

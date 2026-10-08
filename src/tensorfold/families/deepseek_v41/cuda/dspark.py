@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 import triton
@@ -16,7 +16,7 @@ from tensorfold.families.glm5_next.cuda import glue, qmm
 
 from ..config import Config
 from . import attn_kernel, moe, mx8, norms, quant, rope, sample
-from .buffers import Buffers, State
+from .buffers import Buffers
 from .forward import _gather
 from .weights import StageW, Weights
 
@@ -76,35 +76,36 @@ def absorb(e, b: Buffers, n: int, *, prompt: bool, first: int = 0) -> None:
         st.rings[sw.index].index_copy_(0, slots, kv)
 
 
-def _stage(sw: StageW, w: Weights, st: State, b: Buffers, k: Work) -> None:
-    """One stage (M:968-994, attention as M:1054-1074) on the block stream ``b.xd`` in place."""
+def stage(sw: StageW, w: Weights, b: Buffers, xd: torch.Tensor, at: torch.Tensor, kv_out: torch.Tensor, d,
+          attend: Callable[..., torch.Tensor]) -> None:
+    """One stage (M:968-994, attention as M:1054-1074) on the block rows ``xd`` in place at positions ``at``: their KV
+    into ``kv_out``, ``attend(sw, q, kv, out)`` the attention, ``d`` the scratch of the DSpark MoE's rows."""
 
-    cfg, a, L = w.cfg, sw.attn, sw.index
-    B, eps, table, pos = cfg.dspark_block_size, cfg.rms_norm_eps, w.rope[sw.role.rope], st.pos_dev
-    flat = b.xd.view(B, -1)
+    cfg, a = w.cfg, sw.attn
+    n, eps, table = xd.shape[0], cfg.rms_norm_eps, w.rope[sw.role.rope]
+    flat = xd.view(n, -1)
     h = sw.hc_attn
-    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:B], b.pre_a[:B], b.post_a[:B], b.comb_a[:B], eps,
+    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:n], b.pre_a[:n], b.post_a[:n], b.comb_a[:n], eps,
                  cfg.hc_eps, cfg.hc_sinkhorn_iters)
-    xa = norms.collapse_norm(flat, b.pre_in[:B], sw.attn_norm, b.xn[:B], eps)
-    qakv = mx8.mm(a.wqa_kv, xa, b.qakv[:B])
-    qr = norms.rmsnorm(qakv[:, :cfg.q_lora_rank], a.q_norm, eps, b.qr[:B])
-    kv = quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, pos, table, b.bkv)
-    q = b.q[:B]
-    mx8.mm(a.wq_b, qr, q.view(B, -1))
-    rope.apply(q, pos, table)
-    o = attn_kernel.attention(q, st.rings[L], None, pos, k.anchors, kv, k.lists, k.counts, a.sink, b.o[:B],
-                              prompt=False, part=b.attn_part)
-    rope.apply(o, pos, table, inverse=True)
-    u = mx8.grouped(a.wo_a, o.view(B, -1), b.u[:B])
-    mx8.mm(a.wo_b, u, b.part[:B], f32=True)
-    glue.hc_post(flat, flat, _gather(w, b, B), b.post_a[:B], b.comb_a[:B])
+    xa = norms.collapse_norm(flat, b.pre_in[:n], sw.attn_norm, b.xn[:n], eps)
+    qakv = mx8.mm(a.wqa_kv, xa, b.qakv[:n])
+    qr = norms.rmsnorm(qakv[:, :cfg.q_lora_rank], a.q_norm, eps, b.qr[:n])
+    kv = quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], a.kv_norm, eps, at, table, kv_out)
+    q = b.q[:n]
+    mx8.mm(a.wq_b, qr, q.view(n, -1))
+    rope.apply(q, at, table)
+    o = attend(sw, q, kv, b.o[:n])
+    rope.apply(o, at, table, inverse=True)
+    u = mx8.grouped(a.wo_a, o.view(n, -1), b.u[:n])
+    mx8.mm(a.wo_b, u, b.part[:n], f32=True)
+    glue.hc_post(flat, flat, _gather(w, b, n), b.post_a[:n], b.comb_a[:n])
     h = sw.hc_ffn
-    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:B], b.pre_f[:B], b.post_f[:B], b.comb_f[:B], eps,
+    norms.hc_mix(flat, h.fn, h.base, h.scale, b.hcpart[:n], b.pre_f[:n], b.post_f[:n], b.comb_f[:n], eps,
                  cfg.hc_eps, cfg.hc_sinkhorn_iters)
-    xf = norms.collapse_norm(flat, b.pre_a[:B], sw.ffn_norm, b.xn[:B], eps)    # delayed mHC: the attention's pre
-    moe.dspark_moe(cfg, sw.moe, xf, b)
-    glue.hc_post(flat, flat, _gather(w, b, B), b.post_f[:B], b.comb_f[:B])
-    b.pre_in[:B].copy_(b.pre_f[:B])
+    xf = norms.collapse_norm(flat, b.pre_a[:n], sw.ffn_norm, b.xn[:n], eps)    # delayed mHC: the attention's pre
+    moe.dspark_moe(cfg, sw.moe, xf, b, d)
+    glue.hc_post(flat, flat, _gather(w, b, n), b.post_f[:n], b.comb_f[:n])
+    b.pre_in[:n].copy_(b.pre_f[:n])
 
 
 @torch.no_grad()
@@ -118,26 +119,34 @@ def block(e) -> torch.Tensor:
     b.pre_in[:B].zero_()
     b.pre_in[:B, 0].fill_(1.0)
     torch.sub(st.pos_dev.expand(B), 1, out=k.anchors)
+
+    def attend(sw: StageW, q: torch.Tensor, kv: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        return attn_kernel.attention(q, st.rings[sw.index], None, st.pos_dev, k.anchors, kv, k.lists, k.counts,
+                                     sw.attn.sink, out, prompt=False, part=b.attn_part)
+
     for sw in ds.stages:
-        _stage(sw, w, st, b, k)
+        stage(sw, w, b, b.xd, st.pos_dev, b.bkv, b, attend)
     x = norms.collapse_norm(b.xd.view(B, -1), b.pre_in[:B], ds.norm, b.fnormed[:B], cfg.rms_norm_eps,
                             raw=b.hidden[:B])
     return mx8.mm(w.head, x, b.dlog, f32=True)
 
 
 @triton.jit
-def _markov_in(IDS, EMB, X, PROJ, ME, CONF, i, D: tl.constexpr, RK: tl.constexpr, BLOCK: tl.constexpr):
-    """Row i: me = markov_embed[ids[i]] (a bf16 copy); confidence = proj . f32(cat(x_i, me)) as one fp32 sum."""
+def _markov_in(IDS, EMB, X, PROJ, ME, CONF, i, step, xlane, D: tl.constexpr, RK: tl.constexpr, BLOCK: tl.constexpr):
+    """Program j, step i: r = i step + j; me[r] = markov_embed[ids[r]] (a bf16 copy); conf[r] = proj . f32(cat(x, me))
+    as one fp32 sum, x the row i + j xlane."""
 
+    j = tl.program_id(0)
+    r = i * step + j
     n = tl.arange(0, BLOCK)
-    tok = tl.load(IDS + i).to(tl.int64)
+    tok = tl.load(IDS + r).to(tl.int64)
     isx = n < D
     ism = (n >= D) & (n < D + RK)
     me = tl.load(EMB + tok * RK + (n - D), mask=ism, other=0.0)
-    tl.store(ME + i * RK + (n - D), me, mask=ism)
-    x = tl.load(X + i * D + n, mask=isx, other=0.0)
+    tl.store(ME + r * RK + (n - D), me, mask=ism)
+    x = tl.load(X + (i + j * xlane) * D + n, mask=isx, other=0.0)
     v = tl.where(isx, x.to(tl.float32), me.to(tl.float32))
-    tl.store(CONF + i, tl.sum(v * tl.load(PROJ + n, mask=n < D + RK, other=0.0), axis=0))
+    tl.store(CONF + r, tl.sum(v * tl.load(PROJ + n, mask=n < D + RK, other=0.0), axis=0))
 
 
 def markov_input(e, i: int) -> None:
@@ -145,7 +154,7 @@ def markov_input(e, i: int) -> None:
 
     w, b, k = e.w, e.dbuf, e.dwork
     D, RK = w.cfg.hidden_size, w.cfg.dspark_markov_rank
-    _markov_in[(1,)](k.mids, w.dspark.markov_embed, b.hidden, w.dspark.conf, b.me, b.conf, i, D=D, RK=RK,
+    _markov_in[(1,)](k.mids, w.dspark.markov_embed, b.hidden, w.dspark.conf, b.me, b.conf, i, 1, 0, D=D, RK=RK,
                      BLOCK=triton.next_power_of_2(D + RK), num_warps=8)
 
 

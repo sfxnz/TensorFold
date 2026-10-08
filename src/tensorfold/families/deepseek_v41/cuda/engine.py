@@ -36,6 +36,7 @@ class DeepSeekV41Engine:
         from .cache import Kept, entries_wanted
         from .decode import Engine
         from .geometry import cache_wanted, dsv41_geometry, kept_bytes
+        from .proposals import enabled as batched
 
         if rank not in (0, 1):
             raise ValueError(f"rank {rank}: {type(self).__name__} runs on ranks 0 and 1")
@@ -54,7 +55,8 @@ class DeepSeekV41Engine:
         dspark = self.policy[0] > 0 and not self.serial_only
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         try:
-            plan = admit(model_dir, context, explicit, torch, lambda text: dsv41_geometry(cfg, 2, lanes=self.slots),
+            plan = admit(model_dir, context, explicit, torch,
+                         lambda text: dsv41_geometry(cfg, 2, lanes=self.slots, batched=batched() and dspark),
                          split.rank_estimate(cfg, rank, dspark), rank=rank, world=2, gather=self._gather_ints)
         except ValueError as exc:               # the window is per lane: name the flag that multiplies it
             if self.slots == 1 or "cannot fit" not in str(exc):
@@ -76,7 +78,8 @@ class DeepSeekV41Engine:
         mine = protocol.settings(start_error=failure is not None, dspark=dspark, capacity=capacity,
                                  prefill_rows=prefill_rows, max_rows=MAX_ROWS, ring=RING, policy=self.policy,
                                  layers=cfg.num_hidden_layers, world=2, engram_digest=digest, lanes=self.slots,
-                                 decode_share=self.share, cache_bytes=wanted, cache_entries=entries)
+                                 decode_share=self.share, batched_drafts=batched(), cache_bytes=wanted,
+                                 cache_entries=entries)
         both = self._gather_ints(mine)
         if failure is not None or both[1 - rank][0]:
             raise ValueError("the TF_DSV41_* variables or the Engram tables could not be read on " +
@@ -115,6 +118,7 @@ class DeepSeekV41Engine:
         from .lanes import Ahead, Lanes
         from .multi import LaneDecoder
         from .multi_tp import Link
+        from .proposals import Batch, enabled
 
         w, S = self.w, self.slots
         cfg, dev = w.cfg, w.device
@@ -129,11 +133,12 @@ class DeepSeekV41Engine:
                                dbuf=self.mbuf, ahead=Ahead(cfg, w.world)) for k in range(S)]
         self.kept = Kept(self.engines, cache_bytes, entries)
         self.eos = (cfg.eos_token_id,)
-        lane_graphs = LaneGraphs(w, self.lanes, self.mbuf, self.engines) if graphs else None
+        batch = Batch(cfg, w.world, S, dev) if enabled() and w.dspark is not None else None
+        lane_graphs = LaneGraphs(w, self.lanes, self.mbuf, self.engines, batch) if graphs else None
         if lane_graphs is not None:
             lane_graphs.warm()
         self.decoder = LaneDecoder(w, self.lanes, self.engines, self.mbuf, self.pbuf, self.policy, self.eos,
-                                   lane_graphs, self.share, kept=self.kept)
+                                   lane_graphs, self.share, kept=self.kept, batch=batch)
         self._warm_lanes()
         if self.rank == 0:
             self.decoder.link = Link(getattr(self.comm, "store", None), rank=0, host=self.master or None)

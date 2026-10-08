@@ -74,7 +74,7 @@ def shape(dec) -> list:
     entries = [] if kept is None else [[len(x.snap.ids), x.digest, "arena" if x.lane is None else x.lane]
                                        for x in kept.cache]
     settings = [dec.lanes.slots, dec.lanes.capacity, dec.drafts, dec.confidence, list(dec.eos), dec.pbuf.rows,
-                None if kept is None else kept.entries]
+                None if kept is None else kept.entries, dec.batch is not None]
     return [dec.next_id, lanes, streams, entries, dec._free(), settings]
 
 

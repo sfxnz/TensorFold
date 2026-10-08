@@ -15,6 +15,7 @@ from . import MAX_ROWS, PREFILL_ROWS, buffers
 from .buffers import _device_bytes
 from .dspark import Work
 from .lanes import Lanes
+from .proposals import Batch
 
 MINIMUM_SLOTS = 4096
 CACHE_ENV = "TF_DSV41_CACHE_GIB"
@@ -28,9 +29,11 @@ def rope_bytes(cfg: Config, capacity: int) -> int:
     return 2 * 2 * capacity * (cfg.qk_rope_head_dim // 2) * 4
 
 
-def dsv41_geometry(cfg: Config, world: int, reserve: int = MAX_ROWS, lanes: int = 1) -> Geometry:
+def dsv41_geometry(cfg: Config, world: int, reserve: int = MAX_ROWS, lanes: int = 1,
+                   batched: bool = False) -> Geometry:
     """State, RoPE tables, a decode window's and a prompt chunk's buffers, exactly as the engine allocates them;
-    ``lanes`` above 1: that many States and drafters' scratch, and the shared forward's buffers over them."""
+    ``lanes`` above 1: that many States and drafters' scratch, and the shared forward's buffers over them, with
+    ``batched`` the scratch of their proposals in one block."""
 
     def bytes_at(slots: int) -> int:
         slots = int(slots)
@@ -40,6 +43,8 @@ def dsv41_geometry(cfg: Config, world: int, reserve: int = MAX_ROWS, lanes: int 
         else:
             state = Lanes(cfg, lanes, slots, "meta").nbytes() + lanes * _device_bytes(Work(cfg, world, "meta"), META)
             decode = buffers.Buffers(cfg, world, MAX_ROWS * lanes, slots, device="meta", lanes=lanes).nbytes()
+            if batched:
+                decode += _device_bytes(Batch(cfg, world, lanes, META), META)
         prompt = buffers.bytes(cfg, world, PREFILL_ROWS, slots, prefill=True)
         return state + rope_bytes(cfg, slots) + decode + prompt
 
