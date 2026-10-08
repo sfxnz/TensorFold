@@ -15,7 +15,8 @@ if not torch.cuda.is_available():
 from dsv41_layouts import mx8_from_block
 
 from tensorfold.cuda import prompt_precision
-from tensorfold.cuda.nvfp4.linear import Mx8Linear
+from tensorfold.cuda.kernels import qmm
+from tensorfold.cuda.nvfp4.linear import FUSED_ROWS, MXFP8, Mx8Linear, _ext
 from tensorfold.families.deepseek_v41.cuda import mx8
 from tensorfold.families.deepseek_v41.cuda.split import slice_for
 
@@ -154,8 +155,12 @@ def test_decode_groups_run_in_one_launch_with_each_groups_bits(monkeypatch):
 
     class Counting:
         def qmmf(self, *a):
-            calls.append(a[7])
+            calls.append(("qmmf", a[7]))
             return ext.qmmf(*a)
+
+        def qmmf_groups(self, *a):
+            calls.append(("groups", a[7], a[12]))
+            return ext.qmmf_groups(*a)
 
     monkeypatch.setattr(mx8, "_ext", lambda: Counting())
     for m in (*ROWS, 2048):
@@ -165,12 +170,36 @@ def test_decode_groups_run_in_one_launch_with_each_groups_bits(monkeypatch):
         calls.clear()
         got = mx8.grouped(groups, o, torch.empty_like(want), prompt=m > 6)
         assert torch.equal(got, want), m
-        assert calls == ([] if m > 6 else [GROUPS * n]), m
+        assert calls == ([] if m > 6 else [("groups", GROUPS * n, GROUPS)]), m
+
+
+def _stacked(groups: mx8.Groups, x: torch.Tensor) -> torch.Tensor:
+    """The G x G launch: x's row r, group block g as row G r + g against every group's columns, the (r, g, g) blocks."""
+
+    G, k, n, whole = len(groups), groups[0].k, groups[0].n, groups.whole
+    rows, m = x.shape[0], x.shape[0] * len(groups)
+    y = torch.empty((m, G * n), dtype=torch.bfloat16, device="cuda")
+    sk = qmm.split_k(n, k)
+    bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
+    _ext().qmmf(x.contiguous().view(m, k), whole.w8, whole.bs, 1.0, y, None, MXFP8, G * n, sk, whole.npad, bm, False)
+    return y.as_strided((rows, G, n), (G * G * n, (G + 1) * n, 1)).reshape(rows, G * n)
 
 
 @pytest.mark.parametrize("count", [2, 4])
-def test_stacked_group_rows_do_not_depend_on_the_row_count(count):
-    """Every row of a 1..24-row stacked launch (G x rows up to 96) has the bits of that row through each group alone."""
+def test_one_launch_has_the_stacked_launchs_bits(count):
+    """The grouped launch equals the G x G launch it replaces at every lane row count, past the tiles and fused."""
+
+    groups, _ = _groups(70 + count, count)
+    k, n = groups[0].k, groups[0].n
+    o = _x(256, count * k, 14)
+    for rows in (*range(1, LANE_ROWS + 1), 32, 33, 64, 96, 256):
+        out = torch.empty((rows, count * n), dtype=torch.bfloat16, device="cuda")
+        assert torch.equal(mx8.grouped(groups, o[:rows], out), _stacked(groups, o[:rows])), (count, rows)
+
+
+@pytest.mark.parametrize("count", [2, 4])
+def test_group_rows_do_not_depend_on_the_row_count(count):
+    """Every row of a 1..24-row grouped launch has the bits of that row through each group alone."""
 
     groups, alone = _groups(60 + count, count)
     k, n = groups[0].k, groups[0].n
