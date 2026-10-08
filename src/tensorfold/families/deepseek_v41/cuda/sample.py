@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from fractions import Fraction
 
 import numpy as np
@@ -23,6 +24,7 @@ from .weights import Weights
 DRAFT_TOP_K = 1024      # a draft's largest top_k, and its top_k when the request's is off: never whole shards
 CANDIDATES = DRAFT_TOP_K + MARGIN   # a rank's candidates for a keyed draft, so values tied at the cut resolve by id
 NO_CUT = 2.0            # the top_p of a request without one: no cumulative mass reaches it
+GREEDY_ENV = "TF_DSV41_GREEDY_DEVICE"   # "1": a verify window draws its greedy rows on the device, in its graph
 
 
 def target_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int],
@@ -32,6 +34,61 @@ def target_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int],
     start = time.perf_counter()
     tokens = sample_rows(w, logits, positions, sampling)
     return tokens, time.perf_counter() - start
+
+
+def greedy_on_device(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether GREEDY_ENV turns the verify window's device greedy draw on."""
+
+    return (os.environ if environ is None else environ).get(GREEDY_ENV, "").strip() == "1"
+
+
+def greedy(sampling: Sampling | None) -> bool:
+    """A draw of the largest logit (no temperature)."""
+
+    return sampling is None or sampling.temperature <= 0
+
+
+@triton.jit
+def _least(LOGITS, KEYS, width, stride, offset, B: tl.constexpr):
+    """KEYS[row] = the least of the row's ``_keys`` keys over its ``width`` columns: its largest value (-0 ties +0)
+    at the lowest id holding it."""
+
+    row = tl.program_id(0)
+    best = tl.full([B], 0x7FFFFFFFFFFFFFFF, tl.int64)
+    for start in range(0, width, B):
+        col = start + tl.arange(0, B)
+        ok = col < width
+        v = tl.load(LOGITS + row * stride + col, ok, other=0.0)
+        bits = tl.where(v == 0.0, 0.0, v).to(tl.int32, bitcast=True).to(tl.int64)
+        key = ((-1 - (bits ^ ((bits >> 31) & 0x7FFFFFFF))) << 32) + col + offset
+        best = tl.minimum(best, tl.where(ok, key, 0x7FFFFFFFFFFFFFFF))
+    tl.store(KEYS + row, tl.min(best, 0))
+
+
+def least_keys(w: Weights, logits: torch.Tensor, mine: torch.Tensor, got: torch.Tensor,
+               best: torch.Tensor) -> torch.Tensor:
+    """Each row of this rank's fp32 ``logits`` [R, V / world] -> its greedy key over every rank's columns, alike on
+    every rank, in the int64 scratch ``mine`` [R], ``got`` [world * R] and ``best`` [R]; a key's low word is its id."""
+
+    R = logits.shape[0]
+    _least[(R,)](logits, mine, logits.shape[1], logits.stride(0), w.vocab_offset, B=1024, num_warps=4)
+    if w.world == 1:
+        return mine
+    fast_gather(w.comm, mine, got)
+    return torch.amin(got.view(w.world, R), dim=0, out=best)
+
+
+def window_keys(w: Weights, b, R: int) -> None:
+    """The greedy keys of the verify window's head rows ``b.logits[:R]`` into the pinned ``b.gkeys_host``."""
+
+    keys = least_keys(w, b.logits[:R], b.gkeys[:R], b.ggot[:w.world * R], b.gbest[:R])
+    b.gkeys_host[:R].copy_(keys, non_blocking=True)
+
+
+def window_rows(b, start: int, R: int) -> list[int]:
+    """The greedy draws of rows start..start + R of the last verify window, once its stream has synchronized."""
+
+    return [key & 0xFFFFFFFF for key in b.gkeys_host[start:start + R].tolist()]
 
 
 def _nucleus(sampling: Sampling | None) -> bool:
@@ -135,13 +192,15 @@ def _batched(s: Sampling | None) -> bool:
 
 
 def lane_rows(w: Weights, rows: Sequence[torch.Tensor], positions: Sequence[Sequence[int]],
-              samplings: Sequence[Sampling | None]) -> tuple[list[list[int]], float]:
-    """Each lane's ``target_rows`` -> (each lane's tokens, host seconds): two or more top_k-off lanes drawn together,
-    every other lane (and one the batch leaves to its own call) by its own call."""
+              samplings: Sequence[Sampling | None],
+              given: Sequence[list[int] | None] | None = None) -> tuple[list[list[int]], float]:
+    """Each lane's ``target_rows`` -> (each lane's tokens, host seconds): a lane's ``given`` tokens when not None (its
+    greedy draws, made in the forward), two or more top_k-off lanes drawn together, every other lane (and one the batch
+    leaves to its own call) by its own call."""
 
     start = time.perf_counter()
-    out: list = [None] * len(rows)
-    batch = [k for k, s in enumerate(samplings) if _batched(s)]
+    out: list = [None] * len(rows) if given is None else list(given)
+    batch = [k for k, s in enumerate(samplings) if _batched(s) and out[k] is None]
     if len(batch) > 1:                              # a lone one: its own call
         drawn = nucleus_lanes([rows[k] for k in batch], [positions[k] for k in batch], [samplings[k] for k in batch],
                               offset=w.vocab_offset, gather=one_rank if w.comm is None else comm_gather(w.comm))
