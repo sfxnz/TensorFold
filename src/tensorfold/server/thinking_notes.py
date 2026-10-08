@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-OFF = 'chat_template_kwargs {"enable_thinking": false}'
+OFF = 'chat_template_kwargs {"enable_thinking": false} (or {"thinking": false})'
 
 
 def template_thinks(model_dir: Path) -> bool:

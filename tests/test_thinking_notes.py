@@ -35,6 +35,7 @@ def test_the_warning_is_for_a_reply_cut_while_thinking(finish, thinking, content
     assert (line is not None) == warned
     if warned:
         assert "max_tokens" in line and "reasoning_content" in line and "--no-thinking" in line
+        assert '"enable_thinking": false' in line and '"thinking": false' in line
 
 
 def _app(script: list[int]):
