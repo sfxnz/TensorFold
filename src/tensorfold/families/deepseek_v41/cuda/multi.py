@@ -15,7 +15,7 @@ from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 
 from ..engram_hash import rank_columns
-from . import BLOCK, dspark, engram
+from . import BLOCK, dspark, engram, sample
 from . import forward as F
 from .buffers import Buffers
 from .decode import Engine, _clock, accept
@@ -265,11 +265,12 @@ class LaneDecoder(TwoRanks):
         launch = time.perf_counter() - t
         torch.cuda.current_stream().synchronize()
         device = time.perf_counter() - t - launch
+        draws, seconds = self._draws(live)          # 5. every lane's draws
         kept = []
-        for s, e, (_, pos, _) in zip(live, engines, windows):        # 5-6. each lane's draws and kept rows
+        for s, e, sampled in zip(live, engines, draws):              # 6. each lane's kept rows
             e.clock["launch"] += launch
             e.clock["device"] += device
-            sampled = e.sample(b.logits[s.seg0:s.seg0 + s.R], [pos + 1 + r for r in range(s.R)], s.sampling)
+            e.clock["sampling"] += seconds
             kept.append(sampled[:accept(sampled, s.drafts, self._ends(s))])
         for s, e, new, (_, _, tokens) in zip(live, engines, kept, windows):     # 7. commit
             F.commit(w, e.st, b, s.R, len(new), row0=s.seg0)
@@ -291,6 +292,14 @@ class LaneDecoder(TwoRanks):
             if self.stages:
                 _clocked(s, e.clock)
         return [s for s in live if s.done]
+
+    def _draws(self, live: list[Stream]) -> tuple[list[list[int]], float]:
+        """Each live lane's target draws on its rows of the forward -> (their tokens, host seconds)."""
+
+        rows = [self.mbuf.logits[s.seg0:s.seg0 + s.R] for s in live]
+        at = [self.engines[s.lane].st.pos + 1 for s in live]
+        return sample.lane_rows(self.w, rows, [list(range(a, a + s.R)) for a, s in zip(at, live)],
+                                [s.sampling for s in live])
 
     def finish(self, done: list[Stream]) -> None:
         """Free the lanes of streams that ended: done, a client gone, or a background stream yielding."""
