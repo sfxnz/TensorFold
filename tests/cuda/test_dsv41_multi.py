@@ -154,14 +154,13 @@ class Run:
 
     def __init__(self, dec: M.LaneDecoder) -> None:
         self.dec, self.got, self.windows, self.spans, self.steps = dec, {}, {}, {}, 0
-        for k, e in enumerate(dec.engines):
-            e.sample = self._recorder(k, e.sample)
+        dec._draws = self._recorder(dec._draws)
 
-    def _recorder(self, k: int, sample):
-        def rec(logits, positions, sampling):
-            s = next(s for s in self.dec.streams.values() if s.lane == k and not s.done)
-            self.windows.setdefault(id(s), []).append([_bits(row) for row in logits])
-            return sample(logits, positions, sampling)
+    def _recorder(self, draws):
+        def rec(live):
+            for s in live:
+                self.windows.setdefault(id(s), []).append([_bits(row) for row in self.dec.mbuf.logits[s.seg0:s.seg0 + s.R]])
+            return draws(live)
         return rec
 
     def stream(self, req: Req, stop=None) -> Stream:
@@ -188,8 +187,7 @@ class Run:
             assert self.steps < 5000, "the decoder made no progress"
 
     def close(self) -> None:
-        for e in self.dec.engines:
-            del e.sample
+        del self.dec._draws
 
 
 def check(dec: M.LaneDecoder) -> None:

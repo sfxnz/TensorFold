@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Sequence
+from fractions import Fraction
 
 import numpy as np
 import torch
 import triton
 import triton.language as tl
 
+from tensorfold.cuda import keyed_draw
 from tensorfold.cuda.comm import fast_gather
-from tensorfold.engine.exact_sampling import MARGIN, Sampling, _mix
+from tensorfold.cuda.sampling import DIGITS, MASS, SLACK, TMAX, _stacked, comm_gather, one_rank
+from tensorfold.engine.exact_sampling import MARGIN, Sampling, _mix, uniform
 from tensorfold.families.glm5_next.cuda.decode import sample_rows
 
 from .weights import Weights
@@ -28,6 +32,125 @@ def target_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int],
     start = time.perf_counter()
     tokens = sample_rows(w, logits, positions, sampling)
     return tokens, time.perf_counter() - start
+
+
+def _nucleus(sampling: Sampling | None) -> bool:
+    return sampling is not None and sampling.temperature > 0 and not sampling.top_k
+
+
+def _row_keys(s: Sampling, positions: Sequence[int]) -> np.ndarray:
+    """``nucleus_rows``' per-row uniform keys of (seed, position)."""
+
+    with np.errstate(over="ignore"):
+        key = _mix(np.uint64(s.seed & 0xFFFFFFFFFFFFFFFF) + np.uint64(0x9E3779B97F4A7C15))
+        return _mix(key ^ (np.asarray(positions).astype(np.uint64) * np.uint64(0xD1B54A32D192ED03)))
+
+
+def _cut_rows(gather, logits: torch.Tensor, inv: torch.Tensor, mass: torch.Tensor, top_p: Sequence[float],
+              offset: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """``sampling._cut`` with each row's own top_p and reciprocal temperature."""
+
+    rows, width = logits.shape
+    ids = torch.arange(offset, offset + width, device=logits.device)
+    part = torch.zeros(rows, dtype=torch.int64, device=logits.device)
+    below = torch.zeros_like(part)
+    need, shift = None, 64
+    for digit in DIGITS:
+        shift -= digit
+        hist = _stacked(gather, keyed_draw.count(logits, ids, mass, part, shift, digit))
+        if need is None:
+            totals = hist.sum(dim=(0, 2)).tolist()
+            need = torch.tensor([math.ceil(Fraction(p) * t) for p, t in zip(top_p, totals)], dtype=torch.int64,
+                                device=logits.device)
+        part, below = keyed_draw.pick(hist, need, below, part, shift, digit)
+    value = -1 - (part >> 32)
+    value = (value ^ ((value >> 31) & 0x7FFFFFFF)).to(torch.int32).view(torch.float32).double() * inv
+    return value, part & 0xFFFFFFFF
+
+
+def _decide(first, second, vals, ids, s: Sampling, position: int) -> int | None:
+    """``sampling._keyed``'s rule for one row from every rank's best two: its token, None when it cannot decide."""
+
+    live = first > -math.inf
+    v, i = vals[live], ids[live]
+    if not len(v):
+        return None
+    order = np.lexsort((i, -v))
+    v, i = v[order], i[order]
+    score = v - np.log(-np.log(uniform(s.seed, int(position), i)))
+    best = int(np.argmax(score))
+    if not math.isfinite(score[best]):
+        return None
+    for last in second.tolist():
+        if last > -math.inf and not score[best] > last + SLACK * (1.0 + abs(last)):
+            return None
+    return int(i[best])
+
+
+def nucleus_lanes(rows: Sequence[torch.Tensor], positions: Sequence[Sequence[int]], samplings: Sequence[Sampling], *,
+                  offset: int = 0, gather=one_rank) -> list[list[int] | None]:
+    """top_k-off lanes drawn together: ``nucleus_rows``' keyed draw over every lane's CUDA rows at once, each row with
+    its lane's key, temperature, top_p and min_p -> each lane's tokens, None where its own call leaves that draw."""
+
+    dev, n = rows[0].device, [x.shape[0] for x in rows]
+    lane = np.repeat(np.arange(len(rows)), n)
+    # x / t on the device multiplies by the scalar's reciprocal: each row multiplies by its own
+    knobs = np.stack([np.array([1.0 / max(float(samplings[k].temperature), 1e-6) for k in lane]).view(np.int64),
+                      np.array([samplings[k].min_log for k in lane], dtype=np.float64).view(np.int64),
+                      np.concatenate([_row_keys(s, p) for s, p in zip(samplings, positions)]).view(np.int64)])
+    knobs = torch.from_numpy(knobs).to(dev)            # one copy: reciprocal temperatures, min_p logs, keys
+    inv, keys = knobs[0].view(torch.float64), knobs[2]
+    logits = torch.cat(list(rows)) if len(rows) > 1 else rows[0]
+    scaled = logits.float().double() * inv[:, None]
+    top = _stacked(gather, logits.float().amax(dim=-1).double() * inv).max(dim=0).values
+    mass = torch.floor(torch.exp(scaled - top[:, None]) * MASS).to(torch.int64)
+    floor = top + knobs[1].view(torch.float64)
+    cut = np.array([0.0 < samplings[k].top_p < 1.0 for k in lane])
+    if cut.all() or not cut.any():                      # one kind of row: no subsets
+        bound = _cut_rows(gather, logits, inv, mass, [samplings[k].top_p for k in lane], offset) if cut.any() else None
+        f, i = keyed_draw.best_two(scaled, keys, floor, offset, None, bound)
+    else:
+        f = torch.empty((len(lane), 3), dtype=torch.float64, device=dev)
+        i = torch.empty((len(lane), 2), dtype=torch.int64, device=dev)
+        for members, cutting in ((np.flatnonzero(~cut), False), (np.flatnonzero(cut), True)):
+            at = torch.from_numpy(members).to(dev)
+            bound = _cut_rows(gather, logits[at], inv[at], mass[at], [samplings[lane[r]].top_p for r in members],
+                              offset) if cutting else None
+            f[at], i[at] = keyed_draw.best_two(scaled[at], keys[at], floor[at], offset, None, bound)
+    both = _stacked(gather, torch.cat([f.view(torch.int64), i[:, 1:]], 1)).cpu().numpy()
+    first, second, vals = (np.ascontiguousarray(both[:, :, c]).view(np.float64) for c in range(3))
+    flat = [p for ps in positions for p in ps]
+    out: list[list[int] | None] = [[] for _ in rows]
+    for r, k in enumerate(lane):
+        if out[k] is not None:
+            token = _decide(first[:, r], second[:, r], vals[:, r], both[:, r, 3], samplings[k], flat[r])
+            out[k] = None if token is None else out[k] + [token]
+    return out
+
+
+def _batched(s: Sampling | None) -> bool:
+    """A top_k-off draw whose own call starts with the keyed draw (no cut past TMAX)."""
+
+    return _nucleus(s) and not (0.0 < s.top_p < 1.0 and max(float(s.temperature), 1e-6) > TMAX)
+
+
+def lane_rows(w: Weights, rows: Sequence[torch.Tensor], positions: Sequence[Sequence[int]],
+              samplings: Sequence[Sampling | None]) -> tuple[list[list[int]], float]:
+    """Each lane's ``target_rows`` -> (each lane's tokens, host seconds): two or more top_k-off lanes drawn together,
+    every other lane (and one the batch leaves to its own call) by its own call."""
+
+    start = time.perf_counter()
+    out: list = [None] * len(rows)
+    batch = [k for k, s in enumerate(samplings) if _batched(s)]
+    if len(batch) > 1:                              # a lone one: its own call
+        drawn = nucleus_lanes([rows[k] for k in batch], [positions[k] for k in batch], [samplings[k] for k in batch],
+                              offset=w.vocab_offset, gather=one_rank if w.comm is None else comm_gather(w.comm))
+        for k, tokens in zip(batch, drawn):
+            out[k] = tokens
+    for k, tokens in enumerate(out):
+        if tokens is None:
+            out[k] = sample_rows(w, rows[k], positions[k], samplings[k])
+    return out, time.perf_counter() - start
 
 
 class Draws:
