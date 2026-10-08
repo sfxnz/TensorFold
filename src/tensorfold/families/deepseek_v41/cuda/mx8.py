@@ -9,6 +9,8 @@ import torch
 from tensorfold.cuda.kernels import qmm
 from tensorfold.cuda.nvfp4.linear import FUSED_ROWS, MXFP8, PROMPT_TILE, Mx8Linear, _ext, _prompt_ext
 
+from . import gemv
+
 
 def _folds(lin: Mx8Linear) -> bool:
     """``Mx8Linear.prefill``'s test: every exponent keeps an e4m3 byte times its power of two exact in bf16."""
@@ -44,6 +46,9 @@ def mm(lin: Mx8Linear, x: torch.Tensor, out: torch.Tensor | None = None, *, f32:
        prompt: bool = False) -> torch.Tensor:
     """x (M, K) -> (M, n) bf16 as ``lin`` or (``prompt``) ``lin.prefill``, or fp32 before that rounding."""
 
+    y = None if prompt else gemv.run(lin, x, out, f32)
+    if y is not None:
+        return y
     if f32:
         return _f32(lin, x, out, prompt)
     return lin.prefill(x, out) if prompt else lin(x, out)
