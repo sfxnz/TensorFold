@@ -23,6 +23,7 @@ from . import attn_multi, gdn_multi, image_rows, prefixes
 from .forward import commit, compute, compute_mixed, converges, stage
 from .mtp import mtp_compute, mtp_stage
 from .state import Buffers, State
+from .copy_drafts import CopyIndex
 from .multi_solo import Alone, solo
 from .multi_fill import FILL_GUARD, PASS_MIN, PromptPasses
 from .multi_tp import Link as Link
@@ -49,8 +50,10 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
-                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0) -> None:
+                 share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
+                 copy: bool = True) -> None:
         self.link = self.follower = None
+        self.copy = bool(copy)                       # copy drafts (copy_drafts.py) for streams that draft
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
@@ -250,10 +253,15 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         s.count = max(1, min(s.count, room))
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
-        if self.w.comm is not None and any(x is not None for x in (s.constraint, s.vision, s.probabilities)):
+        if self.w.comm is not None and any(x is not None for x in (s.constraint, s.probabilities)):
             raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
         t0 = time.perf_counter()
         if self.w.comm is not None:
+            if s.vision is not None and self.link is not None and not hasattr(s.vision, "features"):
+                # rank 0 encodes first, so a refused image fails here alone; a readmitted request keeps its features
+                if self.vision is None:
+                    raise ValueError("image inputs require starting this server with --vision")
+                s.vision = self.vision.encode(s.vision, s.prompt)
             st, resume, s.cached = self._prepare_admission(s, told)
         else:
             st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
@@ -399,6 +407,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                     s.error = exc
             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
             kept.append((s, a0, rows[:len(path)], new, last))
+            if s.copies is not None:                     # the copy index sees the round's tokens before the next draft
+                s.copies.extend(new)
         self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
         for s, _, _, new, _ in kept:
             if s.error is not None:
@@ -415,7 +425,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         return failed + done + ended
 
     def _draft_all(self, streams: list) -> None:
-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+        """Streams absorb kept rows and chain drafts one step a depth; a copying stream still absorbs, then sits out."""
 
         for s, _, _ in streams:
             s.drafts = []
@@ -423,6 +433,13 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
         if not todo:
             return
+        copying: set[int] = set()
+        for s, _, _ in todo:
+            if s.copies is not None:
+                copied = s.copies.chain(room[s.sid])
+                if copied:
+                    s.drafts = copied
+                    copying.add(s.sid)
         for s, _, _ in todo:
             st = s.st
             if st.mtp_drafted:
@@ -434,10 +451,15 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
             st.set_mtp_len(st.mtp_len + len(keep))
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
+        if len(copying) == len(active):
+            return
         for j in range(self.depth):
+            # level one picks for every absorbed stream (the two-rank gather reads them in order); copiers drop out
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
             nxt = []
             for (s, row), (d, p) in zip(active, picks):
+                if s.sid in copying:
+                    continue
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
                     continue

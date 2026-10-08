@@ -28,6 +28,12 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     endpoint.add_argument("--port", type=int, default=8080)
     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
     endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to")
+    endpoint.add_argument("--name-priority", action="append", default=[], metavar="ID=background",
+                          help="a request naming ID (--name or --alias) with no priority of its own is treated as "
+                               "priority: background; CUDA only, repeatable")
+    endpoint.add_argument("--api-key", action="append", default=[], help="require this API key; repeat for more keys")
+    endpoint.add_argument("--api-key-file", help="restricted key file, one key or label: key per line; # comments")
+    endpoint.add_argument("--metrics-open", action="store_true", help="allow metrics without an API key")
     endpoint.add_argument("--vision", action="store_true",
                           help="enable image input for supported GLM and Qwen vision checkpoints")
     endpoint.add_argument("--vision-urls", action="store_true",
@@ -74,10 +80,11 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     speed.add_argument("--drafter-bits", type=int, default=4, help="quantize the draft model's linears (0: bf16)")
     speed.add_argument("--mtp-drafts", type=int, default=None,
                        help="most MTP drafts a round (Qwen3.8 Flash Next: 3 on Mac; on CUDA 6, stopping under 70%% "
-                            "confidence); 0: no MTP drafts (any family)")
+                            "confidence; Nemotron on CUDA: 15, stopping where a row stops paying; Qwen3.6 MoE on Mac: "
+                            "4, each round's depth, plain included, from measured costs); 0: no MTP drafts")
     speed.add_argument("--mtp-confidence", type=float, default=None,
                        help="on CUDA, stop an MTP chain before a later draft under this probability "
-                            "(Flash Next default 0.70)")
+                            "(Flash Next default 0.70; Nemotron: by the row costs it measures at start)")
     speed.add_argument("--lane-kernels", choices=("auto", "on", "off"), default="auto",
                        help="lane kernels for Qwen3.8 dense (auto: on GPUs with tensor units)")
     speed.add_argument("--prompt-cache-gib", type=float, default=None,
@@ -125,12 +132,12 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
     cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                       help="auto: MLX on macOS, CUDA elsewhere")
-    cuda.add_argument("--tp", type=int, choices=(1, 2), default=1,
+    cuda.add_argument("--tp", type=int, choices=(1, 2, 4), default=1,
                       help="GPUs (one per machine) the model is split over; run the same command on each")
-    cuda.add_argument("--rank", type=int, choices=(0, 1), default=0,
-                      help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
-    cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
-    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
+    cuda.add_argument("--rank", type=int, choices=(0, 1, 2, 3), default=0,
+                      help="with --tp 2/4: this machine's rank; rank 0 serves HTTP, others follow it")
+    cuda.add_argument("--master", default="", help="with --tp 2/4: rank 0's address on the link between the ranks")
+    cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2/4: rank 0's rendezvous port")
     cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
                            "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")

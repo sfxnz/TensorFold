@@ -194,7 +194,7 @@ class Engine:
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
         """A decode step's forward (a CUDA graph when enabled): logits [R, V]."""
 
-        if self.graphs is not None:
+        if self.graphs is not None and self.st.image_positions is None:    # graphs are captured for text rows
             return self.graphs.forward(tokens)
         return forward(self.w, self.st, self.buf, tokens)
 
@@ -245,7 +245,7 @@ class Engine:
         return int(tok), float(np.exp(float(got[hit[0]]) - float(got[k]))) if len(hit) else 0.0
 
     def mtp_forward(self, next_tokens: Sequence[int], streams: torch.Tensor) -> torch.Tensor:
-        if self.graphs is not None:
+        if self.graphs is not None and self.st.image_positions is None:
             return self.graphs.mtp_forward(next_tokens, streams)
         return mtp_forward(self.w, self.st, self.mbuf, next_tokens, streams)
 
@@ -443,8 +443,16 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, depth: int = DEPTH,
                confidence: float = CONFIDENCE, stop_eos: bool = False, on_tokens=None, constraint=None,
-               probabilities=None) -> DecodeResult:
+               probabilities=None, copies=None) -> DecodeResult:  # copies: a CopyIndex over the prompt and pending
     """Verify pending and drafted tokens from the prefill state, commit rows before the first mismatched draft, and call ``on_tokens(new)`` with kept tokens after pending, stopping on True."""
+
+    def propose(streams, next_tokens, n):
+        """Copy drafts when the index has a chain (the MTP cache still absorbs the kept rows), else the MTP chain."""
+        copied = copies.chain(n) if copies is not None else []
+        if copied:
+            absorb(e, streams, next_tokens)
+            return copied
+        return draft(e, streams, next_tokens, st.pos + 1, n, sampling, confidence)
 
     w, st, b = e.w, e.st, e.buf
     out = [pending]
@@ -455,7 +463,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     unabsorbed = None                                  # the last round's kept rows, not yet in the MTP cache
     torch.cuda.synchronize()
     start = time.perf_counter()
-    drafts = draft(e, e.last_streams, [pending], st.pos + 1, min(depth, count - len(out)), sampling, confidence)
+    drafts = propose(e.last_streams, [pending], min(depth, count - len(out)))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         tokens = [out[-1]] + drafts
         window = constraint.window(tokens, list(range(-1, len(tokens) - 1))) if constraint is not None else None
@@ -485,6 +493,8 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         if constraint is not None:
             constraint.advance(sampled[:keep])
         out.extend(sampled[:keep])
+        if copies is not None:
+            copies.extend(sampled[:keep])
         if on_tokens is not None and new and on_tokens(new):
             break
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
@@ -492,7 +502,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         n = min(depth, count - len(out))
         drafts = []
         if n > 0:
-            drafts = draft(e, b.streams[:keep], sampled[:keep], st.pos + 1, n, sampling, confidence)
+            drafts = propose(b.streams[:keep], sampled[:keep], n)
             unabsorbed = None
     torch.cuda.synchronize()
     seconds = time.perf_counter() - start

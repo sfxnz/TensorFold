@@ -40,6 +40,18 @@ def test_two_gpus_need_a_master_before_anything_loads(tmp_path):
     assert not called
 
 
+def test_four_gpus_only_for_a_family_that_splits_over_four(tmp_path):
+    called = []
+    family = _family(cuda_engine=lambda *a, **k: called.append(k))
+    args = argparse.Namespace(tp=4, rank=0, master="192.0.2.11", master_port=29551, no_drafts=True, drafter="none",
+                              mtp_drafts=None, name="", model=str(tmp_path))
+    with pytest.raises(ValueError, match="--tp 4: Test family runs on one or two GPUs"):
+        cli._serve_cuda(args, family, tmp_path)
+    args.tp, args.rank = 2, 3
+    with pytest.raises(ValueError, match="--rank 3 needs --tp 4"):
+        cli._serve_cuda(args, family, tmp_path)
+    assert not called
+
 def test_serve_parses_the_cuda_flags():
     args = cli.build_parser().parse_args(["serve", "owner/model", "--tp", "2", "--rank", "1", "--master", "192.0.2.11"])
     assert (args.backend, args.tp, args.rank, args.master, args.master_port) == ("auto", 2, 1, "192.0.2.11", 29551)
@@ -198,7 +210,6 @@ def test_kv_dtype_reaches_only_the_families_that_declare_it(tmp_path, monkeypatc
     (["--kv-dtype", "int8"], "cuda", "nemotron_h", "KV cache, not --kv-dtype int8"),
     (["--mtp-confidence", "0.6"], "mlx", "qwen4_exp", "on MLX has no such rule"),
     (["--mtp-confidence", "0.6"], "cuda", "glm5_next", "on CUDA has no such rule"),
-    (["--mtp-confidence", "0.6"], "cuda", "nemotron_h", "on CUDA has no such rule"),
     (["--mtp-confidence", "1.5"], "cuda", "qwen4_exp", "probability from 0 to 1"),
     (["--mtp-confidence", "-0.1"], "cuda", "qwen4_exp", "probability from 0 to 1"),
     (["--prefill-fp8"], "mlx", "qwen3_5", "Qwen3.8 dense on MLX has none"),
