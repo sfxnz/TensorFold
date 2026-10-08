@@ -54,7 +54,16 @@ from safetensors import safe_open
 from tokenizers import Tokenizer
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, dspark, engram, loader, quant
+from tensorfold.families.deepseek_v41.cuda import (
+    MAX_ROWS,
+    PREFILL_ROWS,
+    attn_kernel,
+    buffers,
+    dspark,
+    engram,
+    loader,
+    quant,
+)
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import rope as tf_rope
 from tensorfold.families.deepseek_v41.cuda.weights import Weights
@@ -444,6 +453,11 @@ def _dspark(stream: Stream, rw: Ref) -> list[dict]:
                                main_norm=stream.build.t("mtp.0.main_norm.weight"), stages=stages)
     e = SimpleNamespace(w=w, st=st, dwork=dspark.Work(cfg, 1, stream.dev))
     k, out = e.dwork, []
+
+    def attend(sw, q: torch.Tensor, kv: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+        return attn_kernel.attention(q, st.rings[sw.index], None, st.pos_dev, k.anchors, kv, k.lists, k.counts,
+                                     sw.attn.sink, o, prompt=False, part=b.attn_part)
+
     for p in DSPARK_AT:
         n = min(p + 1, cfg.sliding_window)
         taps = stream.taps[p + 1 - n:p + 1]
@@ -464,7 +478,7 @@ def _dspark(stream: Stream, rw: Ref) -> list[dict]:
             X, pre = b.xd.float().cpu(), b.pre_in[:B].cpu()
             held["xa"] = rms_norm(hc_pre(X, pre, MIRROR), mref.W(f"{mref._prefix(sw.index)}.attn_norm.weight"),
                                   cfg.rms_norm_eps, MIRROR)
-            dspark._stage(sw, w, st, b, k)
+            dspark.stage(sw, w, b, b.xd, st.pos_dev, b.bkv, b, attend)
             got = b.xd.cpu()
             top = cfg.dspark_num_experts_per_tok            # the shared expert's slot follows the routed ones
             gw = (sw.moe.gate.cpu(), sw.moe.bias.cpu())
