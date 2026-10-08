@@ -74,7 +74,7 @@ def batch(tiny):
 
 
 def _bits(x: torch.Tensor) -> torch.Tensor:
-    return x.contiguous().view(torch.uint8)
+    return x.new_empty(x.shape).copy_(x).view(torch.uint8)      # a fresh copy: a 1-element column keeps its stride
 
 
 def _solo(e: D.Engine, y: int, sampling: Sampling | None, d: int) -> dict:
@@ -117,7 +117,7 @@ def test_every_slot_equals_its_lanes_own_proposal(tiny, rig, batch, case):
         got = _together(tiny, rig, batch, slots, d)
         for j, (lane, y, s) in enumerate(slots):
             _same(got[j], _solo(engines[lane], y, s, d), f"slot {j} (lane {lane}) of {slots}, {d} drafts")
-        assert torch.equal(batch.host[:d, 0, :len(slots)], batch.chain[1:1 + d, :len(slots)]), "the pinned drafts"
+        assert torch.equal(batch.host[:d, 0, :len(slots)], batch.chain[1:1 + d, :len(slots)].cpu()), "the pinned drafts"
 
 
 def _capture(fn) -> torch.cuda.CUDAGraph:
