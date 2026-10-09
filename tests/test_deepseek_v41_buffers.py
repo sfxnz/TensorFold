@@ -224,5 +224,5 @@ def test_lane_tables_add_only_their_bytes(slots):
 def test_weights_fields():
     assert [f.name for f in dataclasses.fields(weights.Weights)] == [
         "cfg", "rank", "world", "comm", "device", "vocab_offset", "embed", "layers", "norm", "head", "dspark",
-        "engram", "rope", "engram_scales"]
+        "engram", "rope", "engram_scales", "warm"]
     assert issubclass(weights.StageW, weights.LayerW)
