@@ -125,3 +125,4 @@ class Weights:
     engram: dict[int, EngramW]  # by layer id
     rope: Any                 # rope.py's cos/sin tables, one pair per kind
     engram_scales: EngramScales | None = None
+    warm: Any = None          # l2warm.Warm: decode forwards warm the weights read after each gather
