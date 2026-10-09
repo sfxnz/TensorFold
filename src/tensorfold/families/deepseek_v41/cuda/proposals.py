@@ -16,11 +16,14 @@ from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.glm5_next.cuda import glue, qmm
 
 from ..config import Config
-from . import attn_kernel, dspark, mx8, norms, sample
+from . import MAX_ROWS, attn_kernel, dspark, mx8, norms, quant, sample
 from .buffers import Buffers
 from .lanes import Lanes
 
 ENV = "TF_DSV41_BATCHED_DRAFTS"     # "1": two or more drafting lanes propose in one block forward
+SETUP_ENV = "TF_DSV41_BATCHED_SETUP"  # when the block's scratch and graphs are made, one of SETUPS
+SETUPS = ("early", "late", "lazy")  # before the lane graphs; after the lanes' warm; at the first 2+ drafting lanes
+ABSORB_ENV = "TF_DSV41_BATCHED_ABSORB"  # "1": with the block on, 2+ lanes absorb their kept rows in one pass
 LAST = torch.iinfo(torch.int64).max  # a greedy slot's unused candidate keys: after every real key
 
 
@@ -28,12 +31,33 @@ def enabled() -> bool:
     return os.environ.get(ENV) == "1"
 
 
+def setup() -> str:
+    """SETUP_ENV's value, "early" when unset."""
+
+    value = os.environ.get(SETUP_ENV) or SETUPS[0]
+    if value not in SETUPS:
+        raise ValueError(f"{SETUP_ENV}={value!r}: one of {', '.join(SETUPS)}")
+    return value
+
+
+def absorbing() -> bool:
+    return enabled() and os.environ.get(ABSORB_ENV) == "1"
+
+
+def mode() -> int:
+    """The settings both ranks must share as one int: 0 off, else 1 + 2 x the setup's index + 8 with the absorb."""
+
+    return 1 + 2 * SETUPS.index(setup()) + 8 * absorbing() if enabled() else 0
+
+
 class Batch:
     """Scratch of one block over up to ``slots`` lanes, slot j on rows j B..: each slot's lane, token and draw knobs
     (``table``, from the host), each row's lane, position, anchor and list, the block's DSpark rows, the draws'
-    candidates, and the pinned rows each Markov step's drafts and confidences land in."""
+    candidates, and the pinned rows each Markov step's drafts and confidences land in; with ``absorb`` the tables of
+    the lanes' kept rows absorbed in one pass."""
 
-    def __init__(self, cfg: Config, world: int, slots: int, device: torch.device | str = "cuda") -> None:
+    def __init__(self, cfg: Config, world: int, slots: int, device: torch.device | str = "cuda",
+                 absorb: bool = False) -> None:
         dev = torch.device(device)
         bf, f32, i32, i64 = torch.bfloat16, torch.float32, torch.int32, torch.int64
         B, D, V = cfg.dspark_block_size, cfg.hidden_size, cfg.vocab_size // world
@@ -77,6 +101,12 @@ class Batch:
         self.host = torch.empty((B, 2, slots), dtype=i32, pin_memory=host)    # each step's drafts, confidence bits
         self.landed = [torch.cuda.Event(external=True) for _ in range(B)]
         self.waited = self.launch = 0.0         # host seconds the last proposal waited for steps and launched
+        self.absorbs = absorb
+        if absorb:                              # each kept row's forward row, ring row less its role's, position
+            self.kept_host = torch.zeros((3, MAX_ROWS * slots), dtype=i64, pin_memory=host)
+            self.kept = torch.zeros((3, MAX_ROWS * slots), dtype=i64, device=dev)
+            self.dest = torch.zeros((MAX_ROWS * slots,), dtype=i64, device=dev)
+            self.kept_staged = torch.cuda.Event() if host else None
 
 
 def block(w, lanes: Lanes, b: Buffers, k: Batch, n: int) -> None:
@@ -158,6 +188,46 @@ def chain(w, lanes: Lanes, b: Buffers, k: Batch, L: int, keyed: int, d: int) -> 
         k.host[i, 0, :L].copy_(k.chain[i + 1, :L], non_blocking=True)
         k.host[i, 1, :L].copy_(k.conf[i, :L].view(torch.int32), non_blocking=True)
         k.landed[i].record()
+
+
+def stage_kept(k: Batch, roles: int, window: int, kept: Sequence[tuple[int, int, int, int]],
+               taps: int) -> tuple[int, int]:
+    """``absorb``'s tables of ``kept`` through their pinned twin, rings of ``roles`` x ``window`` rows a lane and
+    ``taps`` tap rows -> (rows kept, forward rows read)."""
+
+    if not kept or min(rows for _, _, rows, _ in kept) < 1:
+        raise ValueError(f"absorb: {kept}, every lane keeps a row or more")
+    n, T = sum(rows for _, _, rows, _ in kept), max(row + rows for _, row, rows, _ in kept)
+    if T > taps or n > k.kept.shape[1] or min(row for _, row, _, _ in kept) < 0:
+        raise ValueError(f"absorb: {kept} in {taps} tap rows, {k.kept.shape[1]} kept at most")
+    k.kept_staged.synchronize()
+    host, j = k.kept_host.numpy(), 0
+    for lane, row, rows, pos in kept:
+        host[0, j:j + rows] = range(row, row + rows)
+        host[1, j:j + rows] = [lane * roles * window + (pos + i) % window for i in range(rows)]
+        host[2, j:j + rows] = range(pos, pos + rows)
+        j += rows
+    k.kept[:, :n].copy_(k.kept_host[:, :n], non_blocking=True)
+    k.kept_staged.record()
+    return n, T
+
+
+@torch.no_grad()
+def absorb(w, lanes: Lanes, b: Buffers, k: Batch, kept: Sequence[tuple[int, int, int, int]]) -> None:
+    """Every (lane, forward row, rows, position) of ``kept``: that many forward rows from that row, committed from that
+    position on, into the lane's stage rings, the bits ``dspark.absorb`` writes for each alone; the main projection
+    runs over every row up to the last kept one (row-invariant), the stages over the kept rows."""
+
+    cfg, ds = w.cfg, w.dspark
+    _, roles, window, width = lanes.rings.shape
+    n, T = stage_kept(k, roles, window, kept, b.taps.shape[0])
+    x = torch.index_select(dspark.main_rows(w, b, 0, T, prompt=False), 0, k.kept[0, :n], out=b.mx[:n])
+    rings = lanes.rings.view(-1, width)
+    for sw in ds.stages:
+        qakv = mx8.mm(sw.attn.wqa_kv, x, b.qakv[:n], prompt=False)
+        kv = quant.norm_rope_fp8(qakv[:, cfg.q_lora_rank:], sw.attn.kv_norm, cfg.rms_norm_eps, k.kept[2, :n],
+                                 w.rope[sw.role.rope], b.kvw[sw.index, :n])
+        rings.index_copy_(0, torch.add(k.kept[1, :n], sw.index * window, out=k.dest[:n]), kv)
 
 
 def set_slots(k: Batch, slots: Sequence[tuple[int, int, Sampling | None]]) -> int:

@@ -120,7 +120,7 @@ def share(comm, rank: int, values: list[int] | None, device: str = "cuda") -> li
 
 def settings(*, start_error: bool, dspark: bool, capacity: int, prefill_rows: int, max_rows: int, ring: int,
              policy: tuple[int, float | None], layers: int, world: int, engram_digest: int, lanes: int,
-             decode_share: float, batched_drafts: bool, greedy_device: bool, cache_bytes: int,
+             decode_share: float, batched_drafts: int, greedy_device: bool, cache_bytes: int,
              cache_entries: int) -> list[int]:
     """This rank's agreement vector: SETTINGS, then SPARE."""
 

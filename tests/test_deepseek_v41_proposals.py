@@ -15,7 +15,8 @@ pytest.importorskip("triton")
 
 from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import BLOCK, MAX_LANES, dspark, geometry, proposals, sample
+from tensorfold.families.deepseek_v41.cuda import BLOCK, MAX_LANES, dspark, geometry, layout, proposals, sample
+from tensorfold.families.deepseek_v41.cuda import multi as M
 from tensorfold.families.deepseek_v41.cuda.buffers import _device_bytes
 
 CFG = Config.read(Path(__file__).parent / "fixtures" / "deepseek_v41")
@@ -114,3 +115,79 @@ def test_a_proposal_takes_two_to_slots_lanes_of_one_to_block_drafts():
                    [(0, 1, None, BLOCK + 1), (1, 1, None, 2)]):
         with pytest.raises(ValueError, match="propose"):
             proposals.propose(k, wanted, None, run=lambda *a: None)
+
+
+def test_the_setup_and_absorb_knobs_make_one_setting(monkeypatch):
+    for name in (proposals.ENV, proposals.SETUP_ENV, proposals.ABSORB_ENV):
+        monkeypatch.delenv(name, raising=False)
+    assert proposals.mode() == 0 and proposals.setup() == "early" and not proposals.absorbing()
+    monkeypatch.setenv(proposals.ABSORB_ENV, "1")
+    assert proposals.mode() == 0 and not proposals.absorbing(), "the absorb rides on the block"
+    monkeypatch.setenv(proposals.ENV, "1")
+    seen = set()
+    for i, when in enumerate(proposals.SETUPS):
+        monkeypatch.setenv(proposals.SETUP_ENV, when)
+        for absorb in ("0", "1"):
+            monkeypatch.setenv(proposals.ABSORB_ENV, absorb)
+            assert proposals.setup() == when and proposals.mode() == 1 + 2 * i + 8 * (absorb == "1")
+            seen.add(proposals.mode())
+    assert len(seen) == 2 * len(proposals.SETUPS), "the ranks tell every choice apart"
+    monkeypatch.setenv(proposals.SETUP_ENV, "soon")
+    with pytest.raises(ValueError, match=proposals.SETUP_ENV):
+        proposals.mode()
+
+
+def test_the_absorb_tables_come_with_the_absorb_only():
+    for slots in (2, MAX_LANES):
+        plain, k = proposals.Batch(CFG, 2, slots, META), proposals.Batch(CFG, 2, slots, META, absorb=True)
+        assert not plain.absorbs and not hasattr(plain, "kept") and k.absorbs
+        assert k.kept.shape == (3, proposals.MAX_ROWS * slots) and k.dest.shape == (proposals.MAX_ROWS * slots,)
+
+        added = (geometry.dsv41_geometry(CFG, 2, lanes=slots, batched=True, absorb=True).bytes_at(4096)
+                 - geometry.dsv41_geometry(CFG, 2, lanes=slots, batched=True).bytes_at(4096))
+        assert added == _device_bytes(k, META) - _device_bytes(plain, META) > 0
+
+
+def test_kept_rows_map_to_their_forward_rows_ring_rows_and_positions():
+    k = proposals.Batch(CFG, 2, MAX_LANES, "cpu", absorb=True)
+    k.kept_staged = _Event()
+    roles, window, lane = 7, 128, 7 * 128            # a lane's rings: roles x window rows
+    kept = [(1, 0, 2, 126), (3, 6, 1, 40), (0, 9, 3, 255)]      # (lane, forward row, rows, position), wrapping
+    assert proposals.stage_kept(k, roles, window, kept, proposals.MAX_ROWS * MAX_LANES) == (6, 12)
+    rows, ring, pos = k.kept[:, :6].tolist()
+    assert rows == [0, 1, 6, 9, 10, 11] and pos == [126, 127, 40, 255, 256, 257]
+    assert ring == [lane + 126, lane + 127, 3 * lane + 40, 127, 0, 1], "dspark.absorb's slot: position % window"
+    for bad in ([], [(0, 0, 0, 5)], [(0, 20, 5, 5)], [(0, -1, 2, 5)]):
+        with pytest.raises(ValueError, match="absorb"):
+            proposals.stage_kept(k, roles, window, bad, proposals.MAX_ROWS * MAX_LANES)
+
+
+def test_a_deferred_block_is_built_at_the_first_round_with_two_drafting_lanes():
+    built, alone = [], []
+
+    def engine(lane: int, sparse: bool = False) -> SimpleNamespace:
+        e = SimpleNamespace(st=SimpleNamespace(pos=50), dwork=SimpleNamespace(sparse=sparse))
+        e.propose = lambda y, p, s, d, c: (alone.append(lane), ([7] * d, [0.0] * d))[1]
+        return e
+
+    def stream(lane: int, draft: bool = True) -> SimpleNamespace:
+        return SimpleNamespace(lane=lane, out=[5], count=100, draft=draft, sampling=None)
+
+    dec = SimpleNamespace(drafts=3, confidence=None, batch=None, defer=True, defer_absorb=True,
+                          _drafting=lambda s: s.draft, build_batch=lambda absorb, lane: built.append((absorb, lane)))
+    M.LaneDecoder._propose(dec, [stream(0)], [engine(0)])
+    M.LaneDecoder._propose(dec, [stream(0), stream(2, draft=False)], [engine(0), engine(2)])
+    M.LaneDecoder._propose(dec, [stream(1), stream(3)], [engine(1, sparse=True), engine(3)])
+    assert not built and alone == [0, 0, 1, 3], "one drafting lane, or a sparse one, proposes alone"
+    M.LaneDecoder._propose(dec, [stream(1), stream(3)], [engine(1), engine(3)])
+    assert built == [(True, 1)], "built once two lanes draft, its graphs on the first one's rows"
+
+
+def test_the_layout_dump_names_device_tensors_only(monkeypatch):
+    obj = SimpleNamespace(a=torch.empty(4, device=META), host=torch.zeros(3), n=5,
+                          d={"x": torch.empty((2, 2), dtype=torch.bfloat16, device=META)},
+                          rows=[torch.empty(1, device=META), "y"])
+    got = layout.tensors({"g": obj, "none": None})
+    assert sorted(got) == ["g.a", "g.d[x]", "g.rows[0]"] and got["g.a"][1] == 16 and got["g.d[x]"][1] == 8
+    monkeypatch.delenv(layout.ENV, raising=False)
+    assert layout.dump("start", None) is None, "nothing without the variable"

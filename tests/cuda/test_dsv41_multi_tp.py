@@ -2,9 +2,10 @@
 rank 1 every admission, round, finish and drop over the link (its store fallback, in memory). Streams together equal
 the same streams one at a time and their solo runs on the legacy two-rank engine (tokens, each verify window's logits
 bits on rank 0, drafted, accepted and rounds) at 1, 2 and 4 streams, greedy and keyed, proposals alone and in one
-block; a stream joins mid-flight; clients leave while a prompt fills, at the first token and mid-decode; a resumed
-prompt equals its fresh run while others decode; a tampered plan and a missing snapshot are refused on both ranks;
-failed rounds drop on both ranks; and each time rank 1 decoded what rank 0 did and ends with every lane free.
+block (made early, late or lazily, kept rows absorbed in one pass); a stream joins mid-flight; clients leave while a
+prompt fills, at the first token and mid-decode; a resumed prompt equals its fresh run while others decode; a tampered
+plan and a missing snapshot are refused on both ranks; failed rounds drop on both ranks; and each time rank 1 decoded
+what rank 0 did and ends with every lane free.
 """
 
 from __future__ import annotations
@@ -341,6 +342,30 @@ def test_proposals_in_one_block_equal_solo_on_both_ranks(ranks, c):
     assert len(run.all) == c and not refused
     for j, s in enumerate(run.all):
         run.same(ranks, s, f"stream {j} of {c} proposing together")
+
+
+@pytest.mark.parametrize("when", ["late", "lazy"])
+@pytest.mark.parametrize("c", [2, 4])
+def test_blocks_made_late_or_lazily_absorbing_together_equal_solo_on_both_ranks(ranks, c, when):
+    """c drafting streams with the block made after the lanes' warm or at the first round with two drafting lanes,
+    kept rows absorbed in one pass, their main projection gathered at once on both ranks; each equals its solo run."""
+
+    reqs = [_req(50 * c + j, LENGTHS[j], j % 2 == 1, COUNTS[j]) for j in range(c)]
+    decs = []
+
+    def setup(both):
+        decs.extend(both)
+        for dec in both:
+            if when == "late":
+                dec.build_batch(True)
+            else:
+                dec.defer, dec.defer_absorb = True, True
+
+    run, refused = _two(ranks, lambda run: run.go([(_always, run.stream(r)) for r in reqs]), setup=setup)
+    assert len(run.all) == c and not refused
+    assert all(dec.batch is not None and dec.batch.absorbs and not dec.defer for dec in decs), "built on both ranks"
+    for j, s in enumerate(run.all):
+        run.same(ranks, s, f"stream {j} of {c}, block made {when}, absorbing together")
 
 
 def test_a_stream_joins_mid_flight(ranks):

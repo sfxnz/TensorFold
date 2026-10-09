@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 
@@ -15,7 +16,7 @@ from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 
 from ..engram_hash import rank_columns
-from . import BLOCK, dspark, engram, proposals, sample
+from . import BLOCK, dspark, engram, layout, proposals, sample
 from . import forward as F
 from .buffers import Buffers
 from .decode import Engine, _clock, accept
@@ -55,6 +56,7 @@ class LaneDecoder(TwoRanks):
         self.w, self.lanes, self.engines, self.mbuf, self.pbuf = w, lanes, list(engines), mbuf, pbuf
         self.drafts, self.confidence = int(policy[0]), policy[1]
         self.eos, self.graphs, self.kept, self.batch = tuple(eos), graphs, kept, batch
+        self.defer = self.defer_absorb = False      # build_batch(defer_absorb) at the first 2+ drafting lanes
         for k, e in enumerate(self.engines):        # each lane's absorb and proposals replay its own graphs
             e.graphs = None if graphs is None else SimpleNamespace(verify={}, absorb=graphs.absorb[k],
                                                                    drafts=graphs.drafts[k])
@@ -276,10 +278,19 @@ class LaneDecoder(TwoRanks):
             F.commit(w, e.st, b, s.R, len(new), row0=s.seg0)
             if self.kept is not None:
                 self.kept.live[s.lane] += tokens[:len(new)]
-        for s, e, new in zip(live, engines, kept):  # 8-9. absorb and read ahead, for lanes that go on drafting
-            if not self._drafting(s) or len(s.out) + len(new) >= s.count or new[-1] in self._ends(s):
-                continue
-            if s.seg0 == 0:                         # its graph's rows
+        going = [(s, e, new) for s, e, new in zip(live, engines, kept)     # 8-9. absorb and read ahead, for lanes
+                 if self._drafting(s) and len(s.out) + len(new) < s.count and new[-1] not in self._ends(s)]
+        together = self.batch is not None and self.batch.absorbs and len(going) > 1
+        if together:                                # their kept rows in one pass
+            t = time.perf_counter()
+            proposals.absorb(w, self.lanes, b, self.batch, [(s.lane, s.seg0, len(new), e.st.pos - len(new))
+                                                            for s, e, new in going])
+            for _, e, _ in going:
+                e._timed("launch", t)
+        for s, e, new in going:
+            if together:
+                pass                                # absorbed above
+            elif s.seg0 == 0:                       # its graph's rows
                 e.absorb(len(new))
             else:
                 t = time.perf_counter()
@@ -303,6 +314,8 @@ class LaneDecoder(TwoRanks):
             want.append(min(self.drafts, s.count - len(s.out) - 1) if self._drafting(s) else 0)
             s.drafts = []
         group = [j for j, d in enumerate(want) if d > 0]
+        if self.defer and len(group) > 1 and not any(engines[j].dwork.sparse for j in group):
+            self.build_batch(self.defer_absorb, live[group[0]].lane)
         if self.batch is None or len(group) < 2 or any(engines[j].dwork.sparse for j in group):
             for j in group:
                 s, e, d = live[j], engines[j], want[j]
@@ -320,6 +333,19 @@ class LaneDecoder(TwoRanks):
             engines[j].clock["launch"] += k.launch
             engines[j].clock["device"] += k.waited
             engines[j].clock["markov"] += rest
+
+    def build_batch(self, absorb: bool, lane: int | None = None) -> None:
+        """``batch`` and its graphs in pools of their own, after every other buffer and graph; the graphs captured on
+        ``lane``'s rows, left as they are, or with None on every lane at MAX_ROWS, each reset after."""
+
+        dev = self.lanes.device
+        self.batch_pool = torch.cuda.MemPool() if dev.type == "cuda" else None
+        with torch.cuda.use_mem_pool(self.batch_pool) if self.batch_pool is not None else nullcontext():
+            self.batch = proposals.Batch(self.w.cfg, self.w.world, self.lanes.slots, dev, absorb=absorb)
+        self.defer = False
+        if self.graphs is not None:
+            self.graphs.batched_late(self.batch, lane)
+        layout.dump("batched", self)
 
     def _chain(self, L: int, keyed: int, d: int) -> None:
         t = time.perf_counter()

@@ -186,7 +186,7 @@ def test_equal_settings_agree_on_the_smaller_room():
     ("engram_digest", -0x123456789ABCDEF0 + 1),         # the low word differs
     ("engram_digest", -0x123456789ABCDEF0 + (1 << 40)),  # the high word differs
     ("capacity", 4102), ("dspark", False), ("policy", (3, 0.5)), ("policy", (0, None)), ("layers", 8),
-    ("lanes", 2), ("decode_share", 0.25), ("batched_drafts", True), ("greedy_device", True),
+    ("lanes", 2), ("decode_share", 0.25), ("batched_drafts", True), ("batched_drafts", 3), ("greedy_device", True),
 ])
 def test_different_settings_refuse_naming_both_values(name, value):
     a = protocol.settings(**SETTINGS)

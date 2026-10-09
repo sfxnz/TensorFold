@@ -72,6 +72,13 @@ request's rows on its own ring and positions. Every kernel in it is row-invarian
 drafts alone and its replies and draft stats are unchanged. Both ranks must set it alike; they refuse to serve
 otherwise.
 
+`TF_DSV41_BATCHED_SETUP` sets when that block's scratch and graphs are made: `early` (the default) before the lane
+graphs, `late` after the startup warm in memory pools of their own, `lazy` likewise at the first round with two or more
+drafting requests, so a lone request never makes them. `TF_DSV41_BATCHED_ABSORB=1` also writes the accepted rows of
+two or more drafting requests into their DSpark rings in one pass. Replies are the same either way. Both ranks must set
+both alike. `TF_DSV41_LAYOUT=PREFIX` writes where the decode buffers and the allocator's segments sit, to
+`PREFIX.start.rank<r>.json` at startup and `PREFIX.batched.rank<r>.json` once the block is made, to compare two builds.
+
 ## Memory
 
 A rank holds 76.1 GiB of weights: its half of the routed experts (TP over each expert's intermediate dim, 1,152 a

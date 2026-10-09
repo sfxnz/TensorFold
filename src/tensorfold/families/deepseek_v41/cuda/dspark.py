@@ -47,16 +47,10 @@ class Work:
         self.waited = 0.0                                                   # host seconds the last propose waited
 
 
-@torch.no_grad()
-def absorb(e, b: Buffers, n: int, *, prompt: bool, first: int = 0) -> None:
-    """The last ``n`` committed positions' taps, tap rows first.., into every stage's ring (M:1039-1051, 1128-1130)."""
+def main_rows(w, b: Buffers, first: int, n: int, *, prompt: bool) -> torch.Tensor:
+    """``main_proj`` of tap rows first.. over the ranks, then ``main_norm`` -> ``b.xn[:n]`` (M:1039-1043)."""
 
-    w, st, k = e.w, e.st, e.dwork
-    cfg, ds = w.cfg, w.dspark
-    if not 0 < n <= min(b.taps.shape[0] - first, st.pos, st.rings.shape[1]) or first < 0:
-        raise ValueError(f"absorb: tap rows {first}..{first + n} at {st.pos} committed positions, "
-                         f"{b.taps.shape[0]} tap rows, a {st.rings.shape[1]}-slot ring")
-    eps, x = cfg.rms_norm_eps, b.mx[:n]
+    ds, x = w.dspark, b.mx[:n]
     taps = b.taps[first:first + n].view(n, -1)
     if w.world == 1:
         mx8.mm(ds.main_proj, taps, x, prompt=prompt)
@@ -66,7 +60,20 @@ def absorb(e, b: Buffers, n: int, *, prompt: bool, first: int = 0) -> None:
         recv = b.mx_gat.view(-1)[:x.numel()].view(w.world, n, -1)
         fast_gather(w.comm, part, recv)
         x.view(n, w.world, -1).copy_(recv.transpose(0, 1))
-    main_x = norms.rmsnorm(x, ds.main_norm, eps, b.xn[:n])
+    return norms.rmsnorm(x, ds.main_norm, w.cfg.rms_norm_eps, b.xn[:n])
+
+
+@torch.no_grad()
+def absorb(e, b: Buffers, n: int, *, prompt: bool, first: int = 0) -> None:
+    """The last ``n`` committed positions' taps, tap rows first.., into every stage's ring (M:1039-1051, 1128-1130)."""
+
+    w, st, k = e.w, e.st, e.dwork
+    cfg, ds = w.cfg, w.dspark
+    if not 0 < n <= min(b.taps.shape[0] - first, st.pos, st.rings.shape[1]) or first < 0:
+        raise ValueError(f"absorb: tap rows {first}..{first + n} at {st.pos} committed positions, "
+                         f"{b.taps.shape[0]} tap rows, a {st.rings.shape[1]}-slot ring")
+    eps = cfg.rms_norm_eps
+    main_x = main_rows(w, b, first, n, prompt=prompt)
     at = torch.add(k.rows[:n], st.pos_dev, out=k.at[:n]).sub_(n)
     slots = at.remainder(st.rings.shape[1])
     for sw in ds.stages:

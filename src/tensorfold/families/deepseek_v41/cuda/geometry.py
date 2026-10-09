@@ -30,10 +30,10 @@ def rope_bytes(cfg: Config, capacity: int) -> int:
 
 
 def dsv41_geometry(cfg: Config, world: int, reserve: int = MAX_ROWS, lanes: int = 1,
-                   batched: bool = False) -> Geometry:
+                   batched: bool = False, absorb: bool = False) -> Geometry:
     """State, RoPE tables, a decode window's and a prompt chunk's buffers, exactly as the engine allocates them;
     ``lanes`` above 1: that many States and drafters' scratch, and the shared forward's buffers over them, with
-    ``batched`` the scratch of their proposals in one block."""
+    ``batched`` the scratch of their proposals in one block (with ``absorb`` its absorb tables)."""
 
     def bytes_at(slots: int) -> int:
         slots = int(slots)
@@ -44,7 +44,7 @@ def dsv41_geometry(cfg: Config, world: int, reserve: int = MAX_ROWS, lanes: int 
             state = Lanes(cfg, lanes, slots, "meta").nbytes() + lanes * _device_bytes(Work(cfg, world, "meta"), META)
             decode = buffers.Buffers(cfg, world, MAX_ROWS * lanes, slots, device="meta", lanes=lanes).nbytes()
             if batched:
-                decode += _device_bytes(Batch(cfg, world, lanes, META), META)
+                decode += _device_bytes(Batch(cfg, world, lanes, META, absorb=absorb), META)
         prompt = buffers.bytes(cfg, world, PREFILL_ROWS, slots, prefill=True)
         return state + rope_bytes(cfg, slots) + decode + prompt
 
