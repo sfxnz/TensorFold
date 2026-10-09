@@ -56,6 +56,10 @@ A greedy request draws its decode tokens in the verify window's graph: each row'
 vocabulary at its lowest id, read back once the window ends. `TF_DSV41_GREEDY_DEVICE=0` draws them on the host instead.
 Both ranks must set it alike; they refuse to serve otherwise.
 
+A decode forward warms the dense weights read after each all-gather into L2 on a side stream, at 200 GB/s and up to
+8 MB a gather. `TF_DSV41_L2WARM=RATE[:MB]` sets both and `TF_DSV41_L2WARM=0` turns it off. Replies are the same
+either way.
+
 Under `--parallel` 2 or more, each live request's verify window shares one forward with the others' and every reply
 equals its solo run. Rank 0 plans each step and sends it to rank 1, and both check they agree before any collective. A
 request's client that leaves ends it after its next round; one that leaves while its prompt fills is noticed at its

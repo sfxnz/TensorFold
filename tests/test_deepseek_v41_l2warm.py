@@ -15,11 +15,12 @@ from tensorfold.families.deepseek_v41.cuda import l2warm
 MB = 1 << 20
 
 
-@pytest.mark.parametrize("value, want", [("", None), ("0", None), (" 0 ", None), ("150", (150.0, l2warm.CAP_MB * MB)),
-                                         ("100:4", (100.0, 4 * MB)), (" 200:0.5 ", (200.0, MB // 2))])
+@pytest.mark.parametrize("value, want", [("", (200.0, 8 * MB)), ("0", None), (" 0 ", None),
+                                         ("150", (150.0, l2warm.CAP_MB * MB)), ("100:4", (100.0, 4 * MB)),
+                                         (" 200:0.5 ", (200.0, MB // 2))])
 def test_the_switch_reads_a_rate_and_a_cap(value, want):
     assert l2warm.wanted({l2warm.WARM_ENV: value}) == want
-    assert l2warm.wanted({}) is None
+    assert l2warm.wanted({}) == (200.0, 8 * MB)
 
 
 @pytest.mark.parametrize("value", ["yes", "-1", "0.5", "0:8", "150:", "150:0", "150:-2", "nan", "inf", "150:inf", "1:2:3"])

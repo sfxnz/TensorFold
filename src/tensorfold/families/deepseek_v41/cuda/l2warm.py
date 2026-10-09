@@ -11,7 +11,8 @@ from pathlib import Path
 
 import torch
 
-WARM_ENV = "TF_DSV41_L2WARM"    # "RATE[:MB]": warm at RATE GB/s up to MB a gather (default CAP_MB); unset or 0: off
+WARM_ENV = "TF_DSV41_L2WARM"    # "RATE[:MB]": warm at RATE GB/s up to MB a gather (default CAP_MB); unset: GBS; 0: off
+GBS = 200
 CAP_MB = 8
 CTAS = 8                        # blocks of the warm kernel, together at the rate
 SECTOR = 32                     # bytes one of its copies brings into L2
@@ -29,10 +30,10 @@ def _ext():
 
 
 def wanted(environ: Mapping[str, str] | None = None) -> tuple[float, int] | None:
-    """(GB/s, bytes a gather) WARM_ENV asks for, None when off; ValueError naming the variable for a bad value."""
+    """(GB/s, bytes a gather) WARM_ENV asks for, GBS if unset, None for 0; ValueError naming the variable if bad."""
 
-    value = (os.environ if environ is None else environ).get(WARM_ENV, "").strip()
-    if value in ("", "0"):
+    value = (os.environ if environ is None else environ).get(WARM_ENV, "").strip() or str(GBS)
+    if value == "0":
         return None
     rate, colon, cap = value.partition(":")
     try:
