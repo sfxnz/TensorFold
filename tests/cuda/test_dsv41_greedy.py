@@ -179,8 +179,9 @@ def tiny(tiny_dir):
 def engines(tiny, ref):
     """(``target_rows``' graphed engine, the device draw's graphed and eager engines)."""
 
-    plain = D.Engine(tiny, CAP, graphs=True, hasher=ref.hasher, reader=ref.reader)
     with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(sample.GREEDY_ENV, "0")
+        plain = D.Engine(tiny, CAP, graphs=True, hasher=ref.hasher, reader=ref.reader)
         mp.setenv(sample.GREEDY_ENV, "1")
         on = [D.Engine(tiny, CAP, graphs=g, hasher=ref.hasher, reader=ref.reader) for g in (True, False)]
     assert plain.dbuf.gkeys is None and all(e.dbuf.gkeys is not None for e in on)
