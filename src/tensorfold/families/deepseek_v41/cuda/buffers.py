@@ -129,10 +129,10 @@ class State:
 
 class Buffers:
     """Scratch for a window of up to ``rows`` rows (sliced [:R]); ``prefill``: a prompt chunk's, every output kept;
-    ``lanes``: a shared forward's over that many lanes, with its row tables."""
+    ``lanes``: a shared forward's over that many lanes, with its row tables; ``greedy``: its rows' greedy keys too."""
 
     def __init__(self, cfg: Config, world: int, rows: int, capacity: int, prefill: bool = False,
-                 device: torch.device | str = "cuda", lanes: int = 0) -> None:
+                 device: torch.device | str = "cuda", lanes: int = 0, greedy: bool = False) -> None:
         dev = torch.device(device)
         host = dev.type == "cuda"        # pinned staging and events exist for a real device only
         bf, f32, i32, i64, u8 = torch.bfloat16, torch.float32, torch.int32, torch.int64, torch.uint8
@@ -215,6 +215,11 @@ class Buffers:
         self.taps = t((taps, len(cfg.dspark_target_layer_ids), D), bf)
         self.hidden, self.fnormed = t((rows, D), bf), t((rows, D), bf)
         self.logits = t((1 if prefill else rows, V), f32)
+        # each head row's greedy key: this rank's, every rank's, the least, and pinned for the host (None: off)
+        self.gkeys = self.ggot = self.gbest = self.gkeys_host = None
+        if greedy and not prefill:
+            self.gkeys, self.ggot, self.gbest = t((rows,), i64), t((world * rows,), i64), t((rows,), i64)
+            self.gkeys_host = torch.zeros((rows,), dtype=i64, pin_memory=True) if host else None
         # DSpark: main_x of the absorbed rows; the block is proposed after decode windows only
         self.mx, self.mx_gat = t((taps, D), bf), t((world, taps, D // world), bf)
         if not prefill:

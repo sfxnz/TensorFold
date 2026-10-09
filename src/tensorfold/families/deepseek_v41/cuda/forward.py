@@ -115,13 +115,17 @@ def _block(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tenso
 
 def layer(lw: LayerW, w: Weights, st: State, b: Buffers, R: int, e: torch.Tensor | None, prompt: bool,
           start: int = 0, kv_from: int = 0, taps_from: int = 0) -> None:
-    """One block on rows start.. of ``b.X[:R]`` in place (window KV from kv_from), each share gathered as made."""
+    """One block on rows start.. of ``b.X[:R]`` in place (window KV from kv_from), each share gathered as made; a
+    decode forward warms the weights read next beside each gather if ``w.warm``."""
 
     steps = _block(lw, w, st, b, R, e, prompt, start, kv_from, taps_from)
+    warm = None if prompt else w.warm
     try:
-        first = next(steps)
+        first, k = next(steps), 0
         while True:
-            first = steps.send(_gather(w, b, R, first))
+            if warm is not None:
+                warm.ahead(lw.index, k)
+            first, k = steps.send(_gather(w, b, R, first)), k + 1
     except StopIteration:
         pass
 
@@ -190,9 +194,10 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, prompt: bool, head_row
     else:
         for lw in w.layers:
             layer(lw, w, st, b, R, e, prompt, *(rows or {}).get(lw.index, (0, 0)), taps_from)
-    if not head_rows:
-        return None
-    return head(w, b, R - head_rows, head_rows, b.logits[:head_rows], prompt=prompt)
+    out = head(w, b, R - head_rows, head_rows, b.logits[:head_rows], prompt=prompt) if head_rows else None
+    if w.warm is not None and not prompt:
+        w.warm.join()
+    return out
 
 
 @torch.no_grad()

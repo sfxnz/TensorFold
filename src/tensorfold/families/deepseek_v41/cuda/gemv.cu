@@ -40,7 +40,7 @@ void launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs, at::
     C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         reinterpret_cast<const unsigned char*>(w.data_ptr()), reinterpret_cast<const uint8_t*>(bs.data_ptr()), 1.0f,
         out.data_ptr(), static_cast<float*>(nullptr), M, N, K, SK, npad,
-        M == 1 ? K : static_cast<int>(x.stride(0)), 1));
+        M == 1 ? K : static_cast<int>(x.stride(0)), 1, 0));
 }
 
 template <int BM, int BN, int STAGES>

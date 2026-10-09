@@ -72,22 +72,19 @@ class Groups(list):
         return cls(Mx8Linear.from_checkpoint(weight, scale), n)
 
 
-def _stacked(groups: Groups, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """All groups in one decode launch: x's row r, group block g as row G r + g against every group's columns, each
-    tile split over K as its group alone is, so the (r, g, g) blocks, copied to out, have each group's own bits."""
+def _launch(groups: Groups, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """All groups in one decode launch: each 64-column tile reads its own group's columns of x, split over K as that
+    group alone is, so out has each group's own bits."""
 
     G, k, n, whole = len(groups), groups[0].k, groups[0].n, groups.whole
-    m = x.shape[0] * G
+    m = x.shape[0]
     if x.dtype != torch.bfloat16 or not x.is_contiguous():
         x = x.to(torch.bfloat16).contiguous()
-    y = torch.empty((m, G * n), dtype=torch.bfloat16, device=x.device)
     sk = qmm.split_k(n, k)
     part = torch.empty((sk, m, G * n), dtype=torch.float32, device=x.device) if sk > 8 else None
     bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
-    _ext().qmmf(x.view(m, k), whole.w8, whole.bs, 1.0, y, part if bm else None, MXFP8, G * n, sk, whole.npad, bm,
-                False)
-    rows = x.shape[0]
-    out.view(rows, G, n).copy_(y.as_strided((rows, G, n), (G * G * n, (G + 1) * n, 1)))
+    _ext().qmmf_groups(x, whole.w8, whole.bs, 1.0, out, part if bm else None, MXFP8, G * n, sk, whole.npad, bm, False,
+                       G)
     return out
 
 
@@ -97,8 +94,8 @@ def grouped(lins: Sequence[Mx8Linear], x: torch.Tensor, out: torch.Tensor, *, pr
     k, n = lins[0].k, lins[0].n
     if x.shape[-1] != len(lins) * k or out.shape[-1] != len(lins) * n:
         raise ValueError(f"{len(lins)} groups of [{n}, {k}] do not tile x {tuple(x.shape)} -> out {tuple(out.shape)}")
-    if isinstance(lins, Groups) and not prompt and out.is_contiguous():
-        return _stacked(lins, x, out)
+    if isinstance(lins, Groups) and not prompt and out.is_contiguous() and out.dtype == torch.bfloat16:
+        return _launch(lins, x, out)
     for g, lin in enumerate(lins):
         mm(lin, x[:, g * k:(g + 1) * k], out[:, g * n:(g + 1) * n], prompt=prompt)
     return out

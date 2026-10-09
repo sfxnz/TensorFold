@@ -26,13 +26,13 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
     else reinterpret_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16_rn(acc);
 }
 
-template <int MODE, int BM, bool F32, bool CLUSTER, bool FUSE = false>
+template <int MODE, int BM, bool F32, bool CLUSTER, bool FUSE, bool GROUPED>
 void launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs, double scale, at::Tensor& out,
-            const at::Tensor& part, int N, int K, int SK, int npad) {
+            const at::Tensor& part, int N, int K, int SK, int npad, int gtiles) {
     constexpr int BN = 64, WM = 1, WN = 4, STAGES = 4;
     using T = Tile<MODE, BM, BN, WM, WN, STAGES>;
     const int M = x.size(0);
-    auto kernel = qmmf_kernel<MODE, BM, BN, WM, WN, STAGES, F32, CLUSTER, FUSE>;
+    auto kernel = qmmf_kernel<MODE, BM, BN, WM, WN, STAGES, F32, CLUSTER, FUSE, GROUPED>;
     static bool configured = false;
     if (!configured) {
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SMEM);
@@ -58,48 +58,54 @@ void launch(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs, doub
         reinterpret_cast<const unsigned char*>(w.data_ptr()),
         bs.defined() ? reinterpret_cast<const uint8_t*>(bs.data_ptr()) : nullptr, static_cast<float>(scale),
         out.data_ptr(), part.defined() ? part.data_ptr<float>() : nullptr, M, N, K, SK, npad,
-        M == 1 ? K : static_cast<int>(x.stride(0)), group));
+        M == 1 ? K : static_cast<int>(x.stride(0)), group, gtiles));
 }
 
-template <int MODE, bool F32, bool CLUSTER>
+template <int MODE, bool F32, bool CLUSTER, bool GROUPED>
 void by_rows(int bm, const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs, double scale, at::Tensor& out,
-             const at::Tensor& part, int N, int K, int SK, int npad) {
+             const at::Tensor& part, int N, int K, int SK, int npad, int gtiles) {
     switch (bm) {
-        case 16: launch<MODE, 16, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad); break;
-        case 32: launch<MODE, 32, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad); break;
-        case 64: launch<MODE, 64, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad); break;
-        default: launch<MODE, 64, F32, false, true>(x, w, bs, scale, out, part, N, K, SK, npad); break;   // 0: fused
+        case 16: launch<MODE, 16, F32, CLUSTER, false, GROUPED>(x, w, bs, scale, out, part, N, K, SK, npad, gtiles);
+                 break;
+        case 32: launch<MODE, 32, F32, CLUSTER, false, GROUPED>(x, w, bs, scale, out, part, N, K, SK, npad, gtiles);
+                 break;
+        case 64: launch<MODE, 64, F32, CLUSTER, false, GROUPED>(x, w, bs, scale, out, part, N, K, SK, npad, gtiles);
+                 break;
+        default: launch<MODE, 64, F32, false, true, GROUPED>(x, w, bs, scale, out, part, N, K, SK, npad, gtiles);
+                 break;                                                                                    // 0: fused
     }
 }
 
-template <int MODE>
+template <int MODE, bool GROUPED = false>
 void by_output(int bm, bool f32, bool cluster, const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs,
-               double scale, at::Tensor& out, const at::Tensor& part, int N, int K, int SK, int npad) {
-    if (f32) { if (cluster) by_rows<MODE, true, true>(bm, x, w, bs, scale, out, part, N, K, SK, npad);
-               else by_rows<MODE, true, false>(bm, x, w, bs, scale, out, part, N, K, SK, npad); }
-    else { if (cluster) by_rows<MODE, false, true>(bm, x, w, bs, scale, out, part, N, K, SK, npad);
-           else by_rows<MODE, false, false>(bm, x, w, bs, scale, out, part, N, K, SK, npad); }
+               double scale, at::Tensor& out, const at::Tensor& part, int N, int K, int SK, int npad, int gtiles) {
+    if (f32) { if (cluster) by_rows<MODE, true, true, GROUPED>(bm, x, w, bs, scale, out, part, N, K, SK, npad, gtiles);
+               else by_rows<MODE, true, false, GROUPED>(bm, x, w, bs, scale, out, part, N, K, SK, npad, gtiles); }
+    else { if (cluster) by_rows<MODE, false, true, GROUPED>(bm, x, w, bs, scale, out, part, N, K, SK, npad, gtiles);
+           else by_rows<MODE, false, false, GROUPED>(bm, x, w, bs, scale, out, part, N, K, SK, npad, gtiles); }
 }
 
 }  // namespace
 
 void qmmf_cuda(const at::Tensor& x, const at::Tensor& w, const at::Tensor& bs, double scale, at::Tensor& out,
                const at::Tensor& part, int64_t mode, int64_t N, int64_t K, int64_t SK, int64_t npad, int64_t bm,
-               bool f32) {
+               bool f32, int64_t gtiles) {
     // slices add in one order via a cluster's shared memory (sm_90 on) or ``part`` and the reduce, or (bm 0, prompt
     // rows) in one block: the same bits
     const bool fused = bm == 0;
     const bool cluster = !fused && SK > 1 && SK <= 8 && !part.defined() &&
                          at::cuda::getCurrentDeviceProperties()->major >= 9;
-    const int n = static_cast<int>(N), k = static_cast<int>(K), sk = static_cast<int>(SK), np = static_cast<int>(npad);
+    const int n = static_cast<int>(N), k = static_cast<int>(K), sk = static_cast<int>(SK), np = static_cast<int>(npad),
+              gt = static_cast<int>(gtiles);
     at::Tensor slices = part;                         // sm_89: no clusters, so slices up to 8 meet here too
     if (!fused && SK > 1 && !cluster && !slices.defined())
         slices = at::empty({SK, x.size(0), N}, out.options().dtype(at::kFloat));
     const int b = static_cast<int>(bm);
-    if (mode == FP4) by_output<FP4>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np);
-    else if (mode == FP8) by_output<FP8>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np);
-    else if (mode == MXFP8) by_output<MXFP8>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np);
-    else by_output<FP8G>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np);
+    if (gt) by_output<MXFP8, true>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np, gt);   // MXFP8 only
+    else if (mode == FP4) by_output<FP4>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np, gt);
+    else if (mode == FP8) by_output<FP8>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np, gt);
+    else if (mode == MXFP8) by_output<MXFP8>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np, gt);
+    else by_output<FP8G>(b, f32, cluster, x, w, bs, scale, out, slices, n, k, sk, np, gt);
     if (!fused && SK > 1 && !cluster) {
         const long long total = static_cast<long long>(x.size(0)) * N;
         const int threads = 256, blocks = static_cast<int>((total + threads - 1) / threads);

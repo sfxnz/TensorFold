@@ -221,8 +221,26 @@ def test_lane_tables_add_only_their_bytes(slots):
     assert solo.nbytes() == buffers.bytes(CFG, 2, rows, 65536)
 
 
+@pytest.mark.parametrize("slots", (1, MAX_LANES))
+def test_greedy_scratch_adds_only_its_keys(slots):
+    """GREEDY_ENV's decode buffers hold each row's greedy key (this rank's, every rank's, the least); none else do."""
+
+    from tensorfold.families.deepseek_v41.cuda.sample import GREEDY_ENV, greedy_on_device
+
+    assert all(greedy_on_device(env) for env in ({}, {GREEDY_ENV: "1"}, {GREEDY_ENV: " 1 "}))
+    assert not greedy_on_device({GREEDY_ENV: "0"}) and not greedy_on_device({GREEDY_ENV: " 0 "})
+    rows = 6 * slots
+    off, on = (buffers.Buffers(CFG, 2, rows, 65536, device="meta", lanes=slots, greedy=g) for g in (False, True))
+    assert off.gkeys is off.ggot is off.gbest is off.gkeys_host is None
+    assert {n: (tuple(getattr(on, n).shape), getattr(on, n).dtype) for n in ("gkeys", "ggot", "gbest")} == {
+        "gkeys": ((rows,), torch.int64), "ggot": ((2 * rows,), torch.int64), "gbest": ((rows,), torch.int64)}
+    assert on.gkeys_host is None                                     # no pinning
+    assert on.nbytes() - off.nbytes() == 8 * 4 * rows and on.nbytes() == _walk(on)
+    assert buffers.Buffers(CFG, 2, 2048, 4096, True, device="meta", greedy=True).gkeys is None   # a prompt chunk
+
+
 def test_weights_fields():
     assert [f.name for f in dataclasses.fields(weights.Weights)] == [
         "cfg", "rank", "world", "comm", "device", "vocab_offset", "embed", "layers", "norm", "head", "dspark",
-        "engram", "rope", "engram_scales"]
+        "engram", "rope", "engram_scales", "warm"]
     assert issubclass(weights.StageW, weights.LayerW)

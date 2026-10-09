@@ -58,11 +58,13 @@ struct Tile {
 
 // FUSE: one block runs all SK slices of its tile, each from zero over its own groups, and adds them in
 // slice order: the cluster's (or the reduce's) arithmetic without the cluster, the partials or the second pass.
-template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE = false>
+// GROUPED: every ``gtiles`` 64-column tiles are a group with its own K columns of x (row stride ``ldx``).
+template <int MODE, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool FUSE = false,
+          bool GROUPED = false>
 __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
         float scale, void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx,
-        int group) {
+        int group, int gtiles) {
     using T = Tile<MODE, BM, BN, WM, WN, STAGES>;
     static_assert(64 % BN == 0 && BN % (WN * 8) == 0, "a block reads BN columns of one 64-column tile");
     extern __shared__ __align__(128) unsigned char buf[];
@@ -71,6 +73,7 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
     const int KG = K / GS, slice_groups = KG / SK, per = FUSE ? KG : slice_groups;
     const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
     const int m0 = at.x, n0 = at.y, slice = FUSE ? 0 : blockIdx.z, g0 = slice * per;
+    const __nv_bfloat16* xg = GROUPED ? x + static_cast<size_t>(n0 / 64 / gtiles) * K : x;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
     auto load = [&](int s, int g) {
@@ -78,7 +81,7 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
         for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
             const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
             const int row = min(m0 + r, M - 1);
-            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
+            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, xg + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
                   m0 + r < M);
         }
         unsigned char* pw = p + T::X;

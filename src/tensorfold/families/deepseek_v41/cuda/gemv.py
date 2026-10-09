@@ -69,7 +69,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here, nvfp4 = Path(__file__).parent, Path(__file__).parents[3] / "cuda" / "nvfp4"
-    return load(name="tensorfold_dsv41_gemv_v1", sources=[str(here / "gemv.cpp"), str(here / "gemv.cu")],
+    return load(name="tensorfold_dsv41_gemv_v2", sources=[str(here / "gemv.cpp"), str(here / "gemv.cu")],
                 extra_include_paths=[str(nvfp4)], extra_cuda_cflags=["-O3"], verbose=False)
 
 
