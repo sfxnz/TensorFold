@@ -16,7 +16,7 @@ from ..engram_hash import rank_columns
 from . import BLOCK, DEFAULT_CONFIDENCE, DEFAULT_DRAFTS, MAX_ROWS, PREFILL_ROWS, dspark, engram, sample
 from . import forward as F
 from .buffers import Buffers, State
-from .graphs import Graphs
+from .graphs import Graphs, verify_window
 from .weights import Weights
 
 HOST_PARTS = ("engram", "sampling", "markov", "launch")
@@ -44,7 +44,8 @@ class Engine:
         self.st = State(cfg, capacity, dev) if st is None else st
         self.pbuf = Buffers(cfg, w.world, min(prefill_rows, capacity), capacity, prefill=True, device=dev) \
             if pbuf is None else pbuf
-        self.dbuf = Buffers(cfg, w.world, MAX_ROWS, capacity, device=dev) if dbuf is None else dbuf
+        self.dbuf = Buffers(cfg, w.world, MAX_ROWS, capacity, device=dev, greedy=sample.greedy_on_device()) \
+            if dbuf is None else dbuf
         self.dwork = dspark.Work(cfg, w.world, dev) if dwork is None and w.dspark is not None else dwork
         self.ahead = self.dbuf if ahead is None else ahead     # pinned Engram rows read ahead for the next window
         self.eos: tuple[int, ...] = (cfg.eos_token_id,)
@@ -79,7 +80,7 @@ class Engine:
         if g is not None:
             g.replay()
         else:
-            F.compute(w, st, b, R, prompt=False, head_rows=R)
+            verify_window(w, st, b, R)
         self.replays["graph" if g is not None else "eager"] += 1
         t = self._timed("launch", t)
         torch.cuda.current_stream().synchronize()
@@ -87,6 +88,13 @@ class Engine:
         return b.logits[:R]
 
     def sample(self, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None) -> list[int]:
+        """The last forward's draws: greedy ones read back from it when it drew them, else ``target_rows``."""
+
+        if self.dbuf.gkeys is not None and sample.greedy(sampling):
+            start = time.perf_counter()
+            tokens = sample.window_rows(self.dbuf, 0, logits.shape[0])
+            self.clock["sampling"] += time.perf_counter() - start
+            return tokens
         tokens, seconds = sample.target_rows(self.w, logits, positions, sampling)
         self.clock["sampling"] += seconds
         return tokens

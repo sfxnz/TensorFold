@@ -32,11 +32,12 @@ class DeepSeekV41Engine:
         from tensorfold.cuda.comm import open_comm
 
         from ..config import Config
-        from . import MAX_ROWS, PREFILL_ROWS, RING, loader, split
+        from . import MAX_ROWS, PREFILL_ROWS, RING, l2warm, loader, split
         from .cache import Kept, entries_wanted
         from .decode import Engine
         from .geometry import cache_wanted, dsv41_geometry, kept_bytes
         from .proposals import enabled as batched
+        from .sample import greedy_on_device
 
         if rank not in (0, 1):
             raise ValueError(f"rank {rank}: {type(self).__name__} runs on ranks 0 and 1")
@@ -66,10 +67,11 @@ class DeepSeekV41Engine:
         self.capacity_plan, self.limit = plan, plan["context_window"]
         capacity = plan["cache_slots"]
         hasher = reader = None
-        failure, digest, wanted, entries = None, NO_DIGEST, 0, 0
+        failure, digest, wanted, entries, warm = None, NO_DIGEST, 0, 0, None
         try:                                    # a failure here reaches the gather, so both ranks name it
             extra = self.slots if self.concurrent else 0        # room for each lane's prompt beside the others'
             wanted, entries = kept_bytes(plan, cache_wanted()), entries_wanted(lanes=extra)
+            warm = l2warm.wanted()
             hasher, reader = self._engram(model_dir, cfg)
             digest = reader.layout.digest() if reader is not None else NO_DIGEST
         except Exception as exc:                # noqa: BLE001 - raised below on both ranks
@@ -78,7 +80,8 @@ class DeepSeekV41Engine:
         mine = protocol.settings(start_error=failure is not None, dspark=dspark, capacity=capacity,
                                  prefill_rows=prefill_rows, max_rows=MAX_ROWS, ring=RING, policy=self.policy,
                                  layers=cfg.num_hidden_layers, world=2, engram_digest=digest, lanes=self.slots,
-                                 decode_share=self.share, batched_drafts=batched(), cache_bytes=wanted,
+                                 decode_share=self.share, batched_drafts=batched(),
+                                 greedy_device=greedy_on_device(), cache_bytes=wanted,
                                  cache_entries=entries)
         both = self._gather_ints(mine)
         if failure is not None or both[1 - rank][0]:
@@ -92,6 +95,8 @@ class DeepSeekV41Engine:
             print(f"[tensorfold] other conversations' prompts are kept in {cache_bytes / 2**30:.1f} GiB, what the "
                   f"{self.limit}-token window leaves", flush=True)
         self.w = loader.load(model_dir, cfg, rank, 2, self.comm, dspark=dspark, capacity=capacity)
+        if warm is not None:
+            self.w.warm = l2warm.Warm(self.w, *warm)
         self.comm.ready("loading")              # a peer stuck loading is named, not waited on in the all-gather
         self.comm.barrier()
         if self.concurrent:
@@ -119,6 +124,7 @@ class DeepSeekV41Engine:
         from .multi import LaneDecoder
         from .multi_tp import Link
         from .proposals import Batch, enabled
+        from .sample import greedy_on_device
 
         w, S = self.w, self.slots
         cfg, dev = w.cfg, w.device
@@ -127,7 +133,7 @@ class DeepSeekV41Engine:
             raise ValueError(f"--parallel {S}: {rows} stacked output-projection rows reach TF_QMMF_FUSED_ROWS "
                              f"{FUSED_ROWS}, where its tiles change with the row count")
         self.lanes = Lanes(cfg, S, capacity, dev)
-        self.mbuf = Buffers(cfg, w.world, MAX_ROWS * S, capacity, device=dev, lanes=S)
+        self.mbuf = Buffers(cfg, w.world, MAX_ROWS * S, capacity, device=dev, lanes=S, greedy=greedy_on_device())
         self.pbuf = Buffers(cfg, w.world, prefill_rows, capacity, prefill=True, device=dev)
         self.engines = [Engine(w, capacity, hasher=hasher, reader=reader, st=self.lanes.view(k), pbuf=self.pbuf,
                                dbuf=self.mbuf, ahead=Ahead(cfg, w.world)) for k in range(S)]

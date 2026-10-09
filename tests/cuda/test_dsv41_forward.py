@@ -1,7 +1,7 @@
 """The target forward on the tiny checkpoint: every block and the head within the model-level gate of the reference port
 fed the same stream, the whole model's logits as close to the reference's as its own fp32 mode is, two thread ranks
 deterministic and in agreement, a prompt row's head independent of its chunk, rings rebuilt from committed rows, graph
-replays equal to eager runs.
+replays equal to eager runs, warmed forwards equal to cold ones.
 
 The tiny's random weights amplify roundings from block to block: the reference's own fp32 and mirror modes disagree on
 top-1 where margins are small, so end-to-end top-1 counts only rows whose top-1 is decided.
@@ -26,7 +26,7 @@ from dsv41_ref_weights import RefWeights
 from dsv41_reference import Mode, State, hc_pre, rms_norm
 
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, loader
+from tensorfold.families.deepseek_v41.cuda import MAX_ROWS, PREFILL_ROWS, buffers, l2warm, loader
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.engram_table import Reader
 
@@ -334,3 +334,53 @@ def test_graph_replays_equal_eager(tiny, ref, R):
         again = [b.kvw[:layers, :R], b.taps[:R], *st.row_views(st.pos + R)]
         assert all(torch.equal(x, y) for x, y in zip(state, again)), f"state: {R} rows at {st.pos}"
         F.commit(w, st, b, R, keep)
+
+
+@pytest.mark.parametrize("R", list(range(1, MAX_ROWS + 1)))
+def test_warmed_forwards_equal_cold_ones(tiny, ref, R):
+    w = tiny
+    e = Eng(w, ref.hasher, ref.reader)
+    st, b = e.st, e.dbuf
+    windows = _windows([(150, 150, True)] + [(R, R, False)] * 3, 40 + R, w.cfg.vocab_size)
+    e.compute(windows[0], True)
+    F.commit(w, st, e.pbuf, 150, 150)
+    try:
+        for k, ids in enumerate(windows[1:]):
+            F.stage(w, st, b, ids, e.hasher, e.reader)
+            w.warm = None
+            cold = F.compute(w, st, b, R, prompt=False, head_rows=R).clone()
+            w.warm = l2warm.Warm(w, 100.0, 1 << 20)
+            assert len(w.warm.tables) == 2 * w.cfg.num_hidden_layers
+            assert torch.equal(F.compute(w, st, b, R, prompt=False, head_rows=R), cold), f"eager: {R} rows, step {k}"
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = F.compute(w, st, b, R, prompt=False, head_rows=R)
+            out.fill_(float("nan"))
+            graph.replay()
+            assert torch.equal(out, cold), f"graph: {R} rows, step {k}"
+            F.commit(w, st, b, R, 1 + k % R)
+    finally:
+        w.warm = None
+
+
+def test_warmed_two_ranks_equal_cold_ones(tiny_dir, tiny, ref):
+    cfg = tiny.cfg
+    comms = pair()
+    engs = [Eng(loader.load(tiny_dir, cfg, r, 2, comms[r], dspark=False, capacity=CAP), ref.hasher,
+                Reader(ref.reader.layout)) for r in range(2)]
+    windows = _windows(PAIR_PLAN, 5, cfg.vocab_size)
+
+    def rank(r, warm):
+        def go(_):
+            e = engs[r]
+            e.st.reset()
+            for buf in (e.pbuf, e.dbuf):
+                buf.exl3.guard_left = 0
+            e.w.warm = l2warm.Warm(e.w, 150.0, 8 << 20) if warm else None
+            return [_sha(x) for x in e.run(PAIR_PLAN, windows)]
+        return go
+
+    cold = run_pair(rank(0, False), rank(1, False), comms)
+    warm = run_pair(rank(0, True), rank(1, True), comms)
+    for r in range(2):
+        assert warm[r] == cold[r], f"rank {r}: warmed per-step logits differ from cold ones"

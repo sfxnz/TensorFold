@@ -37,6 +37,7 @@ def start(tmp_path, monkeypatch):
     names = inventory(json.loads(FIXTURE.read_text()))
     for name in ("TF_DSV41_CACHE_GIB", "TF_DSV41_CACHE_ENTRIES"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TF_DSV41_L2WARM", "0")         # fake weights: nothing to warm
     monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
     monkeypatch.setattr(build, "refuse_old_gpu", lambda *a: None)
     monkeypatch.setattr(capacity, "headers", lambda model_dir, **kw: names)
