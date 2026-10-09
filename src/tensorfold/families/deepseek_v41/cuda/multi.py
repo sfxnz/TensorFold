@@ -19,6 +19,7 @@ from . import BLOCK, dspark, engram, sample
 from . import forward as F
 from .buffers import Buffers
 from .decode import Engine, _clock, accept
+from .graphs import verify_window
 from .lanes import Lanes, stage_tables
 from .multi_fill import FillPlan, span_rows
 from .multi_tp import TwoRanks
@@ -261,7 +262,7 @@ class LaneDecoder(TwoRanks):
         if g is not None:
             g.replay()
         else:
-            F.compute(w, self.lanes, b, T, prompt=False, head_rows=T)
+            verify_window(w, self.lanes, b, T)
         launch = time.perf_counter() - t
         torch.cuda.current_stream().synchronize()
         device = time.perf_counter() - t - launch
@@ -296,10 +297,14 @@ class LaneDecoder(TwoRanks):
     def _draws(self, live: list[Stream]) -> tuple[list[list[int]], float]:
         """Each live lane's target draws on its rows of the forward -> (their tokens, host seconds)."""
 
-        rows = [self.mbuf.logits[s.seg0:s.seg0 + s.R] for s in live]
+        b, start = self.mbuf, time.perf_counter()
+        rows = [b.logits[s.seg0:s.seg0 + s.R] for s in live]
         at = [self.engines[s.lane].st.pos + 1 for s in live]
-        return sample.lane_rows(self.w, rows, [list(range(a, a + s.R)) for a, s in zip(at, live)],
-                                [s.sampling for s in live])
+        drawn = [sample.window_rows(b, s.seg0, s.R) if b.gkeys is not None and sample.greedy(s.sampling) else None
+                 for s in live]
+        tokens, _ = sample.lane_rows(self.w, rows, [list(range(a, a + s.R)) for a, s in zip(at, live)],
+                                     [s.sampling for s in live], drawn)
+        return tokens, time.perf_counter() - start
 
     def finish(self, done: list[Stream]) -> None:
         """Free the lanes of streams that ended: done, a client gone, or a background stream yielding."""

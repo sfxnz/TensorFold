@@ -8,9 +8,17 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from . import GRAPH_ROWS, MAX_ROWS, dspark
+from . import GRAPH_ROWS, MAX_ROWS, dspark, sample
 from . import forward as F
 from .lanes import stage_tables
+
+
+def verify_window(w, st, b, R: int) -> None:
+    """A verify window's forward over its R staged rows, then (with ``b``'s greedy scratch) each row's greedy key."""
+
+    F.compute(w, st, b, R, prompt=False, head_rows=R)
+    if b.gkeys is not None:
+        sample.window_keys(w, b, R)
 
 
 class Graphs:
@@ -67,7 +75,7 @@ class Graphs:
         token = w.cfg.bos_token_id
         for R in GRAPH_ROWS:
             F.stage(w, st, b, [token] * R, e.hasher, e.reader)
-            self.verify[R] = self._capture(lambda R=R: F.compute(w, st, b, R, prompt=False, head_rows=R))
+            self.verify[R] = self._capture(lambda R=R: verify_window(w, st, b, R))
         if w.dspark is not None:
             self.absorb, self.drafts = self._proposals(e)
         return len(self.verify) + len(self.absorb) + len(self.drafts)
@@ -104,7 +112,7 @@ class LaneGraphs(Graphs):
         token = w.cfg.bos_token_id
         for T in range(1, MAX_ROWS * S + 1):
             stage_tables(b, [(k, MAX_ROWS, [token] * (T // S + (k < T % S))) for k in range(min(S, T))])
-            self.verify[T] = self._capture(lambda T=T: F.compute(w, lanes, b, T, prompt=False, head_rows=T))
+            self.verify[T] = self._capture(lambda T=T: verify_window(w, lanes, b, T))
         if w.dspark is not None:
             for k, e in enumerate(self.engines):
                 self.absorb[k], self.drafts[k] = self._proposals(e)
