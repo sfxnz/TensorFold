@@ -36,6 +36,7 @@ class DeepSeekV41Engine:
         from .cache import Kept, entries_wanted
         from .decode import Engine
         from .geometry import cache_wanted, dsv41_geometry, kept_bytes
+        from .sample import greedy_on_device
 
         if rank not in (0, 1):
             raise ValueError(f"rank {rank}: {type(self).__name__} runs on ranks 0 and 1")
@@ -77,7 +78,8 @@ class DeepSeekV41Engine:
         mine = protocol.settings(start_error=failure is not None, dspark=dspark, capacity=capacity,
                                  prefill_rows=prefill_rows, max_rows=MAX_ROWS, ring=RING, policy=self.policy,
                                  layers=cfg.num_hidden_layers, world=2, engram_digest=digest, lanes=self.slots,
-                                 decode_share=self.share, cache_bytes=wanted, cache_entries=entries)
+                                 decode_share=self.share, greedy_device=greedy_on_device(), cache_bytes=wanted,
+                                 cache_entries=entries)
         both = self._gather_ints(mine)
         if failure is not None or both[1 - rank][0]:
             raise ValueError("the TF_DSV41_* variables or the Engram tables could not be read on " +
@@ -118,6 +120,7 @@ class DeepSeekV41Engine:
         from .lanes import Ahead, Lanes
         from .multi import LaneDecoder
         from .multi_tp import Link
+        from .sample import greedy_on_device
 
         w, S = self.w, self.slots
         cfg, dev = w.cfg, w.device
@@ -126,7 +129,7 @@ class DeepSeekV41Engine:
             raise ValueError(f"--parallel {S}: {rows} stacked output-projection rows reach TF_QMMF_FUSED_ROWS "
                              f"{FUSED_ROWS}, where its tiles change with the row count")
         self.lanes = Lanes(cfg, S, capacity, dev)
-        self.mbuf = Buffers(cfg, w.world, MAX_ROWS * S, capacity, device=dev, lanes=S)
+        self.mbuf = Buffers(cfg, w.world, MAX_ROWS * S, capacity, device=dev, lanes=S, greedy=greedy_on_device())
         self.pbuf = Buffers(cfg, w.world, prefill_rows, capacity, prefill=True, device=dev)
         self.engines = [Engine(w, capacity, hasher=hasher, reader=reader, st=self.lanes.view(k), pbuf=self.pbuf,
                                dbuf=self.mbuf, ahead=Ahead(cfg, w.world)) for k in range(S)]
