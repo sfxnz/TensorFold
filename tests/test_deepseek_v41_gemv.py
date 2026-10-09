@@ -30,3 +30,9 @@ def test_unset_takes_the_tuned_table_and_zero_turns_it_off(monkeypatch):
     assert tiles_wanted({}) == {(1, 64): Tiles(16, 4, True)}
     assert tiles_wanted({KNOB: "0"}) == {}
     assert tiles_wanted({KNOB: "*:32/6/fuse"}) == {None: Tiles(32, 6, True)}
+
+
+def test_the_tuned_table_names_decode_shapes_only_and_leaves_wo_a_to_its_grouped_launch():
+    assert None not in gemv.TUNED and (1024, 4096) not in gemv.TUNED and (4096, 4096) not in gemv.TUNED
+    assert tiles_wanted({}) == gemv.TUNED and tiles_wanted({KNOB: "0"}) == {}
+    assert all(t.bn == 64 and t.fuse for t in gemv.TUNED.values())

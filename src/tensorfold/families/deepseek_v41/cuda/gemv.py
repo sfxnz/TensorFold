@@ -27,7 +27,17 @@ class Tiles:
     fuse: bool = False
 
 
-TUNED: dict[tuple[int, int] | None, Tiles] = {}      # (n, K) -> tiles when KNOB is unset; None: every other shape
+# (n, K) -> tiles when KNOB is unset (one rank's shapes at world 2); None: every other shape. wo_a keeps its grouped
+# launch; wq_b and engram's wkv keep Mx8Linear's tiles.
+TUNED: dict[tuple[int, int] | None, Tiles] = {
+    (1792, 5120): Tiles(64, 8, True),               # wq_a | wkv
+    (5120, 4096): Tiles(64, 4, True),               # wo_b
+    (2304, 5120): Tiles(64, 6, True),               # shared w1 | w3
+    (5120, 1152): Tiles(64, 4, True),               # shared w2
+    (4096, 1280): Tiles(64, 4, True),               # indexer wq_b
+    (2560, 15360): Tiles(64, 4, True),              # DSpark main_proj
+    (64640, 5120): Tiles(64, 6, True),              # LM head
+}
 
 
 def parse(spec: str) -> dict[tuple[int, int] | None, Tiles]:
