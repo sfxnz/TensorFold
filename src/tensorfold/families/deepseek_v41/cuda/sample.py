@@ -24,7 +24,7 @@ from .weights import Weights
 DRAFT_TOP_K = 1024      # a draft's largest top_k, and its top_k when the request's is off: never whole shards
 CANDIDATES = DRAFT_TOP_K + MARGIN   # a rank's candidates for a keyed draft, so values tied at the cut resolve by id
 NO_CUT = 2.0            # the top_p of a request without one: no cumulative mass reaches it
-GREEDY_ENV = "TF_DSV41_GREEDY_DEVICE"   # "1": a verify window draws its greedy rows on the device, in its graph
+GREEDY_ENV = "TF_DSV41_GREEDY_DEVICE"   # "0": a verify window draws its greedy rows on the host, not in its graph
 
 
 def target_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int],
@@ -37,9 +37,9 @@ def target_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int],
 
 
 def greedy_on_device(environ: Mapping[str, str] | None = None) -> bool:
-    """Whether GREEDY_ENV turns the verify window's device greedy draw on."""
+    """Whether the verify window draws its greedy rows on the device: unless GREEDY_ENV is "0"."""
 
-    return (os.environ if environ is None else environ).get(GREEDY_ENV, "").strip() == "1"
+    return (os.environ if environ is None else environ).get(GREEDY_ENV, "1").strip() != "0"
 
 
 def greedy(sampling: Sampling | None) -> bool:

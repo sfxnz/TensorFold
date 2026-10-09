@@ -227,8 +227,8 @@ def test_greedy_scratch_adds_only_its_keys(slots):
 
     from tensorfold.families.deepseek_v41.cuda.sample import GREEDY_ENV, greedy_on_device
 
-    assert greedy_on_device({GREEDY_ENV: "1"}) and greedy_on_device({GREEDY_ENV: " 1 "})
-    assert not any(greedy_on_device(env) for env in ({}, {GREEDY_ENV: "0"}, {GREEDY_ENV: ""}, {GREEDY_ENV: "yes"}))
+    assert all(greedy_on_device(env) for env in ({}, {GREEDY_ENV: "1"}, {GREEDY_ENV: " 1 "}))
+    assert not greedy_on_device({GREEDY_ENV: "0"}) and not greedy_on_device({GREEDY_ENV: " 0 "})
     rows = 6 * slots
     off, on = (buffers.Buffers(CFG, 2, rows, 65536, device="meta", lanes=slots, greedy=g) for g in (False, True))
     assert off.gkeys is off.ggot is off.gbest is off.gkeys_host is None

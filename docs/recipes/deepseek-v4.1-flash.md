@@ -52,9 +52,9 @@ start builds four CUDA extensions (about two minutes); later starts load in abou
 `TF_DSV41_CACHE_ENTRIES` (default 8, plus one a lane under `--parallel` 2 or more) how many it keeps; the startup log
 says when the window leaves less. Give both ranks the same values.
 
-`TF_DSV41_GREEDY_DEVICE=1` draws a greedy request's decode tokens in the verify window's graph: each row's largest value
-over the whole vocabulary at its lowest id, read back once the window ends. Both ranks must set it alike; they refuse
-to serve otherwise.
+A greedy request draws its decode tokens in the verify window's graph: each row's largest value over the whole
+vocabulary at its lowest id, read back once the window ends. `TF_DSV41_GREEDY_DEVICE=0` draws them on the host instead.
+Both ranks must set it alike; they refuse to serve otherwise.
 
 Under `--parallel` 2 or more, each live request's verify window shares one forward with the others' and every reply
 equals its solo run. Rank 0 plans each step and sends it to rank 1, and both check they agree before any collective. A
