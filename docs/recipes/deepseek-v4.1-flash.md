@@ -60,7 +60,7 @@ A decode forward warms the dense weights read after each all-gather into L2 on a
 8 MB a gather. `TF_DSV41_L2WARM=RATE[:MB]` sets both and `TF_DSV41_L2WARM=0` turns it off. Replies are the same
 either way.
 
-Decode rows of the FP8 projections run on tiles picked by shape (except wo_a, which runs its groups in one launch).
+Decode rows of most FP8 projections run on tiles picked by shape (not wo_a, which runs its groups in one launch, nor attention wq_b or the Engram wkv, which keep the shared tiles).
 `TF_DSV41_QMMF=NxK:bn/stages/cluster|fuse,...` names other tiles and `TF_DSV41_QMMF=0` turns it off. Each output keeps
 its K slices and their order, so replies are the same either way.
 
