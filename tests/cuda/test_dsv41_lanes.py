@@ -1,7 +1,7 @@
 """The shared verify forward over 2, 3 and 4 lanes: each row's logits, window KV, taps, pooled rows and entry position
 equal the legacy forward of its lane's window alone, for every total of rows and random layouts, and each lane's state
-after its own commit and absorb equals legacy's; rows of a 24-row window equal each row run alone; the lane graphs
-(verify by total rows, each lane's absorb and proposals) replay eager's bits.
+after its own commit and absorb (or the lanes' absorbs in one pass) equals legacy's; rows of a 24-row window equal each
+row run alone; the lane graphs (verify by total rows, each lane's absorb and proposals) replay eager's bits.
 
 Lanes are prefilled on their views with prompts across the tiny config's transitions (16 visible entries, 32-entry
 candidate pools, the 128-slot ring) and up to 5000 tokens. The pack's check needs ``TF_DSV41_MODEL``.
@@ -30,7 +30,7 @@ from dsv41_ref_weights import RefWeights
 
 from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import BLOCK, GRAPH_ROWS, MAX_ROWS, dspark, engram, loader
+from tensorfold.families.deepseek_v41.cuda import BLOCK, GRAPH_ROWS, MAX_ROWS, dspark, engram, loader, proposals
 from tensorfold.families.deepseek_v41.cuda import decode as D
 from tensorfold.families.deepseek_v41.cuda import forward as F
 from tensorfold.families.deepseek_v41.cuda import prefill as P
@@ -131,13 +131,15 @@ def _same_state(st, want, what: str, open_entry: bool = True) -> None:
         assert torch.equal(_u8(x), _u8(y)), f"{what}: {name}"
 
 
-def _sweep(w, ref, S: int, prompts, layouts, seed: int, cap: int, reader) -> int:
+def _sweep(w, ref, S: int, prompts, layouts, seed: int, cap: int, reader, together: bool = False) -> int:
     """Lanes and legacy twins prefilled alike; per layout one shared forward, each row checked against its lane's legacy
-    window, then each live lane committed and absorbed at a random keep and checked -> rows checked."""
+    window, then each live lane committed and absorbed at a random keep (``together``: the lanes' kept rows in one
+    pass) and checked -> rows checked."""
 
     layers, vocab = w.cfg.num_hidden_layers, w.cfg.vocab_size
     lanes, mbuf, engines = _lanes(w, ref, S, cap, reader)
     legacy = [D.Engine(w, cap, hasher=ref.hasher, reader=reader) for _ in range(S)]
+    batch = proposals.Batch(w.cfg, w.world, S, w.device, absorb=True) if together else None
     g, pending, checked = random.Random(seed), [], 0
     for k, n in enumerate(prompts):
         prompt = _ids(seed + k, n, vocab)
@@ -159,14 +161,19 @@ def _sweep(w, ref, S: int, prompts, layouts, seed: int, cap: int, reader) -> int
             for r in range(len(tokens)):
                 _same_row(mbuf, s0 + r, legacy[k].dbuf, r, layers, f"layout {i} {layout}: lane {k} row {r} at {pos + r}")
                 checked += 1
+        kept = []
         for (k, _, tokens), s0 in zip(windows, seg0):
             R, keep = len(tokens), g.randint(1, len(tokens))
             for e, row0 in ((engines[k], s0), (legacy[k], 0)):
                 F.commit(w, e.st, e.dbuf, R, keep, row0=row0)
-                if w.dspark is not None:
+                if w.dspark is not None and (batch is None or e is legacy[k]):
                     dspark.absorb(e, e.dbuf, keep, prompt=False, first=row0)
-            _same_state(engines[k].st, legacy[k].st, f"layout {i} {layout}: lane {k} kept {keep} of {R}")
+            kept.append((k, s0, keep, engines[k].st.pos - keep))
             pending[k] = g.randrange(2, vocab)
+        if batch is not None and w.dspark is not None:
+            proposals.absorb(w, lanes, mbuf, batch, kept)
+        for k, _, keep, _ in kept:
+            _same_state(engines[k].st, legacy[k].st, f"layout {i} {layout}: lane {k} kept {keep}")
     for k in range(S):
         _same_state(engines[k].st, legacy[k].st, f"lane {k} at the end")
     assert lanes.pos_dev.tolist() == [e.st.pos for e in engines]
@@ -188,6 +195,16 @@ def test_shared_forward_rows_equal_each_lane_alone(tiny, ref, S):
     layouts = _layouts(S, S, RANDOM)
     assert {sum(R for _, R in x) for x in layouts} == set(range(1, MAX_ROWS * S + 1))
     rows = _sweep(tiny, ref, S, PROMPTS[S], layouts, 17 * S, CAP, ref.reader)
+    assert rows == sum(R for x in layouts for _, R in x)
+
+
+@pytest.mark.parametrize("S", sorted(PROMPTS))
+def test_lanes_absorbing_together_equal_each_lane_alone(tiny, ref, S):
+    """Every live lane's kept rows into its stage rings in one pass: each lane's rings equal its legacy twin's."""
+
+    layouts = _layouts(S, 3 * S, RANDOM // 2)
+    assert tiny.dspark is not None
+    rows = _sweep(tiny, ref, S, PROMPTS[S], layouts, 19 * S, CAP, ref.reader, together=True)
     assert rows == sum(R for x in layouts for _, R in x)
 
 

@@ -82,7 +82,7 @@ def _dec(n: int = 1000) -> SimpleNamespace:
                             SimpleNamespace(st=SimpleNamespace(pos=0, history=[]))],
         streams={2: stream(2, 0, [8, 9], None)}, filling=[stream(3, 1, [], SimpleNamespace(i=1))],
         kept=SimpleNamespace(cache=entries, entries=12), lanes=SimpleNamespace(slots=4, capacity=1024),
-        drafts=5, confidence=0.15, eos=(1,), pbuf=SimpleNamespace(rows=2048))
+        drafts=5, confidence=0.15, eos=(1,), pbuf=SimpleNamespace(rows=2048), batch=None)
     dec.free = [2, 3]
     dec._free = lambda: list(dec.free)
     return dec
@@ -124,6 +124,7 @@ CHANGES = {
     "prompt rows": lambda d: setattr(d.pbuf, "rows", 1024),
     "kept entries allowed": lambda d: setattr(d.kept, "entries", 8),
     "no kept": lambda d: setattr(d, "kept", None),
+    "proposals in one block": lambda d: setattr(d, "batch", object()),
 }
 
 

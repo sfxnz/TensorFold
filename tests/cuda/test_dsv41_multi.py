@@ -1,8 +1,9 @@
 """Concurrent requests over 4 lanes on one rank: every stream equals its solo run on the legacy engine (tokens, each
 verify window's logits bits, drafted, accepted and rounds) with 2, 3 and 4 streams, greedy and keyed, fixed and
-confidence policies, a serial lane, graphs on and off; prompts admitted mid-decode fill beside the rounds at every
-decode share, in small spans, paused and resumed; clients that leave free their lanes; and a Scheduler from 4 threads,
-with a background stream that yields and replays, equals solo too.
+confidence policies, a serial lane, graphs on and off, proposals alone and in one block (made early, late or lazily,
+kept rows absorbed alone or in one pass); prompts admitted mid-decode
+fill beside the rounds at every decode share, in small spans, paused and resumed; clients that leave free their lanes;
+and a Scheduler from 4 threads, with a background stream that yields and replays, equals solo too.
 
 Prompts cross the tiny config's transitions (16 visible entries, 32-entry candidate pools, the 128-slot ring).
 """
@@ -29,7 +30,7 @@ from tensorfold.cuda.scheduler import Scheduler
 from tensorfold.cuda.streams import Stream
 from tensorfold.engine.exact_sampling import Sampling
 from tensorfold.families.deepseek_v41.config import Config
-from tensorfold.families.deepseek_v41.cuda import BLOCK, MAX_ROWS, PREFILL_ROWS, dspark, loader, multi_fill
+from tensorfold.families.deepseek_v41.cuda import BLOCK, MAX_ROWS, PREFILL_ROWS, dspark, loader, multi_fill, proposals
 from tensorfold.families.deepseek_v41.cuda import decode as D
 from tensorfold.families.deepseek_v41.cuda import multi as M
 from tensorfold.families.deepseek_v41.cuda import prefill as P
@@ -112,9 +113,34 @@ def graphs(tiny, rig):
     return lg
 
 
-def _decoder(w, rig, policy, graphs=None, share: float = 0.5) -> M.LaneDecoder:
+@pytest.fixture(scope="module")
+def batch(tiny):
+    k = proposals.Batch(tiny.cfg, tiny.world, S, tiny.device, absorb=True)
+    k.absorbs = False                   # its absorb tables are used where a test turns them on
+    return k
+
+
+@pytest.fixture(scope="module")
+def batched_graphs(tiny, rig, batch):
+    lanes, mbuf, _, engines = rig
+    lg = LaneGraphs(tiny, lanes, mbuf, engines, batch)
+    assert lg.warm() == 22 * S + BLOCK * sum(L + 1 for L in range(2, S + 1))     # by (lanes, keyed of them, d)
+    return lg
+
+
+@pytest.fixture(scope="module")
+def late_graphs(tiny, rig):
+    """Lane graphs without a block: build_batch captures the block's into a pool of their own."""
+
+    lanes, mbuf, _, engines = rig
+    lg = LaneGraphs(tiny, lanes, mbuf, engines)
+    assert lg.warm() == 22 * S
+    return lg
+
+
+def _decoder(w, rig, policy, graphs=None, share: float = 0.5, batch=None) -> M.LaneDecoder:
     lanes, mbuf, pbuf, engines = rig
-    return M.LaneDecoder(w, lanes, engines, mbuf, pbuf, policy, (w.cfg.eos_token_id,), graphs, share)
+    return M.LaneDecoder(w, lanes, engines, mbuf, pbuf, policy, (w.cfg.eos_token_id,), graphs, share, batch=batch)
 
 
 _SOLO: dict = {}
@@ -238,6 +264,95 @@ def test_streams_together_equal_their_solo_runs(tiny, oracle, rig, graphs, c, po
     for j, (s, w) in enumerate(zip(streams, want)):
         _same(run, s, w, f"stream {j} of {c}, {reqs[j]}")
     assert not run.dec.live() and run.dec._free() == list(range(S))
+
+
+@pytest.mark.parametrize("graphed", [True, False], ids=["graphs", "eager"])
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize("c", [2, 3, 4])
+def test_proposals_in_one_block_equal_the_solo_runs(tiny, oracle, rig, batch, batched_graphs, monkeypatch, c, policy,
+                                                     graphed):
+    """c streams, greedy and keyed mixed, all drafting but one at 4: their lanes propose in one block, and each
+    stream equals its solo run bit for bit, its draft stats included."""
+
+    reqs = [Req(20 * c + j, LENGTHS[j], _sampling(3 * j + c, j), COUNTS[j], draft=c < 4 or j != 3, stop_eos=j != 0)
+            for j in range(c)]
+    want = [_solo(oracle, r, POLICIES[policy]) for r in reqs]
+    blocks, propose = [], proposals.propose
+    monkeypatch.setattr(proposals, "propose", lambda k, wanted, *a, **kw: (blocks.append(len(wanted)),
+                                                                           propose(k, wanted, *a, **kw))[1])
+    run = Run(_decoder(tiny, rig, POLICIES[policy], batched_graphs if graphed else None, batch=batch))
+    try:
+        streams = [run.stream(r) for r in reqs]
+        run.go([(_always, s) for s in streams])
+    finally:
+        run.close()
+    assert max(blocks) == sum(r.draft for r in reqs), "every drafting lane proposed in one block"
+    for j, (s, w) in enumerate(zip(streams, want)):
+        _same(run, s, w, f"stream {j} of {c} proposing together, {reqs[j]}")
+    assert not run.dec.live() and run.dec._free() == list(range(S))
+
+
+@pytest.mark.parametrize("absorb", [False, True], ids=["absorb alone", "absorb together"])
+@pytest.mark.parametrize("graphed", [True, False], ids=["graphs", "eager"])
+@pytest.mark.parametrize("when", proposals.SETUPS)
+@pytest.mark.parametrize("c", [2, 4])
+def test_blocks_made_early_late_or_lazily_equal_the_solo_runs(tiny, oracle, rig, batch, batched_graphs, late_graphs,
+                                                               monkeypatch, c, when, graphed, absorb):
+    """c drafting streams, greedy and keyed mixed, the block's scratch and graphs made before the lane graphs, after
+    them or at the first round with two drafting lanes, and the kept rows absorbed alone or in one pass: each stream
+    equals its solo run; a lazy block is built once, on a live lane's rows."""
+
+    policy = POLICIES["confidence"]
+    reqs = [Req(40 * c + j, LENGTHS[j], _sampling(5 * j + c, j), COUNTS[j]) for j in range(c)]
+    want = [_solo(oracle, r, policy) for r in reqs]
+    blocks, together, propose, absorb_all = [], [], proposals.propose, proposals.absorb
+    monkeypatch.setattr(proposals, "propose", lambda k, wanted, *a, **kw: (blocks.append(len(wanted)),
+                                                                           propose(k, wanted, *a, **kw))[1])
+    monkeypatch.setattr(proposals, "absorb", lambda w, lanes, b, k, kept: (together.append(len(kept)),
+                                                                           absorb_all(w, lanes, b, k, kept))[1])
+    if when == "early":
+        monkeypatch.setattr(batch, "absorbs", absorb)
+        dec = _decoder(tiny, rig, policy, batched_graphs if graphed else None, batch=batch)
+    else:
+        dec = _decoder(tiny, rig, policy, late_graphs if graphed else None)
+    built, build = [], dec.build_batch
+    dec.build_batch = lambda a, lane=None: (built.append(lane), build(a, lane))[1]
+    if when == "late":
+        dec.build_batch(absorb)
+        assert dec.batch is not None and dec.batch.absorbs == absorb
+        if graphed:
+            assert len(late_graphs.batched) == BLOCK * sum(L + 1 for L in range(2, S + 1))
+            assert late_graphs.batch_pool != late_graphs.pool, "the block's graphs in a pool of their own"
+    elif when == "lazy":
+        dec.defer, dec.defer_absorb = True, absorb
+    run = Run(dec)
+    try:
+        streams = [run.stream(r) for r in reqs]
+        run.go([(_always, s) for s in streams])
+    finally:
+        run.close()
+    assert max(blocks) == c, "every drafting lane proposed in one block"
+    assert bool(together) == absorb and all(n > 1 for n in together)
+    assert len(built) == (when != "early") and (when != "late" or built == [None])
+    assert when != "lazy" or (built[0] in range(S) and not dec.defer), "built once, on a live lane's rows"
+    for j, (s, w) in enumerate(zip(streams, want)):
+        _same(run, s, w, f"stream {j} of {c}, block made {when}, absorb together {absorb}, {reqs[j]}")
+    assert not run.dec.live() and run.dec._free() == list(range(S))
+
+
+def test_a_lone_stream_never_builds_a_lazy_block(tiny, oracle, rig, late_graphs):
+    req, policy = Req(77, LENGTHS[1], None, COUNTS[1]), POLICIES["confidence"]
+    want = _solo(oracle, req, policy)
+    dec = _decoder(tiny, rig, policy, late_graphs)
+    dec.defer = True
+    run = Run(dec)
+    try:
+        s = run.stream(req)
+        run.go([(_always, s)])
+    finally:
+        run.close()
+    _same(run, s, want, "a lone stream with the block deferred")
+    assert dec.batch is None and dec.defer
 
 
 def test_the_decoder_refuses_what_it_cannot_serve(tiny, rig):

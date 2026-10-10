@@ -158,17 +158,19 @@ def backbone(cfg, m, xf: torch.Tensor, b, *, prompt: bool = False, comm=None,
     return out.add_(b.sd[:R])
 
 
-def dspark_moe(cfg, m, xf: torch.Tensor, b) -> torch.Tensor:
-    """A DSpark stage's MoE for its block rows xf [B, D] bf16 -> the rank's fp32 share b.part [B, D]."""
+def dspark_moe(cfg, m, xf: torch.Tensor, b, d=None) -> torch.Tensor:
+    """A DSpark stage's MoE for its block rows xf [R, D] bf16 -> the rank's fp32 share b.part [R, D]; ``d`` holds the
+    routing and expert rows' scratch (default ``b``)."""
 
+    d = b if d is None else d
     R = xf.shape[0]
     E = cfg.dspark_n_routed_experts
-    route(xf, m.gate, m.bias, b.dmlog[:R], b.dpick[:R], b.dwts[:R], cfg.dspark_num_experts_per_tok,
+    route(xf, m.gate, m.bias, d.dmlog[:R], d.dpick[:R], d.dwts[:R], cfg.dspark_num_experts_per_tok,
           cfg.routed_scaling_factor, cfg.gate_temp)
-    grouped.route(b.dpick[:R], b.dplan)
-    act, ey = b.dact[:R].view(-1, m.experts.width), b.dey[:R].view(-1, m.experts.dims)
-    nvx.gate_up(xf, m.experts, b.dplan, act, R, skip=E)
-    nvx.down(act, m.experts, b.dplan, ey, R, skip=E)
-    b.dey[:R, -1].copy_(shared(cfg, m, xf, b))
-    glue.combine(b.dey[:R], b.dwts[:R], b.part[:R])
+    grouped.route(d.dpick[:R], d.dplan)
+    act, ey = d.dact[:R].view(-1, m.experts.width), d.dey[:R].view(-1, m.experts.dims)
+    nvx.gate_up(xf, m.experts, d.dplan, act, R, skip=E)
+    nvx.down(act, m.experts, d.dplan, ey, R, skip=E)
+    d.dey[:R, -1].copy_(shared(cfg, m, xf, b))
+    glue.combine(d.dey[:R], d.dwts[:R], b.part[:R])
     return b.part[:R]

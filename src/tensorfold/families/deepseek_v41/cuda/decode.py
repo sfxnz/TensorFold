@@ -170,12 +170,10 @@ class Engine:
             dspark.chain(e, d, keyed)
         self._timed("launch", t)
 
-    def propose(self, y: int, p: int, sampling: Sampling | None, d: int,
-                threshold: float | None = None) -> tuple[list[int], list[float]]:
-        """``dspark.propose`` through the graphs, reading each draft's Engram rows ahead as it lands (all but the
-        last) -> (drafts, logits)."""
+    def landing(self, y: int, d: int) -> Callable[[int, int], None]:
+        """``landed(i, draft)`` for a proposal of ``d`` drafts after ``y``: each draft's Engram rows read ahead as it
+        lands (all but the last)."""
 
-        start, other = time.perf_counter(), sum(self.clock.values())
         context = [*self.st.history, y]
 
         def landed(i: int, token: int) -> None:
@@ -183,7 +181,15 @@ class Engine:
                 self.fetch(i + 1, context, token)
             context.append(token)
 
-        out = dspark.propose(self, y, p, sampling, d, threshold, run=self._draft, landed=landed)
+        return landed
+
+    def propose(self, y: int, p: int, sampling: Sampling | None, d: int,
+                threshold: float | None = None) -> tuple[list[int], list[float]]:
+        """``dspark.propose`` through the graphs, reading each draft's Engram rows ahead as it lands (all but the
+        last) -> (drafts, logits)."""
+
+        start, other = time.perf_counter(), sum(self.clock.values())
+        out = dspark.propose(self, y, p, sampling, d, threshold, run=self._draft, landed=self.landing(y, d))
         self.clock["device"] += self.dwork.waited
         self.clock["markov"] += time.perf_counter() - start - (sum(self.clock.values()) - other)
         return out

@@ -75,7 +75,8 @@ def test_one_lane_keeps_the_native_estimate(start, capsys):
 def test_four_lanes_fit_the_native_window_in_a_larger_estimate(start, capsys):
     obj = start(4)
     assert obj.limit == NATIVE and obj.concurrent
-    assert "CUDA rank 0 startup estimate 82.55 GiB" in capsys.readouterr().out
+    # 82.55 GiB with TF_DSV41_BATCHED_DRAFTS=0; the batched block's scratch adds 8.81 MiB
+    assert "CUDA rank 0 startup estimate 82.56 GiB" in capsys.readouterr().out
 
 
 def test_without_context_the_window_shrinks_to_fit_every_lane(start):

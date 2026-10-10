@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from . import GRAPH_ROWS, MAX_ROWS, dspark, sample
+from . import GRAPH_ROWS, MAX_ROWS, dspark, proposals, sample
 from . import forward as F
 from .lanes import stage_tables
 
@@ -29,8 +29,9 @@ class Graphs:
         self.absorb: dict[int, torch.cuda.CUDAGraph] = {}      # by kept rows
         self.drafts: dict[tuple[int, bool], torch.cuda.CUDAGraph] = {}     # block + d Markov steps, by (d, keyed)
 
-    def _capture(self, fn) -> torch.cuda.CUDAGraph:
-        """``fn`` run once eagerly (compiling its kernels outside the capture), then captured into the pool."""
+    def _capture(self, fn, pool=None) -> torch.cuda.CUDAGraph:
+        """``fn`` run once eagerly (compiling its kernels outside the capture), then captured into ``pool`` (the
+        graphs' own when None)."""
 
         fn()
         torch.cuda.synchronize()
@@ -39,7 +40,7 @@ class Graphs:
         gc.disable()            # collecting an old graph mid-capture destroys it and invalidates the capture
         try:
             # thread-local: NCCL's helper threads may call CUDA while this thread captures
-            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
+            with torch.cuda.graph(g, pool=self.pool if pool is None else pool, capture_error_mode="thread_local"):
                 fn()
         finally:
             if enabled:
@@ -83,9 +84,10 @@ class Graphs:
 
 class LaneGraphs(Graphs):
     """Graphs of the shared forward over ``lanes``: verify by total rows T (the row tables are data, so one graph serves
-    every layout), and each lane Engine's absorb from forward row 0 and its proposals, in one pool."""
+    every layout), each lane Engine's absorb from forward row 0 and its proposals, and with ``batch`` the proposals of
+    2.. lanes in one block by (lanes, keyed of them, d), in one pool; ``batched_late`` captures those last instead."""
 
-    def __init__(self, w, lanes, mbuf, engines) -> None:
+    def __init__(self, w, lanes, mbuf, engines, batch=None) -> None:
         if len(engines) != lanes.slots or any(e.st is not lanes.view(k) or e.dbuf is not mbuf
                                               for k, e in enumerate(engines)):
             raise ValueError(f"lane graphs: {len(engines)} engines for {lanes.slots} lanes, each on its lane's view "
@@ -95,6 +97,7 @@ class LaneGraphs(Graphs):
         self.verify: dict[int, torch.cuda.CUDAGraph] = {}      # by total rows T
         self.absorb: list[dict[int, torch.cuda.CUDAGraph]] = [{} for _ in engines]     # per lane, by kept rows
         self.drafts: list[dict[tuple[int, bool], torch.cuda.CUDAGraph]] = [{} for _ in engines]
+        self.batch, self.batched = batch, {}
 
     @torch.no_grad()
     def warm(self) -> int:
@@ -116,6 +119,40 @@ class LaneGraphs(Graphs):
         if w.dspark is not None:
             for k, e in enumerate(self.engines):
                 self.absorb[k], self.drafts[k] = self._proposals(e)
+            if self.batch is not None:
+                self._batched(token)
         for e in self.engines:
             e.reset()
-        return len(self.verify) + sum(map(len, self.absorb)) + sum(map(len, self.drafts))
+        return len(self.verify) + sum(map(len, self.absorb)) + sum(map(len, self.drafts)) + len(self.batched)
+
+    def _batched(self, token: int, lane: int | None = None, pool=None) -> None:
+        """The block of lanes 0.. drafting together (every slot on ``lane`` unless None), by (lanes, keyed of them,
+        d)."""
+
+        k, sampling = self.batch, Sampling(seed=0, temperature=1.0, top_k=0)
+        for L in range(2, min(k.slots, self.lanes.slots) + 1):
+            for keyed in range(L + 1):
+                proposals.set_slots(k, [(j if lane is None else lane, token, sampling if j >= L - keyed else None)
+                                        for j in range(L)])
+                for d in range(1, self.w.cfg.dspark_block_size + 1):
+                    self.batched[L, keyed, d] = self._capture(
+                        lambda L=L, keyed=keyed, d=d: proposals.chain(self.w, self.lanes, self.mbuf, k, L, keyed, d),
+                        pool)
+
+    @torch.no_grad()
+    def batched_late(self, batch, lane: int | None = None) -> int:
+        """``batch``'s graphs in a pool of their own, after every other graph -> how many: every slot on ``lane``,
+        left as it is, or with None every lane at MAX_ROWS, each reset after."""
+
+        self.batch, self.batch_pool = batch, torch.cuda.graph_pool_handle()
+        if lane is None:
+            for e in self.engines:
+                e.st.reset()
+                e.st.set_pos(MAX_ROWS)
+        try:
+            self._batched(self.w.cfg.bos_token_id, lane, self.batch_pool)
+        finally:
+            if lane is None:
+                for e in self.engines:
+                    e.reset()
+        return len(self.batched)

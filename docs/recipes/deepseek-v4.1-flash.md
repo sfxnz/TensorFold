@@ -71,6 +71,18 @@ first token. A background request that yields its lane to a waiting one later re
 the tokens it had not sent. An fp16 overflow of the routed experts in one lane while the first forwards still check
 for it fails that round for every live request; the requests after it are served as usual.
 
+The DSpark proposals of two or more drafting requests run in one block forward, each request's rows on its own ring
+and positions. Every kernel in it is row-invariant, so each request drafts the bits it drafts alone and its replies and
+draft stats are unchanged. `TF_DSV41_BATCHED_DRAFTS=0` has each request propose alone. Both ranks must set it alike;
+they refuse to serve otherwise.
+
+`TF_DSV41_BATCHED_SETUP` sets when that block's scratch and graphs are made: `early` before the lane graphs, `late`
+(the default) after the startup warm in memory pools of their own, `lazy` likewise at the first round with two or more
+drafting requests, so a lone request never makes them. `TF_DSV41_BATCHED_ABSORB=1` also writes the accepted rows of
+two or more drafting requests into their DSpark rings in one pass. Replies are the same either way. Both ranks must set
+both alike. `TF_DSV41_LAYOUT=PREFIX` writes where the decode buffers and the allocator's segments sit, to
+`PREFIX.start.rank<r>.json` at startup and `PREFIX.batched.rank<r>.json` once the block is made, to compare two builds.
+
 ## Memory
 
 A rank holds 76.1 GiB of weights: its half of the routed experts (TP over each expert's intermediate dim, 1,152 a
