@@ -120,7 +120,10 @@ def test_a_proposal_takes_two_to_slots_lanes_of_one_to_block_drafts():
 def test_the_setup_and_absorb_knobs_make_one_setting(monkeypatch):
     for name in (proposals.ENV, proposals.SETUP_ENV, proposals.ABSORB_ENV):
         monkeypatch.delenv(name, raising=False)
-    assert proposals.mode() == 0 and proposals.setup() == "early" and not proposals.absorbing()
+    assert proposals.enabled() and proposals.setup() == "late" and not proposals.absorbing(), "on by default, late"
+    assert proposals.mode() == 1 + 2 * proposals.SETUPS.index("late")
+    monkeypatch.setenv(proposals.ENV, "0")
+    assert proposals.mode() == 0 and not proposals.absorbing()
     monkeypatch.setenv(proposals.ABSORB_ENV, "1")
     assert proposals.mode() == 0 and not proposals.absorbing(), "the absorb rides on the block"
     monkeypatch.setenv(proposals.ENV, "1")
