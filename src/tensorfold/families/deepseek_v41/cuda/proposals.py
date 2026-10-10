@@ -20,24 +20,21 @@ from . import MAX_ROWS, attn_kernel, dspark, mx8, norms, quant, sample
 from .buffers import Buffers
 from .lanes import Lanes
 
-ENV = "TF_DSV41_BATCHED_DRAFTS"     # "0": each drafting lane proposes alone, not two or more in one block forward
+ENV = "TF_DSV41_BATCHED_DRAFTS"     # "1": two or more drafting lanes propose in one block forward
 SETUP_ENV = "TF_DSV41_BATCHED_SETUP"  # when the block's scratch and graphs are made, one of SETUPS
 SETUPS = ("early", "late", "lazy")  # before the lane graphs; after the lanes' warm; at the first 2+ drafting lanes
-DEFAULT_SETUP = "late"              # no cost to a lone lane, and no capture stall at the first 2+ drafting lanes
 ABSORB_ENV = "TF_DSV41_BATCHED_ABSORB"  # "1": with the block on, 2+ lanes absorb their kept rows in one pass
 LAST = torch.iinfo(torch.int64).max  # a greedy slot's unused candidate keys: after every real key
 
 
 def enabled() -> bool:
-    """Whether two or more drafting lanes propose in one block: unless ENV is "0"."""
-
-    return os.environ.get(ENV, "1").strip() != "0"
+    return os.environ.get(ENV) == "1"
 
 
 def setup() -> str:
-    """SETUP_ENV's value, DEFAULT_SETUP when unset."""
+    """SETUP_ENV's value, "early" when unset."""
 
-    value = os.environ.get(SETUP_ENV) or DEFAULT_SETUP
+    value = os.environ.get(SETUP_ENV) or SETUPS[0]
     if value not in SETUPS:
         raise ValueError(f"{SETUP_ENV}={value!r}: one of {', '.join(SETUPS)}")
     return value
